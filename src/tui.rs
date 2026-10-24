@@ -1228,7 +1228,7 @@ fn spinner() -> &'static str {
 }
 
 fn pad(text: &str, width: usize) -> String {
-    let t = util::truncate(text, width);
+    let t = util::truncate(&util::sanitize(text), width);
     let n = t.chars().count();
     format!("{t}{}", " ".repeat(width.saturating_sub(n)))
 }

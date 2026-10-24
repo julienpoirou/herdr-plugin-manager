@@ -26,5 +26,5 @@ command = ["./bin/herdr-pm"]
 [[actions]]
 id = "open"
 title = "Open plugin manager"
-contexts = ["global", "workspace", "tab", "pane"]
+contexts = ["workspace"]
 command = ["./bin/herdr-pm", "open"]

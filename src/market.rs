@@ -359,7 +359,7 @@ fn fetch_github(source: &MarketSource, query: &str, config: &Config) -> Result<L
             };
             entries.push(Entry {
                 market: source.name.clone(),
-                title: full_name.to_string(),
+                title: util::sanitize(full_name),
                 plugin_id: None,
                 version: None,
                 description: util::sanitize(repo["description"].as_str().unwrap_or("")),
@@ -448,7 +448,7 @@ fn fetch_gitea(source: &MarketSource, query: &str) -> Result<Listing> {
             };
             entries.push(Entry {
                 market: source.name.clone(),
-                title: full_name.to_string(),
+                title: util::sanitize(full_name),
                 plugin_id: None,
                 version: None,
                 description: util::sanitize(repo["description"].as_str().unwrap_or("")),
@@ -513,7 +513,7 @@ fn fetch_gitlab(source: &MarketSource, query: &str) -> Result<Listing> {
             };
             entries.push(Entry {
                 market: source.name.clone(),
-                title: path.to_string(),
+                title: util::sanitize(path),
                 plugin_id: None,
                 version: None,
                 description: util::sanitize(project["description"].as_str().unwrap_or("")),
@@ -555,13 +555,9 @@ fn index_entries(source: &MarketSource, index: Index, query: &str) -> Listing {
         .into_iter()
         .map(|p| Entry {
             market: source.name.clone(),
-            title: if p.name.is_empty() {
-                p.id.clone()
-            } else {
-                p.name.clone()
-            },
-            plugin_id: Some(p.id),
-            version: Some(p.version).filter(|v| !v.is_empty()),
+            title: util::sanitize(if p.name.is_empty() { &p.id } else { &p.name }),
+            plugin_id: Some(util::sanitize(&p.id)),
+            version: Some(util::sanitize(&p.version)).filter(|v| !v.is_empty()),
             description: util::sanitize(p.description.as_deref().unwrap_or("")),
             web_url: p.homepage.or_else(|| util::web_url_for_remote(&p.source)),
             install: p.source,

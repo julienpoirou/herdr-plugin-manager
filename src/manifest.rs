@@ -141,10 +141,12 @@ pub fn applies_here(item: &Option<Vec<String>>, top: &Option<Vec<String>>) -> bo
 pub fn render_argv(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
+            // Control characters are escaped so a manifest cannot rewrite
+            // the terminal and disguise what it runs.
             if arg.is_empty()
                 || arg
                     .chars()
-                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\'')
             {
                 format!("{arg:?}")
             } else {
@@ -326,7 +328,9 @@ impl Manifest {
         let mut lines = Vec::new();
         lines.push(format!(
             "  plugin    {} ({}) {}",
-            self.name, self.id, self.version
+            util::sanitize(&self.name),
+            util::sanitize(&self.id),
+            util::sanitize(&self.version)
         ));
         if let Some(description) = self.description.as_deref().filter(|d| !d.trim().is_empty()) {
             lines.push(format!("  about     {}", util::sanitize(description)));
@@ -462,6 +466,18 @@ action = "apply"
         assert!(m
             .validate(Version::parse("0.9.5-preview.3").as_ref())
             .is_ok());
+    }
+
+    #[test]
+    fn previews_cannot_hide_escape_sequences() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "evil\u{1b}[2K\rnpm ci".to_string(),
+        ];
+        let shown = render_argv(&argv);
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(shown.contains("\\u{1b}"), "{shown}");
     }
 
     #[test]

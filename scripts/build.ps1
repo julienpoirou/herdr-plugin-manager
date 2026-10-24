@@ -18,8 +18,11 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+if (-not $env:CARGO_TARGET_DIR) {
+    $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "herdr-plugin-manager\target"
+}
 Write-Host "herdr-plugin-manager: building $want"
 cargo build --release --locked --quiet
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Copy-Item -Force target\release\herdr-pm.exe bin\herdr-pm.exe
+Copy-Item -Force (Join-Path $env:CARGO_TARGET_DIR "release\herdr-pm.exe") bin\herdr-pm.exe
 Write-Host "herdr-plugin-manager: built bin\herdr-pm.exe"

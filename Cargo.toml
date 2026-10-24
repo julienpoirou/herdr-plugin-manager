@@ -1,0 +1,32 @@
+[package]
+name = "herdr-plugin-manager"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Manage Herdr plugins from a popup or the command line, from GitHub or any git server (Gitea, Forgejo, GitLab, plain git)."
+license = "MIT"
+keywords = ["herdr", "herdr-plugin", "tui", "plugin-manager", "git"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "herdr-pm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["json", "tls", "native-certs", "gzip"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 4

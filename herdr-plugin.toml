@@ -1,0 +1,30 @@
+id = "herdr-plugin-manager"
+name = "Plugin Manager"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Install, update, roll back and browse Herdr plugins from GitHub or any git server (Gitea, Forgejo, GitLab, plain git)."
+platforms = ["linux", "macos", "windows"]
+
+# Builds bin/herdr-pm from source (needs a Rust toolchain), unless a
+# matching prebuilt bin/herdr-pm is already in the checkout.
+[[build]]
+platforms = ["linux", "macos"]
+command = ["sh", "scripts/build.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/build.ps1"]
+
+[[panes]]
+id = "manager"
+title = "Plugin Manager"
+placement = "popup"
+width = "85%"
+height = "85%"
+command = ["./bin/herdr-pm"]
+
+[[actions]]
+id = "open"
+title = "Open plugin manager"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["./bin/herdr-pm", "open"]

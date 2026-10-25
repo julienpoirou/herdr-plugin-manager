@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths: [.github/workflows/*.yml, .github/workflows/*.yaml]
   pull_request:
-    paths: [.github/workflows/*.yml, .github/workflows/*.yaml]
 
 permissions:
   contents: read

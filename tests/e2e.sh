@@ -12,7 +12,7 @@ HPM="${1:-$(pwd)/target/debug/herdr-pm}"
 command -v herdr >/dev/null || { echo "e2e: herdr is not on PATH" >&2; exit 2; }
 [ -x "$HPM" ] || { echo "e2e: $HPM not found (cargo build first)" >&2; exit 2; }
 
-T="$(mktemp -d "${TMPDIR:-/tmp}/hpm-e2e.XXXXXX")"
+T="$(mktemp -d -t hpm-e2e.XXXXXX)"
 trap 'herdr server stop >/dev/null 2>&1 || true; [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null; rm -rf "$T"' EXIT
 export XDG_CONFIG_HOME="$T/cfg" XDG_STATE_HOME="$T/state" XDG_CACHE_HOME="$T/cache"
 export NO_COLOR=1 HERDR_PM_NO_TOKEN=1

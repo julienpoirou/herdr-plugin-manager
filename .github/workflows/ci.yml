@@ -54,6 +54,9 @@ jobs:
         run: scripts/build.ps1
 
   supply-chain:
+    permissions:
+      contents: read
+      checks: write
     name: Rust dependency audit
     runs-on: ubuntu-latest
     steps:

@@ -380,8 +380,8 @@ pub fn open_url(url: &str) -> Result<()> {
         c.arg(url);
         c
     } else if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        let mut c = Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     } else {
         let mut c = Command::new("xdg-open");

@@ -1,5 +1,26 @@
 # Changelog
 
+
+## Unreleased
+
+- Rename the user-facing interface and Herdr plugin id to GitBridge
+  (`gitbridge`), add an original logo, rewrite the documentation, and expand
+  community/CI configuration.
+- Reject Git remote-helper transports and option-shaped URLs at the Git
+  boundary; validate import sources and `--subdir` before fetching.
+- Sanitize every trust-preview and popup field, including event names, link
+  handlers, marketplace URLs and refs.
+- Normalize abbreviated commit installs to full ids for subsequent update
+  checks; import GitHub entries at their exported commit.
+- Abort installation on submodule failures; preserve the previous Herdr
+  registration when replacing a GitHub install through Git.
+- Report a corrupt private registry instead of treating managed plugins as
+  local links; preserve dangling registry symlinks during offline changes.
+- Match Herdr's Windows-safe config path encoding, avoid `cmd /c start` for
+  URLs, and select GitHub Enterprise tokens by hostname.
+- Upgrade Ratatui to 0.30.2 and `lru` to 0.18.5, removing the two memory
+  safety advisories affecting the previous dependency version.
+
 ## 0.1.0 — 2026-10-25
 
 First release.

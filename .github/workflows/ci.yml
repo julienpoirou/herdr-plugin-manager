@@ -1,20 +1,32 @@
-# Runs on GitHub Actions and on Gitea/Forgejo Actions (same syntax).
-name: ci
+name: CI
+
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  unix:
+    name: ${{ matrix.os }} / Rust
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
@@ -22,12 +34,30 @@ jobs:
         run: |
           curl -fsSL https://herdr.dev/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: End-to-end
+      - name: End-to-end with real Herdr
         run: cargo build --locked && sh tests/e2e.sh
 
   windows:
+    name: windows-latest / Rust and PowerShell
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Verify Windows build script
+        shell: pwsh
+        run: scripts/build.ps1
+
+  supply-chain:
+    name: Rust dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

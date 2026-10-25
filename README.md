@@ -1,167 +1,170 @@
-# herdr-plugin-manager
+# GitBridge for Herdr
 
-Manage [Herdr](https://herdr.dev) plugins from a popup or the command line —
-from GitHub **or any git server**: Gitea, Forgejo, GitLab, a bare repository
-over SSH, `git daemon`, dumb HTTP, a shared folder.
+<img src="assets/logo.png" alt="GitBridge logo" width="112" align="right">
 
-`herdr plugin install` only takes GitHub `owner/repo`. This plugin adds the
-rest: it clones from any remote, shows you everything the plugin will run,
-builds it, links it into Herdr, and keeps earlier versions for rollback. It
-also browses several marketplaces at once, including ones you host yourself
-with nothing but git.
+[![CI](https://github.com/julienpoirou/herdr-plugin-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/julienpoirou/herdr-plugin-manager/actions/workflows/ci.yml)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-a78bfa)](https://www.rust-lang.org/)
+[![Herdr 0.7.4+](https://img.shields.io/badge/herdr-0.7.4%2B-2dd4bf)](https://herdr.dev/)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Written in Rust, one ~5 MB binary, macOS / Linux / Windows.
+**GitBridge connects Herdr to the Git servers you actually use.** It installs
+plugins from GitHub, GitLab, Gitea/Forgejo, a company Git appliance, a bare
+repository, or a directory on disk. The same `herdr-pm` binary provides a
+Ratatui popup and a scriptable CLI.
 
-[Français ↓](#français)
+The repository remains `herdr-plugin-manager`; the Herdr plugin id and Cargo
+package are **`gitbridge`**. The user-facing name is **GitBridge for Herdr**.
 
-```
- herdr plugins  Installed 5 · ↑1   Marketplace                          herdr 0.9.5
-╭───────────────────────────────────────────────────────────────────────────────────╮
-│ 1 ● Hello            1.1.0    git     ssh://git@git.corp.local/tools/hello  ↑ 1.2.0  ›│
-│ 2 ● Notify           0.4.2    git     ssh://git@git.corp.local/tools/notify     ✓  ⌄│
-│         ↳ send               Send a test notification                  prefix+n │
-│ 3 ● Reviewr          1.2.0    github  persiyanov/herdr-reviewr                 ✓  ›│
-│ 4 ○ Scratch          0.3.0    local   /home/me/src/herdr-scratch           local  ›│
-╰───────────────────────────────────────────────────────────────────────────────────╯
- tools.hello  enabled · git
- source   ssh://git@git.corp.local/tools/hello.git
- ref      default branch @ 7790da5  · installed 2d ago · 2 kept for rollback
- update   1.1.0 → 1.2.0 (419ae66) — press u
- ↵ actions  u update  U all  e toggle  x remove  i install  m market  ? help  q quit
-```
+[English](#why-gitbridge) · [Français](#français)
 
-## What it does
+## Why GitBridge
 
-Everything [speardragon/herdr-plugin-manager](https://github.com/speardragon/herdr-plugin-manager) does — popup with installed plugins, update
-indicators, update one / all, enable/disable, uninstall, action accordion
-with key bindings, run an action, open the repo, edit `plugins.json`,
-marketplace with search, sort and paging, dry-run mode — plus:
+Herdr's own installer accepts GitHub `owner/repo`. GitBridge adds the other
+transports without asking a forge API for a checkout:
 
-| | |
+| Capability | Behavior |
 |---|---|
-| **Any git remote** | `https://`, `ssh://`, `git@host:path`, `git://`, `file://`, local paths, dumb HTTP. No forge API needed. |
-| **Monorepos** | `repo.git//plugins/foo` or `--subdir`; a repository with a single plugin is found automatically. |
-| **Aliases** | `corp = "ssh://git@git.corp.local/"` → `herdr-pm install corp:tools/notify.git`. |
-| **Its own trust preview** | Source, ref → commit, commit author/date, every command (build, startup, actions, events, panes, link handlers), platform and Herdr-version checks — before anything runs. Control characters are escaped so a manifest cannot disguise its commands. |
-| **Update diffs** | Updates list the new commits and **what changed in what the plugin runs** (`+ startup #1 …`, `~ build #1 a → b`). |
-| **Rollback** | Each install goes into a fresh directory; the previous ones are kept (`keep_installs`, default 3). `z` / `herdr-pm rollback` switches back instantly, no rebuild. |
-| **Pin / unpin / switch** | Follow a branch, a tag, or hold an exact commit. |
-| **Multi-source marketplace** | GitHub topic search, Gitea/Forgejo, GitLab, a static index over HTTP or a file, and a **git-index**: a catalog stored in any git repository. |
-| **Catalog builder** | `herdr-pm index build --scan-dir /srv/git` turns a directory of bare repos into a catalog — a marketplace for a plain git server. |
-| **Export / import** | Reproduce your plugin set on another machine at the exact commits. |
-| **Doctor & history** | Checks herdr, git, config, manifests, dangling key bindings, marketplace reachability; logs every change. |
-| **Works offline** | Enable/disable works with no Herdr server running (Herdr's CLI refuses that). |
-| **Proxies done right** | `HTTPS_PROXY`, `NO_PROXY` (with domain suffixes), system CA store for internal certificates. |
+| Git transports | HTTPS, HTTP, SSH, scp-style SSH, `git://`, `file://`, absolute or relative repository paths |
+| Monorepos | `repo.git//plugins/tool` or `--subdir plugins/tool`; a single manifest is discovered automatically |
+| Reviewed execution | Resolved commit and every build/startup/action/event/pane command are shown before confirmation |
+| Version history | Separate installations, rollback, pin/unpin and branch/tag/commit switching |
+| Update context | New commits and changes to the executable surface, not only a version bump |
+| Discovery | GitHub/GHE, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
+| Reproducibility | JSON export/import at exact exported commits |
+| Operations | Enable/disable (including offline), uninstall, history, doctor, dry-run |
 
-GitHub `owner/repo` sources still go through `herdr plugin install`, so Herdr
-keeps owning those checkouts and `herdr plugin update` keeps working. Pass
-`--git` to fetch a GitHub repository with git instead (private repos over SSH).
+Remote-helper transports such as `ext::` are deliberately rejected. This also
+protects imports: an imported URL cannot select a Git helper or a command-line
+option before the review.
 
 ## Install
 
-The plugin builds from source on install, so it needs a Rust toolchain and a
-C compiler on the machine (`rustup` + Xcode CLT / build-essential / MSVC).
-A checkout that already contains a matching `bin/herdr-pm` skips the build.
-
-**From GitHub** (once the repository is published there):
+Requirements: Herdr 0.7.4+, Git, and a Rust toolchain with a C linker when no
+matching prebuilt `bin/herdr-pm` is present.
 
 ```sh
-herdr plugin install <owner>/herdr-plugin-manager
+herdr plugin install julienpoirou/herdr-plugin-manager
 ```
 
-**From your own git server**, bootstrap once with the CLI, then let the
-manager manage itself:
+For another Git server:
 
 ```sh
-git clone ssh://git@git.corp.local/tools/herdr-plugin-manager.git
-cd herdr-plugin-manager && cargo install --path . --locked     # puts herdr-pm on PATH
-herdr-pm install ssh://git@git.corp.local/tools/herdr-plugin-manager.git
+cargo install --path . --locked
+herdr-pm install ssh://git@git.corp.example/tools/herdr-plugin-manager.git
 ```
 
-**For development**: `sh scripts/build.sh && herdr plugin link "$PWD"`.
+For a development checkout:
 
-Bind a key in `~/.config/herdr/config.toml` and reload:
+```sh
+sh scripts/build.sh
+herdr plugin link "$PWD"
+```
+
+Bind the popup (recommended: `prefix+g`):
 
 ```toml
 [[keys.command]]
-key = "prefix+p"
+key = "prefix+g"
 type = "plugin_action"
-command = "herdr-plugin-manager.open"
-description = "plugin manager"
+command = "gitbridge.open"
+description = "Open GitBridge"
 ```
 
-```sh
-herdr server reload-config
-```
+Then run `herdr server reload-config`. Put `bin/herdr-pm` on `PATH` (or use
+`cargo install --path . --locked`) to use the CLI directly.
 
-To use the CLI from a shell as well, put the binary on your `PATH`
-(`cargo install --path .`, or symlink `bin/herdr-pm` from the plugin
-directory shown by `herdr plugin list`).
+On native Windows, the manifest uses `scripts/build.ps1`; Git for Windows,
+PowerShell and Rust/MSVC must be available.
 
-## Popup keys
-
-**Installed**
-
-| key | |
-|---|---|
-| `↵` `→` `←` | fold/unfold a plugin's actions · run the selected action (the popup closes first, as Herdr requires) |
-| `u` / `U` | update the selected plugin / every outdated one (each still shows its preview) |
-| `e` | enable ↔ disable |
-| `x` | uninstall (hand-linked plugins are only unlinked) |
-| `i` | install: `owner/repo`, any git URL, `alias:path`, `… --ref v2 --subdir dir` |
-| `p` | pin to the current commit / unpin |
-| `s` | switch to another branch, tag or commit |
-| `z` | roll back to the previous installation |
-| `o` | open the source in a browser |
-| `L` | recent commands Herdr ran for the plugin |
-| `c` / `C` | edit Herdr's `plugins.json` / this manager's `config.toml` |
-| `/` · `r` | filter · refresh and re-check |
-
-**Marketplace** (`m` or `Tab`)
-
-| key | |
-|---|---|
-| `↵` | install the selection (confirmation, then the full preview) |
-| `/` | search all sources |
-| `s` · `f` | cycle sort (stars, updated, name) · cycle source |
-| `←` `→` | previous / next page |
-| `o` · `r` | open in browser · refresh (ignore cache) |
-
-Status column: `✓` up to date · `↑ 1.2.0` update available · `pinned` · `local`
-(hand-linked) · `! check failed` (details below the list).
-
-Install, update, uninstall, rollback and pin run on the plain terminal with
-the same preview and prompts as the CLI, then return to the popup.
-
-## Sources
+## Install sources
 
 ```sh
-herdr-pm install owner/repo[/subdir]                      # GitHub, via herdr
-herdr-pm install https://gitea.corp/tools/notify.git      # any https remote
-herdr-pm install git@gitlab.corp:tools/notify.git         # scp-style ssh
+herdr-pm install owner/repo[/subdir]                       # native Herdr/GitHub
+herdr-pm install owner/repo --git                          # same repo through GitBridge
+herdr-pm install https://gitlab.corp.example/tools/notify.git
+herdr-pm install git@git.corp.example:tools/notify.git
 herdr-pm install ssh://git@host:2222/srv/git/mono.git//plugins/foo
-herdr-pm install git://git.lan/notify.git                 # git daemon
-herdr-pm install /srv/git/notify.git                      # local bare repo
-herdr-pm install corp:tools/notify.git                    # alias from config
-herdr-pm install <source> --ref v1.4.0                    # branch, tag or commit
-herdr-pm install <source> --replace                       # take over a plugin installed another way
+herdr-pm install git://git.lan/notify.git
+herdr-pm install /srv/git/notify.git
+herdr-pm install ./checkout
+herdr-pm install corp:tools/notify.git                     # configured alias
+herdr-pm install <source> --ref v1.4.0                     # branch, tag or commit
+herdr-pm install <source> --subdir plugins/foo
+herdr-pm install <source> --disabled
 ```
 
-Credentials are plain git: your SSH agent and keys, `~/.netrc`, credential
-helpers, `GIT_SSH_COMMAND`. Background update checks never prompt; installs
-and updates do.
+Credentials stay with Git: SSH agent/keys, credential helpers, `.netrc` and
+`GIT_SSH_COMMAND`. Read-only background checks do not prompt.
+
+`--replace` belongs to the Git pipeline:
+
+```sh
+herdr-pm install <git-source> --replace
+```
+
+It replaces an existing local link or a GitHub-owned registration after the
+new build succeeds. Herdr 0.7.4's native GitHub installer has no equivalent
+replacement operation for an existing local link. Therefore
+`herdr-pm install owner/repo --replace` fails explicitly; use
+`herdr-pm install owner/repo --git --replace` when that behavior is wanted.
+
+## Trust and build model
+
+For Git-managed installations, GitBridge:
+
+1. mirrors the remote and resolves the branch, annotated/lightweight tag or
+   commit to a full object id;
+2. reads and validates `herdr-plugin.toml` at that object id;
+3. prints the source, ref, commit metadata and every declared command;
+4. refuses non-interactive installation without `--yes`;
+5. checks out that exact commit, initializes submodules, and verifies the
+   checked-out manifest against the reviewed text;
+6. runs applicable `[[build]]` entries as argv (no shell), then compares the
+   manifest again;
+7. links the new directory into Herdr and records it in `registry.json`.
+
+Control characters in manifest fields, refs, URLs and marketplace labels are
+neutralized in the preview and popup. Parent components in `--subdir` are
+rejected. A submodule or build failure prevents linking. Previous installations
+stay available for rollback.
+
+Plugins remain arbitrary code running as the user. Review the commands and the
+repository, and pin the reviewed commit when appropriate. GitHub shorthand
+installs use Herdr's own preview/build implementation instead.
+
+A hard crash between Herdr's registration and GitBridge's `registry.json`
+update can require manual recovery. Avoid running multiple mutating
+`herdr-pm` commands for the same plugin concurrently; `herdr-pm doctor` reports
+registry/list inconsistencies.
+
+## Popup
+
+Open with `herdr-pm`, the configured key, or the `gitbridge.open` action.
+
+| Area | Keys |
+|---|---|
+| Navigation | arrows / `j` / `k`, mouse, `/` filter |
+| Actions | Enter folds actions; Enter on an action closes the popup then invokes it |
+| Updates | `u` selected, `U` all, each with its own review |
+| State | `e` enable/disable, `x` uninstall, `p` pin/unpin |
+| Versions | `s` switch ref, `z` rollback |
+| Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
+| Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help, `q` quit |
+
+Install, update, rollback, pin and uninstall suspend the popup and use the same
+terminal review paths as the CLI.
 
 ## CLI
 
-```
+```text
 herdr-pm                       open the interactive manager
 herdr-pm list [--check] [--json]
 herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id>        herdr-pm enable|disable <id>
 herdr-pm info <id> [--json]    herdr-pm history [id]
-herdr-pm rollback <id>         herdr-pm pin <id> [ref]   herdr-pm unpin <id> [ref]
-herdr-pm switch <id> <ref>
+herdr-pm rollback <id>         herdr-pm pin <id> [ref]
+herdr-pm unpin <id> [ref]      herdr-pm switch <id> <ref>
 herdr-pm search [words…] [--source S] [--sort stars|updated|name] [--refresh] [--json]
 herdr-pm sources
 herdr-pm index build (--repo URL… | --repos-file F | --scan-dir DIR [--url-base URL]) [-o F]
@@ -170,170 +173,158 @@ herdr-pm export [-o file]      herdr-pm import <file> [ids…]
 herdr-pm doctor                herdr-pm config path|init|show
 ```
 
-`--dry-run` (or `HERDR_PM_DRY_RUN=1`) prints changes instead of making them.
+Global `--dry-run` (or `HERDR_PM_DRY_RUN=1`) reports changes without applying
+them.
 
 ## Configuration
 
-`herdr-pm config init` writes a commented file to
-`$(herdr plugin config-dir herdr-plugin-manager)/config.toml`:
+`herdr-pm config init` creates a commented `config.toml` in the plugin's Herdr
+config directory.
 
 ```toml
-keep_installs = 3        # earlier installations kept for rollback
-market_ttl = 600         # seconds marketplace listings are cached
-check_concurrency = 6    # parallel update checks
+keep_installs = 3        # previous installations retained for rollback
+market_ttl = 600         # marketplace cache lifetime in seconds
+check_concurrency = 6    # parallel background update checks
 
 [aliases]
-corp = "ssh://git@git.corp.local/"
-lab  = "https://gitlab.lab.local/{path}.git"   # {path} = template
+corp = "ssh://git@git.corp.example/"
+lab = "https://gitlab.corp.example/{path}.git"
 
 [[marketplace]]
 name = "github"
-kind = "github"          # repositories tagged herdr-plugin (herdr.dev/plugins)
+kind = "github"
+topic = "herdr-plugin"
+
+[[marketplace]]
+name = "ghe"
+kind = "github"
+url = "https://ghe.corp.example/api/v3"
+token_env = "GH_ENTERPRISE_TOKEN"
 
 [[marketplace]]
 name = "corp"
-kind = "gitea"           # also Forgejo
-url = "https://git.corp.local"
-token_env = "CORP_GITEA_TOKEN"   # or token_cmd = ["pass", "show", "gitea"]
-clone = "ssh"            # install over ssh instead of https
+kind = "gitea"                 # also Forgejo
+url = "https://git.corp.example"
+token_env = "CORP_GITEA_TOKEN"
+clone = "ssh"                  # https (default) or ssh
 
 [[marketplace]]
 name = "lab"
 kind = "gitlab"
-url = "https://gitlab.lab.local"
+url = "https://gitlab.corp.example"
+token_cmd = ["pass", "show", "gitlab/token"]
 
 [[marketplace]]
 name = "internal"
-kind = "git-index"       # plain git server: a catalog file in a repo
-url = "ssh://git@git.internal/srv/git/herdr/index.git"
+kind = "git-index"
+url = "ssh://git@git.corp.example/herdr/index.git"
 path = "herdr-index.json"
+ref = "main"                  # optional
 
 [[marketplace]]
 name = "team"
-kind = "index"           # catalog over http(s) or from a file
-url = "https://intranet.example/herdr-index.json"
+kind = "index"
+url = "https://intranet.corp.example/herdr-index.json"
 ```
 
-Forge sources list repositories carrying the `topic` (default
-`herdr-plugin`), skipping forks and archived ones, like herdr.dev. For GitHub
-Enterprise use `kind = "github"` with `url = "https://ghe.example/api/v3"`.
-GitHub requests use `GH_TOKEN`, `GITHUB_TOKEN` or `gh auth token`
-(`HERDR_PM_NO_TOKEN=1` disables that).
+GitHub authentication uses an explicit source token, `GH_TOKEN`,
+`GITHUB_TOKEN`, then `gh auth token`. GHE additionally prefers
+`GH_ENTERPRISE_TOKEN` and passes its hostname to `gh auth token --hostname`.
+`HERDR_PM_NO_TOKEN=1` disables all GitHub API authentication. The documented
+GitHub API version is `2022-11-28`, which remains valid and is also understood
+by GHES versions supported by this configuration.
 
-## A marketplace on a plain git server
+## A marketplace without a forge API
 
-No web UI, no API: build a catalog from the repositories and publish it in a
-git repository. [`examples/publish-index.sh`](examples/publish-index.sh) does
-it from cron and only commits when something changed:
+Build an index from bare repositories and publish it in Git:
 
 ```sh
-REPO_ROOT=/srv/git URL_BASE=ssh://git@git.internal/srv/git \
+REPO_ROOT=/srv/git URL_BASE=ssh://git@git.corp.example/srv/git \
 INDEX_REPO=/srv/git/herdr/index.git sh examples/publish-index.sh
 ```
 
-The index records every plugin found (monorepos included, with their
-subdirectories), its version, platforms and minimum Herdr version. The format
-is a small JSON file (`"format": "herdr-plugin-index"`), easy to generate from
-anything else too.
+The generated JSON records root and monorepo plugins, versions, platforms,
+minimum Herdr versions, refs and commits. `herdr-pm index check FILE` validates
+the format. See `examples/publish-index.sh` for incremental publication.
 
-## How it works
+## State and offline behavior
 
-* Remotes are mirrored into a bare cache (`…/cache/repos`), so installs,
-  version lookups and update previews work the same on every transport.
-* An install checks out the commit into
-  `…/installs/<plugin>/<commit>-<time>/`, runs the manifest's `[[build]]`
-  steps for this platform there (argv, no shell, no Herdr runtime variables,
-  output shown live), verifies the manifest did not change, then
-  `herdr plugin link`s it. Re-linking replaces the registration atomically;
-  running processes keep their old files.
-* Herdr only sees a linked directory, so the manager keeps its own record
-  (`registry.json`) of remote, followed ref, commit and earlier installations.
-  Data lives in Herdr's state directory for the plugin
-  (`~/.local/state/herdr/plugins/herdr-plugin-manager/`).
-* Update checks are one `git ls-remote` per plugin, in parallel; versions of
-  available updates are read from the mirror (or raw.githubusercontent.com for
-  Herdr-managed GitHub plugins).
+GitBridge stores its data under Herdr's state directory:
 
-## Trust
+```text
+~/.local/state/herdr/plugins/gitbridge/
+├── registry.json       # remotes, followed refs, current and previous installs
+├── installs/           # independent checkouts
+├── cache/              # bare mirrors and marketplace responses
+├── trash/              # deferred cleanup
+└── history.jsonl
+```
 
-Plugins are code that runs as you. Listings are not reviewed — by Herdr or
-by this manager. Read the preview; pin what you reviewed (`--ref <commit>` or
-`p`). Nothing runs before you confirm, and non-interactive use needs `--yes`.
+On Windows the default root is `%LOCALAPPDATA%\herdr`. `HERDR_PM_HOME` and
+`HERDR_PM_CONFIG_DIR` override GitBridge's directories.
+
+Enable/disable first uses Herdr's CLI. If the server is stopped, GitBridge
+updates Herdr's `plugins.json` under `.plugins.lock`, preserves unknown JSON
+fields and follows registry symlinks, including a dangling final target.
 
 ## Environment
 
-| variable | |
+| Variable | Meaning |
 |---|---|
-| `HERDR_PM_DRY_RUN=1` | print changes instead of making them |
-| `HERDR_PM_HERDR_BIN` | herdr binary (default `HERDR_BIN_PATH`, then `herdr`) |
-| `HERDR_PM_CONFIG_DIR` / `HERDR_PM_HOME` | override config / data directories |
-| `HERDR_PM_EDITOR` | editor for `c`/`C` (then `VISUAL`, `EDITOR`) |
-| `HERDR_PM_NO_TOKEN=1` | never send a GitHub token |
-| `HERDR_PM_BUILD_FROM_SOURCE=1` | rebuild even if a prebuilt `bin/herdr-pm` matches |
+| `HERDR_PM_DRY_RUN=1` | Report mutations without applying them |
+| `HERDR_PM_HERDR_BIN` | Herdr executable (otherwise `HERDR_BIN_PATH`, then `herdr`) |
+| `HERDR_PM_HOME` / `HERDR_PM_CONFIG_DIR` | Override state/config directories |
+| `HERDR_PM_EDITOR` | Editor before `VISUAL` and `EDITOR` |
+| `HERDR_PM_NO_TOKEN=1` | Never authenticate GitHub API requests |
+| `HERDR_PM_BUILD_FROM_SOURCE=1` | Ignore a matching prebuilt binary |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` | Forge HTTP proxy behavior, including domain suffixes |
 
 ## Development
 
 ```sh
-cargo test                      # unit tests
-cargo build && sh tests/e2e.sh  # end-to-end against a real herdr on PATH
-HERDR_PM_DRY_RUN=1 cargo run    # popup UI in any terminal, nothing changes
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --locked && sh tests/e2e.sh   # requires herdr on PATH
 ```
 
-The end-to-end suite builds a throwaway git server (bare repos, `file://`,
-`git daemon`), and exercises install, subdirectories, updates with diffs,
-rollback, pin, refusals, aliases, the git-index marketplace, export/import
-and a live Herdr server.
-
----
+The E2E suite uses real Herdr and temporary repositories. It covers local,
+`file://` and `git://` installs, monorepos, builds, updates/diffs, rollback,
+pin/switch, `--replace`, offline and live-server operations, import/export,
+marketplace indexes, malicious imports, terminal escapes and invalid paths.
 
 ## Français
 
-Gestionnaire de plugins [Herdr](https://herdr.dev) en Rust, en popup ou en
-ligne de commande, qui installe depuis **n'importe quel serveur git** :
-Gitea, Forgejo, GitLab, dépôt nu en SSH, `git daemon`, HTTP « dumb », dossier
-partagé. `herdr plugin install` n'accepte que `owner/repo` GitHub ; ici toute
-URL git fonctionne.
+**GitBridge for Herdr** installe des plugins depuis GitHub, GitLab,
+Gitea/Forgejo, un dépôt nu, `git daemon` ou un chemin local. Le binaire
+`herdr-pm` fournit une interface Ratatui et une CLI scriptable.
 
-Il reprend toutes les fonctions de speardragon/herdr-plugin-manager et
-ajoute : alias de serveurs (`corp:outils/notif.git`), monorepos
-(`depot.git//plugins/foo`), aperçu de confiance complet avant toute
-exécution, **diff de ce que le plugin exécute** à chaque mise à jour,
-**rollback** instantané, pin/unpin/switch, marketplace multi-sources (GitHub,
-Gitea/Forgejo, GitLab, index statique, **index dans un dépôt git** pour un
-serveur git nu), générateur de catalogue, export/import, `doctor`,
-historique, gestion du proxy et de `NO_PROXY`.
-
-**Installation sur votre serveur git** :
+Ses fonctions principales sont les monorepos (`depot.git//plugins/outil`), les
+alias de serveurs, l'aperçu des commandes avant confirmation, les diffs de
+mise à jour, les installations indépendantes avec rollback, pin/unpin/switch,
+plusieurs marketplaces, les index JSON hébergés dans Git, l'export/import aux
+commits exacts, `doctor`, l'historique et le mode hors ligne.
 
 ```sh
-git clone ssh://git@git.corp.local/outils/herdr-plugin-manager.git
-cd herdr-plugin-manager && cargo install --path . --locked
-herdr-pm install ssh://git@git.corp.local/outils/herdr-plugin-manager.git
+herdr plugin install julienpoirou/herdr-plugin-manager
+herdr-pm install git@git.corp.example:outils/notify.git
+herdr-pm install /srv/git/mono.git//plugins/foo --ref v1.4.0
 ```
 
-Puis un raccourci dans `~/.config/herdr/config.toml` :
+Raccourci conseillé : `prefix+g` avec la commande
+`gitbridge.open` (exemple TOML ci-dessus). `herdr-pm config init`
+crée une configuration commentée et `?` affiche l'aide du popup.
 
-```toml
-[[keys.command]]
-key = "prefix+p"
-type = "plugin_action"
-command = "herdr-plugin-manager.open"
-```
+**Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
+`..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build
+n'est lancé avant confirmation. Le manifeste est comparé avant et après le
+build. Les plugins restent du code exécuté avec vos droits : lisez l'aperçu et
+épinglez le commit vérifié.
 
-**Marketplace interne sans API** : lancez
-[`examples/publish-index.sh`](examples/publish-index.sh) en cron sur le
-serveur, puis déclarez-la chez les clients :
-
-```toml
-[[marketplace]]
-name = "interne"
-kind = "git-index"
-url = "ssh://git@git.corp.local/srv/git/herdr/index.git"
-```
-
-`herdr-pm config init` crée un fichier de configuration commenté ; touche
-`?` dans le popup pour l'aide.
+`--replace` fonctionne dans le pipeline Git. Pour remplacer un lien local par
+une source GitHub, utilisez `owner/repo --git --replace` : le programme Herdr
+natif ne propose pas cette opération de remplacement.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

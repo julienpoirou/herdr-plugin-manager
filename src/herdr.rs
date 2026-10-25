@@ -413,6 +413,29 @@ pub fn is_server_not_running(err: &anyhow::Error) -> bool {
         .is_some_and(|e| e.code.as_deref() == Some("server_not_running"))
 }
 
+/// Resolves a registry symlink even when its final target does not exist
+/// yet, matching Herdr's stow-friendly write behavior.
+fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        let metadata = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(err) => return Err(err.into()),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(target);
+        }
+        let link = std::fs::read_link(&target)?;
+        target = if link.is_absolute() {
+            link
+        } else {
+            target.parent().unwrap_or_else(|| Path::new(".")).join(link)
+        };
+    }
+    bail!("too many plugin registry symlinks")
+}
+
 /// Flips `enabled` in `plugins.json` under Herdr's registry lock. Only used
 /// when no server is running (the CLI refuses enable/disable offline), so
 /// there is no live state to notify. Unknown fields are preserved verbatim.
@@ -430,7 +453,7 @@ fn set_enabled_offline(plugin_id: &str, enabled: bool) -> Result<()> {
         .open(&lock_path)
         .with_context(|| format!("could not open {}", lock_path.display()))?;
     lock.lock()?;
-    let target = std::fs::canonicalize(&registry).unwrap_or(registry.clone());
+    let target = resolve_write_target(&registry)?;
     let text = std::fs::read_to_string(&target)
         .with_context(|| format!("could not read {}", target.display()))?;
     let mut entries: Vec<serde_json::Value> =
@@ -517,7 +540,7 @@ mouse_capture = true
 [[keys.command]]
 key = "prefix+p"
 type = "plugin_action"
-command = "herdr-plugin-manager.open"
+command = "gitbridge.open"
 
 [[keys.command]]
 key = "prefix+g"
@@ -527,10 +550,28 @@ command = "lazygit"
 [[keys.command]]
 key = "alt+p"
 type = "plugin_action"
-command = "herdr-plugin-manager.open"
+command = "gitbridge.open"
 "#;
         let keys = parse_action_keybindings(toml);
-        assert_eq!(keys["herdr-plugin-manager.open"], vec!["prefix+p", "alt+p"]);
+        assert_eq!(keys["gitbridge.open"], vec!["prefix+p", "alt+p"]);
         assert_eq!(keys.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_write_target_follows_dangling_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "hpm-registry-link-{}-{}",
+            std::process::id(),
+            util::now_unix()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("plugins.json");
+        std::os::unix::fs::symlink("actual/plugins.json", &link).unwrap();
+        assert_eq!(
+            resolve_write_target(&link).unwrap(),
+            root.join("actual/plugins.json")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

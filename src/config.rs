@@ -1,5 +1,5 @@
 //! `config.toml` in the manager's Herdr config directory
-//! (`herdr plugin config-dir herdr-plugin-manager`).
+//! (`herdr plugin config-dir gitbridge`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -165,8 +165,8 @@ impl Default for Config {
     }
 }
 
-pub const EXAMPLE: &str = r#"# herdr-plugin-manager configuration.
-# Location: `herdr plugin config-dir herdr-plugin-manager`/config.toml
+pub const EXAMPLE: &str = r#"# GitBridge configuration.
+# Location: `herdr plugin config-dir gitbridge`/config.toml
 
 # Previous installations kept per plugin, for `herdr-pm rollback`.
 keep_installs = 3

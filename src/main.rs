@@ -1,5 +1,5 @@
-//! herdr-plugin-manager (`herdr-pm`): manage Herdr plugins from a popup or
-//! the command line, from GitHub or any git server.
+//! GitBridge (`herdr-pm`): manage Herdr plugins from a popup or the command
+//! line, from GitHub or any git server.
 
 mod config;
 mod detach;
@@ -30,7 +30,7 @@ use crate::ops::{Ctx, InstallRequest, Origin, Status};
 #[command(
     name = "herdr-pm",
     version,
-    about = "Manage Herdr plugins from GitHub or any git server (Gitea, Forgejo, GitLab, plain git).",
+    about = "GitBridge for Herdr: reviewed installs from any Git transport, rollback, and multi-forge discovery.",
     after_help = "Run without a command to open the interactive manager.\n\
                   Sources: owner/repo (GitHub), https://… ssh://… git@host:path git://… file://… /local/path, \
                   alias:path (see `herdr-pm config init`). Append //subdir to pick a plugin inside a repository."
@@ -292,6 +292,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if git {
                 parsed = parsed.into_git();
             }
+            if let Some(s) = subdir.as_deref() {
+                source::validate_subdir(&source::normalize_subdir(s))?;
+            }
             let parsed = parsed.with_subdir(subdir);
             ops::install(
                 &ctx,
@@ -419,10 +422,12 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
             Some(Status::Current) => ops::green("up to date"),
             Some(Status::Available { commit, version }) => ops::yellow(&format!(
                 "↑ {}",
-                version
-                    .clone()
-                    .filter(|v| *v != row.plugin.version)
-                    .unwrap_or_else(|| util::short_sha(commit).to_string())
+                util::sanitize(
+                    &version
+                        .clone()
+                        .filter(|v| *v != row.plugin.version)
+                        .unwrap_or_else(|| util::short_sha(commit).to_string())
+                )
             )),
             Some(Status::Pinned) => ops::dim("pinned"),
             Some(Status::Local) => ops::dim("local"),
@@ -432,9 +437,9 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
         println!(
             "{dot} {:<width$}  {:<9} {:<7} {}  {}",
             row.plugin.plugin_id,
-            util::truncate(&row.plugin.version, 9),
+            util::truncate(&util::sanitize(&row.plugin.version), 9),
             row.origin.label(),
-            ops::dim(&util::truncate(&row.source_display(), 60)),
+            ops::dim(&util::truncate(&util::sanitize(&row.source_display()), 60)),
             status_text,
         );
     }
@@ -512,9 +517,9 @@ fn outdated(ctx: &Ctx, json: bool) -> Result<ExitCode> {
                 "{} {}  {} ({}) → {} ({})",
                 ops::yellow("↑"),
                 row.plugin.plugin_id,
-                row.plugin.version,
+                util::sanitize(&row.plugin.version),
                 util::short_sha(row.commit().unwrap_or("")),
-                version.clone().unwrap_or_else(|| "?".into()),
+                util::sanitize(&version.clone().unwrap_or_else(|| "?".into())),
                 util::short_sha(commit)
             );
         }
@@ -538,7 +543,7 @@ fn info(ctx: &Ctx, id: &str, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     for (key, value) in ops::describe(row) {
-        println!("{:<10} {value}", ops::dim(&key));
+        println!("{:<10} {}", ops::dim(&key), util::sanitize(&value));
     }
     if row.origin != Origin::Local {
         let status = ops::check(row, Git::BACKGROUND);
@@ -598,22 +603,28 @@ fn search(
         let version = e
             .version
             .as_deref()
-            .map(|v| format!(" {v}"))
+            .map(|v| format!(" {}", util::sanitize(v)))
             .unwrap_or_default();
         println!(
             "{}{} {}  {}  {}",
-            ops::bold(&e.title),
+            ops::bold(&util::sanitize(&e.title)),
             version,
-            ops::dim(&format!("[{}]", e.market)),
+            ops::dim(&format!("[{}]", util::sanitize(&e.market))),
             ops::yellow(&stars),
             ops::dim(&util::relative_age(e.updated_unix))
         );
         if !e.description.is_empty() {
-            println!("    {}", util::truncate(&e.description, 90));
+            println!(
+                "    {}",
+                util::truncate(&util::sanitize(&e.description), 90)
+            );
         }
         println!(
             "    {}",
-            ops::cyan(&format!("herdr-pm install {}", e.install_spec()))
+            ops::cyan(&format!(
+                "herdr-pm install {}",
+                util::sanitize(&e.install_spec())
+            ))
         );
     }
     if entries.len() > shown {
@@ -634,21 +645,25 @@ fn sources(config: &Config) -> Result<ExitCode> {
             } else {
                 ops::dim("○")
             },
-            s.name,
+            util::sanitize(&s.name),
             s.kind.label(),
-            s.url.as_deref().unwrap_or("https://api.github.com"),
+            util::sanitize(s.url.as_deref().unwrap_or("https://api.github.com")),
             if matches!(
                 s.kind,
                 config::MarketKind::Index | config::MarketKind::GitIndex
             ) {
                 String::new()
             } else {
-                ops::dim(&format!("  topic:{}", s.topic))
+                ops::dim(&format!("  topic:{}", util::sanitize(&s.topic)))
             }
         );
     }
     for (name, target) in &config.aliases {
-        println!("  alias {name}: → {target}");
+        println!(
+            "  alias {}: → {}",
+            util::sanitize(name),
+            util::sanitize(target)
+        );
     }
     println!(
         "{}",
@@ -781,7 +796,7 @@ fn history(id: Option<&str>, limit: usize) -> Result<ExitCode> {
             e.plugin_id,
             change,
             e.detail
-                .map(|d| ops::dim(&format!("  {}", util::truncate(&d, 80))))
+                .map(|d| ops::dim(&format!("  {}", util::truncate(&util::sanitize(&d), 80))))
                 .unwrap_or_default()
         );
     }

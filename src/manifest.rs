@@ -308,7 +308,7 @@ impl Manifest {
         }
         for (i, event) in self.events.iter().enumerate() {
             out.push(Runnable {
-                label: format!("event {} #{}", event.on, i + 1),
+                label: format!("event {} #{}", util::sanitize(&event.on), i + 1),
                 command: render_argv(&event.command),
                 runs_here: applies_here(&event.platforms, top),
             });
@@ -344,7 +344,7 @@ impl Manifest {
         ));
         lines.push(format!(
             "  requires  herdr >= {}",
-            self.min_herdr_version.as_deref().unwrap_or("?")
+            util::sanitize(self.min_herdr_version.as_deref().unwrap_or("?"))
         ));
         let runnables = self.runnables();
         if runnables.is_empty() {
@@ -357,7 +357,12 @@ impl Manifest {
                 } else {
                     format!("  (skipped on {})", util::current_platform())
                 };
-                lines.push(format!("    {:<22} {}{}", r.label, r.command, skipped));
+                lines.push(format!(
+                    "    {:<22} {}{}",
+                    util::sanitize(&r.label),
+                    r.command,
+                    skipped
+                ));
             }
         }
         if !self.link_handlers.is_empty() {
@@ -365,7 +370,9 @@ impl Manifest {
             for h in &self.link_handlers {
                 lines.push(format!(
                     "    {:<22} {} → action {}",
-                    h.id, h.pattern, h.action
+                    util::sanitize(&h.id),
+                    util::sanitize(&h.pattern),
+                    util::sanitize(&h.action)
                 ));
             }
         }
@@ -478,6 +485,18 @@ action = "apply"
         let shown = render_argv(&argv);
         assert!(!shown.contains('\u{1b}'), "{shown}");
         assert!(shown.contains("\\u{1b}"), "{shown}");
+
+        let hostile = format!(
+            "{SAMPLE}\n[[events]]\non = \"worktree.created\\u001b[2K\\r\"\ncommand = [\"true\"]\n"
+        );
+        let hostile = hostile.replace(
+            "pattern = \"^https://github\\\\.com/\"",
+            "pattern = \"^https://github\\\\.com/\\u001b]0;disguised\\u0007\"",
+        );
+        let m = Manifest::parse(&hostile).unwrap();
+        let preview = m.preview_lines().join("\n");
+        assert!(!preview.contains('\u{1b}'), "{preview:?}");
+        assert!(!preview.contains('\r'), "{preview:?}");
     }
 
     #[test]

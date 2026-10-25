@@ -38,6 +38,39 @@ pub struct CommitInfo {
     pub time: u64,
 }
 
+/// Rejects option injection and Git's ext/remote-helper transports. All
+/// callers, including JSON imports, must pass through this boundary before
+/// any network process can run.
+fn validate_remote(url: &str) -> Result<()> {
+    if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
+        bail!("unsafe git remote {url:?}");
+    }
+    if let Some((scheme, _)) = url.split_once("://") {
+        if matches!(scheme, "http" | "https" | "ssh" | "git" | "file") {
+            return Ok(());
+        }
+        bail!("unsupported git transport in {url:?}");
+    }
+    if url.contains("::") {
+        bail!("remote-helper transports are not accepted: {url:?}");
+    }
+    let path = Path::new(url);
+    if path.is_absolute() || path.exists() {
+        return Ok(());
+    }
+    if let Some((before, after)) = url.split_once(':') {
+        let scp_like = !before.contains(['/', '\\'])
+            && !after.is_empty()
+            && !after.starts_with("//")
+            && !(before.len() == 1 && before.chars().all(|c| c.is_ascii_alphabetic()))
+            && (before.contains('@') || before.contains('.') || before == "localhost");
+        if scp_like {
+            return Ok(());
+        }
+    }
+    bail!("unsupported git remote {url:?}; use http(s), ssh, git, file, scp-style or a local path")
+}
+
 impl Git {
     pub const FOREGROUND: Git = Git { interactive: true };
     pub const BACKGROUND: Git = Git { interactive: false };
@@ -124,6 +157,7 @@ impl Git {
     /// fetching anything. `None` ref means the remote's default branch.
     /// Exact shas resolve to themselves (they cannot move).
     pub fn ls_remote(&self, url: &str, reference: Option<&str>) -> Result<String> {
+        validate_remote(url)?;
         if let Some(reference) = reference {
             if util::is_full_sha(reference) {
                 return Ok(reference.to_lowercase());
@@ -144,7 +178,7 @@ impl Git {
                 format!("refs/heads/{name}"),
             ]
         };
-        let mut args = vec!["ls-remote", url];
+        let mut args = vec!["ls-remote", "--", url];
         args.extend(patterns.iter().map(String::as_str));
         let out = self.run(None, &args, true)?;
         parse_ls_remote(&out, name).ok_or_else(|| match reference {
@@ -158,6 +192,7 @@ impl Git {
 
     /// Mirrors (or refreshes) a remote into the cache and returns it.
     pub fn sync(&self, url: &str) -> Result<Mirror> {
+        validate_remote(url)?;
         let dir = cache_path_for(url);
         std::fs::create_dir_all(dir.parent().unwrap_or(&dir))?;
         let lock_path = dir.with_extension("lock");
@@ -184,6 +219,7 @@ impl Git {
                 "--prune",
                 "--force",
                 "--no-write-fetch-head",
+                "--",
                 url,
                 "+refs/heads/*:refs/heads/*",
                 "+refs/tags/*:refs/tags/*",
@@ -353,7 +389,14 @@ impl Git {
         let dest_str = dest.display().to_string();
         self.run(
             None,
-            &["clone", "--quiet", "--no-checkout", &mirror_path, &dest_str],
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--",
+                &mirror_path,
+                &dest_str,
+            ],
             false,
         )?;
         // The default-branch ref lives outside refs/heads, so bring it along
@@ -361,24 +404,27 @@ impl Git {
         let spec = format!("+{REMOTE_HEAD}:{REMOTE_HEAD}");
         let _ = self.run(
             Some(dest),
-            &["fetch", "--quiet", &mirror_path, &spec],
+            &["fetch", "--quiet", "--", &mirror_path, &spec],
             false,
         );
         self.run(Some(dest), &["checkout", "--quiet", "--detach", sha], false)
             .with_context(|| format!("could not check out {sha}"))?;
-        let _ = self.run(
+        self.run(
             Some(dest),
             &["remote", "set-url", "origin", &mirror.url],
             false,
-        );
+        )?;
         if dest.join(".gitmodules").exists() {
             // Submodule URLs relative to the original remote resolve
-            // correctly now that origin points back at it.
-            let _ = Git::FOREGROUND.run(
-                Some(dest),
-                &["submodule", "update", "--init", "--recursive", "--quiet"],
-                true,
-            );
+            // correctly now that origin points back at it. A partial checkout
+            // must never reach a build or be linked into Herdr.
+            Git::FOREGROUND
+                .run(
+                    Some(dest),
+                    &["submodule", "update", "--init", "--recursive", "--quiet"],
+                    true,
+                )
+                .context("could not initialize repository submodules")?;
         }
         Ok(())
     }
@@ -451,5 +497,28 @@ mod tests {
         assert_eq!(a, cache_path_for("ssh://git@host/a.git"));
         assert_ne!(a, cache_path_for("ssh://git@host/b.git"));
         assert!(a.to_string_lossy().ends_with(".git"));
+    }
+
+    #[test]
+    fn remotes_reject_helpers_options_and_unknown_schemes() {
+        for remote in [
+            "ext::sh -c 'touch /tmp/pwn'",
+            "hg::https://example.test/repo",
+            "--upload-pack=sh",
+            "https://example.test/repo\n--upload-pack=sh",
+            "unknown://example.test/repo",
+        ] {
+            assert!(validate_remote(remote).is_err(), "accepted {remote:?}");
+        }
+        for remote in [
+            "https://example.test/repo.git",
+            "ssh://git@example.test/repo.git",
+            "git://example.test/repo.git",
+            "file:///srv/repo.git",
+            "git@example.test:team/repo.git",
+            "/srv/repo.git",
+        ] {
+            assert!(validate_remote(remote).is_ok(), "rejected {remote:?}");
+        }
     }
 }

@@ -212,7 +212,7 @@ fn agent_for(url: &str) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout(Duration::from_secs(20))
-        .user_agent(concat!("herdr-plugin-manager/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("gitbridge/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = proxy_for(url).and_then(|p| ureq::Proxy::new(p).ok()) {
         builder = builder.proxy(proxy);
     }
@@ -226,6 +226,7 @@ fn describe_http_error(url: &str, err: ureq::Error) -> anyhow::Error {
             let message = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v["message"].as_str().map(str::to_string))
+                .map(|m| util::sanitize(&m))
                 .unwrap_or_else(|| util::truncate(&util::sanitize(&body), 120));
             let hint = match code {
                 401 => " (token missing or rejected)",
@@ -293,21 +294,35 @@ fn enc(value: &str) -> String {
 }
 
 fn gh_token(config: &Config, source: &MarketSource) -> Option<String> {
+    if std::env::var_os("HERDR_PM_NO_TOKEN").is_some() {
+        return None;
+    }
     if let Some(t) = source.resolve_token() {
         return Some(t);
     }
-    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+    let enterprise = source.url.is_some();
+    let variables: &[&str] = if enterprise {
+        &["GH_ENTERPRISE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+    } else {
+        &["GH_TOKEN", "GITHUB_TOKEN"]
+    };
+    for var in variables {
         if let Ok(t) = std::env::var(var) {
             if !t.trim().is_empty() {
                 return Some(t.trim().to_string());
             }
         }
     }
-    if std::env::var_os("HERDR_PM_NO_TOKEN").is_some() || !config.use_gh_cli {
+    if !config.use_gh_cli {
         return None;
     }
     let mut command = std::process::Command::new("gh");
     command.args(["auth", "token"]);
+    if enterprise {
+        if let Some((host, _)) = source.url.as_deref().and_then(host_of) {
+            command.args(["--hostname", &host]);
+        }
+    }
     let out = util::run_captured(command, Some(Duration::from_secs(5))).ok()?;
     if !out.status.success() {
         return None;

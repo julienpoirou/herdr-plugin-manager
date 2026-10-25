@@ -186,7 +186,7 @@ fn same_path(a: &str, b: &str) -> bool {
 /// Joins Herdr's plugin list with this manager's records.
 pub fn rows(herdr: &Herdr) -> Result<Vec<Row>> {
     let plugins = herdr.list()?;
-    let registry = Registry::load().unwrap_or_default();
+    let registry = Registry::load()?;
     Ok(plugins
         .into_iter()
         .map(|plugin| {
@@ -258,7 +258,7 @@ pub fn check(row: &Row, git: Git) -> Status {
 }
 
 fn first_line(text: &str) -> String {
-    util::truncate(text.lines().next().unwrap_or(text), 160)
+    util::truncate(&util::sanitize(text.lines().next().unwrap_or(text)), 160)
 }
 
 /// Version string of the plugin at `commit` (best effort).
@@ -338,6 +338,9 @@ pub struct InstallRequest {
 /// Entry point for `install`: GitHub shorthands go to Herdr's own
 /// installer, everything else through the git pipeline.
 pub fn install(ctx: &Ctx, request: InstallRequest) -> Result<bool> {
+    if request.replace && matches!(&request.source, Source::Github { .. }) {
+        bail!("--replace with a GitHub shorthand needs Herdr replacement support; rerun with --git to replace it through the safe git pipeline");
+    }
     match request.source {
         Source::Github { .. } => {
             let spec = request.source.display();
@@ -423,8 +426,11 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         .as_deref()
         .map(source::normalize_subdir)
         .filter(|s| !s.is_empty());
+    if let Some(s) = subdir.as_deref() {
+        source::validate_subdir(s)?;
+    }
 
-    step(&format!("fetching {}", request.url));
+    step(&format!("fetching {}", util::sanitize(&request.url)));
     let mirror = git.sync(&request.url)?;
     let sha = git.resolve(&mirror, request.checkout_ref.as_deref())?;
     let mut subdir = subdir;
@@ -499,10 +505,15 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         }
     }
 
-    let follow = request
-        .follow_ref
-        .clone()
-        .unwrap_or_else(|| request.checkout_ref.clone());
+    let follow = request.follow_ref.clone().unwrap_or_else(|| {
+        request.checkout_ref.as_ref().map(|reference| {
+            if util::looks_like_sha(reference) {
+                sha.clone()
+            } else {
+                reference.clone()
+            }
+        })
+    });
 
     if let (true, Some(r)) = (record_live, &record) {
         if r.current.commit == sha && r.url == request.url && r.subdir == subdir {
@@ -550,8 +561,12 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
             }
         ))
     );
-    eprintln!("  source    {source_display}");
-    eprintln!("  ref       {ref_label} → {}", bold(util::short_sha(&sha)));
+    eprintln!("  source    {}", util::sanitize(&source_display));
+    eprintln!(
+        "  ref       {} → {}",
+        util::sanitize(&ref_label),
+        bold(util::short_sha(&sha))
+    );
     if let Some(c) = &commit {
         eprintln!(
             "  commit    {}  {}",
@@ -562,7 +577,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
     if follow != request.checkout_ref {
         eprintln!(
             "  follows   {}",
-            follow.as_deref().unwrap_or("default branch")
+            util::sanitize(follow.as_deref().unwrap_or("default branch"))
         );
     }
     for line in manifest.preview_lines() {
@@ -577,16 +592,17 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         eprintln!(
             "  {} {} ({}) → {} ({})",
             bold("change"),
-            r.current.version,
+            util::sanitize(&r.current.version),
             util::short_sha(&r.current.commit),
-            manifest.version,
+            util::sanitize(&manifest.version),
             util::short_sha(&sha)
         );
         if r.url != request.url || r.subdir != subdir {
             eprintln!(
-                "  {} {} → {source_display}",
+                "  {} {} → {}",
                 yellow("source changes:"),
-                r.source_display()
+                util::sanitize(&r.source_display()),
+                util::sanitize(&source_display)
             );
         }
         match git.count_range(&mirror, &r.current.commit, &sha) {
@@ -627,7 +643,11 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
             } else {
                 format!("local link {}", plugin.plugin_root)
             };
-            eprintln!("  {} {what}", yellow("replaces"));
+            eprintln!(
+                "  {} {what}",
+                yellow("replaces"),
+                what = util::sanitize(&what)
+            );
         }
     }
     eprintln!();
@@ -705,12 +725,6 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         .enabled
         .or(existing.as_ref().map(|p| p.enabled))
         .unwrap_or(true);
-    if let Some(plugin) = &existing {
-        if plugin.is_github() && request.replace {
-            step(&format!("removing herdr's GitHub install of {id}"));
-            ctx.herdr.unregister(&id)?;
-        }
-    }
     step(&format!("linking {}", plugin_root.display()));
     if let Err(err) = ctx.herdr.link(&plugin_root, enabled) {
         let _ = std::fs::remove_dir_all(&install_dir);
@@ -775,11 +789,12 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
     cleanup_installs(&id);
 
     println!(
-        "{} {} {id} {} ({}) from {source_display}.",
+        "{} {} {id} {} ({}) from {}.",
         green("✓"),
         capitalize(past(request.mode)),
-        manifest.version,
-        util::short_sha(&sha)
+        util::sanitize(&manifest.version),
+        util::short_sha(&sha),
+        util::sanitize(&source_display),
     );
     println!(
         "  config: {}",
@@ -967,9 +982,13 @@ fn new_install_dir(id: &str, sha: &str) -> Result<PathBuf> {
 /// Moves installations nobody references into the trash, and empties trash
 /// older than a day (giving running plugin processes time to finish).
 pub fn cleanup_installs(id: &str) {
-    let referenced: Vec<PathBuf> = Registry::load()
-        .ok()
-        .and_then(|r| r.get(id).cloned())
+    let registry = match Registry::load() {
+        Ok(registry) => registry,
+        Err(_) => return,
+    };
+    let referenced: Vec<PathBuf> = registry
+        .get(id)
+        .cloned()
         .map(|r| {
             std::iter::once(&r.current)
                 .chain(r.previous.iter())
@@ -1448,7 +1467,7 @@ pub fn switch(ctx: &Ctx, id: &str, reference: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- export / import
 
-pub const EXPORT_FORMAT: &str = "herdr-plugin-manager-export";
+pub const EXPORT_FORMAT: &str = "gitbridge-export";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExportEntry {
@@ -1528,10 +1547,7 @@ pub fn export(herdr: &Herdr) -> Result<(ExportFile, Vec<String>)> {
 /// number of failures.
 pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
     if file.format != EXPORT_FORMAT {
-        bail!(
-            "not a herdr-plugin-manager export (format {:?})",
-            file.format
-        );
+        bail!("not a GitBridge export (format {:?})", file.format);
     }
     let rows = rows(&ctx.herdr)?;
     let mut failures = 0;
@@ -1570,21 +1586,31 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
             continue;
         }
         let result = match entry.kind.as_str() {
-            "git" => install_git(
-                ctx,
-                GitRequest {
-                    url: entry.source.clone(),
-                    subdir: entry.subdir.clone(),
-                    checkout_ref: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
-                    follow_ref: Some(entry.follow_ref.clone()),
-                    mode: Mode::Import,
-                    enabled: Some(entry.enabled),
-                    replace: false,
-                    expect_id: Some(entry.id.clone()),
-                },
-            )
-            .map(|_| ()),
-            "github" => {
+            "git" => (|| -> Result<()> {
+                let parsed = source::parse(&entry.source, &ctx.config.aliases)?
+                    .with_subdir(entry.subdir.clone());
+                let Source::Git { url, subdir } = parsed else {
+                    bail!(
+                        "git import entry {} does not contain a git source",
+                        entry.id
+                    );
+                };
+                install_git(
+                    ctx,
+                    GitRequest {
+                        url,
+                        subdir,
+                        checkout_ref: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
+                        follow_ref: Some(entry.follow_ref.clone()),
+                        mode: Mode::Import,
+                        enabled: Some(entry.enabled),
+                        replace: false,
+                        expect_id: Some(entry.id.clone()),
+                    },
+                )
+                .map(|_| ())
+            })(),
+            "github" => (|| -> Result<()> {
                 let spec = match &entry.subdir {
                     Some(s) => format!("{}/{s}", entry.source),
                     None => entry.source.clone(),
@@ -1593,13 +1619,15 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
                     ctx,
                     InstallRequest {
                         source: source::parse(&format!("github:{spec}"), &Default::default())?,
-                        reference: entry.follow_ref.clone(),
+                        // Reproduce the exported state exactly; a following
+                        // ref is only a fallback for older/incomplete exports.
+                        reference: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
                         enabled: Some(entry.enabled),
                         replace: false,
                     },
                 )
                 .map(|_| ())
-            }
+            })(),
             other => Err(anyhow!("unknown kind {other:?}")),
         };
         if let Err(err) = result {

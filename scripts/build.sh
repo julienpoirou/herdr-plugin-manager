@@ -14,13 +14,13 @@ mkdir -p bin
 if [ "${HERDR_PM_BUILD_FROM_SOURCE:-0}" != "1" ] && [ -x bin/herdr-pm ]; then
   have="$(./bin/herdr-pm --version 2>/dev/null | awk '{print $2}')" || have=""
   if [ "$have" = "$want" ]; then
-    echo "herdr-plugin-manager: using prebuilt bin/herdr-pm $have"
+    echo "GitBridge: using prebuilt bin/herdr-pm $have"
     exit 0
   fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "herdr-plugin-manager: building needs Rust (https://rustup.rs) and a C compiler," >&2
+  echo "GitBridge: building needs Rust (https://rustup.rs) and a C compiler," >&2
   echo "or a checkout that already contains bin/herdr-pm $want." >&2
   exit 1
 fi
@@ -28,11 +28,11 @@ fi
 # One shared target directory: installations stay small (no 250 MB target/
 # per kept version) and rebuilds after an update are incremental.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/herdr-plugin-manager/target"
+  CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitbridge/target"
   export CARGO_TARGET_DIR
 fi
-echo "herdr-plugin-manager: building $want with $(cargo --version)"
+echo "GitBridge: building $want with $(cargo --version)"
 cargo build --release --locked --quiet
 cp "$CARGO_TARGET_DIR/release/herdr-pm" bin/herdr-pm.tmp
 mv -f bin/herdr-pm.tmp bin/herdr-pm
-echo "herdr-plugin-manager: built bin/herdr-pm"
+echo "GitBridge: built bin/herdr-pm"

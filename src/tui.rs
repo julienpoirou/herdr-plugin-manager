@@ -34,7 +34,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 // ---------------------------------------------------------------- palette
 
-const ACCENT: Color = Color::Cyan;
+const ACCENT: Color = Color::Indexed(141);
 const OK: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
@@ -574,7 +574,14 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
             if force_git {
                 parsed = parsed.into_git();
             }
-            println!("{} {}\n", ops::bold("install"), parsed.display());
+            if let Some(s) = subdir.as_deref() {
+                source::validate_subdir(&source::normalize_subdir(s))?;
+            }
+            println!(
+                "{} {}\n",
+                ops::bold("install"),
+                util::sanitize(&parsed.display())
+            );
             ops::install(
                 &app.ctx,
                 InstallRequest {
@@ -596,8 +603,8 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
             println!(
                 "{} {} {}\n",
                 ops::bold("install"),
-                parsed.display(),
-                ops::dim(&format!("[{}]", entry.market))
+                util::sanitize(&parsed.display()),
+                ops::dim(&format!("[{}]", util::sanitize(&entry.market)))
             );
             ops::install(
                 &app.ctx,
@@ -1015,7 +1022,13 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         KeyCode::Char('x') | KeyCode::Delete => {
             let id = id?;
             if id == paths::PLUGIN_ID {
-                app.say(Level::Warn, "use `herdr-pm uninstall herdr-plugin-manager` from a shell to remove the manager itself");
+                app.say(
+                    Level::Warn,
+                    format!(
+                        "use `herdr-pm uninstall {}` from a shell to remove the manager itself",
+                        paths::PLUGIN_ID
+                    ),
+                );
             } else {
                 app.confirm = Some(Confirm::Uninstall(id));
             }
@@ -1303,7 +1316,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut spans = vec![
         Span::styled(
-            " herdr plugins ",
+            " gitbridge // herdr ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
         tab(installed_label, app.view == View::Installed),
@@ -1340,10 +1353,12 @@ fn status_span(app: &App, row: &Row) -> Span<'static> {
             Status::Available { commit, version } => Span::styled(
                 format!(
                     "↑ {}",
-                    version
-                        .clone()
-                        .filter(|v| *v != row.plugin.version)
-                        .unwrap_or_else(|| util::short_sha(commit).to_string())
+                    util::sanitize(
+                        &version
+                            .clone()
+                            .filter(|v| *v != row.plugin.version)
+                            .unwrap_or_else(|| util::short_sha(commit).to_string())
+                    )
                 ),
                 Style::default().fg(WARN).add_modifier(Modifier::BOLD),
             ),
@@ -1369,7 +1384,7 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
                 "could not read the plugin list from herdr:",
                 Style::default().fg(BAD),
             ),
-            Line::raw(err.clone()),
+            Line::raw(util::sanitize(err)),
         ])
         .wrap(Wrap { trim: true });
         f.render_widget(p, inner);
@@ -1474,7 +1489,10 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw(pad(&action.id, 18)),
                     Span::raw(" "),
                     Span::styled(
-                        util::truncate(&action.title, width.saturating_sub(48).max(10)),
+                        util::truncate(
+                            &util::sanitize(&action.title),
+                            width.saturating_sub(48).max(10),
+                        ),
                         muted(),
                     ),
                 ];
@@ -1495,7 +1513,7 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
 fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:<8} "), muted()),
-        Span::raw(value.into()),
+        Span::raw(util::sanitize(&value.into())),
     ])
 }
 
@@ -1545,7 +1563,7 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
             match app.checks.get(&row.plugin.plugin_id) {
                 Some(Check::Done(Status::Error { message })) => lines.push(Line::from(vec![
                     Span::styled("check    ", muted()),
-                    Span::styled(message.clone(), Style::default().fg(BAD)),
+                    Span::styled(util::sanitize(message), Style::default().fg(BAD)),
                 ])),
                 Some(Check::Done(Status::Available { commit, version })) => {
                     lines.push(Line::from(vec![
@@ -1553,8 +1571,10 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(
                             format!(
                                 "{} → {} ({}) — press u",
-                                row.plugin.version,
-                                version.clone().unwrap_or_else(|| "new commit".into()),
+                                util::sanitize(&row.plugin.version),
+                                util::sanitize(
+                                    &version.clone().unwrap_or_else(|| "new commit".into())
+                                ),
                                 util::short_sha(commit)
                             ),
                             Style::default().fg(WARN),
@@ -1568,7 +1588,7 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
             }
             for w in &row.plugin.warnings {
                 lines.push(Line::styled(
-                    format!("warning: {w}"),
+                    util::sanitize(&format!("warning: {w}")),
                     Style::default().fg(WARN),
                 ));
             }
@@ -1637,7 +1657,10 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
     }
     for (name, err) in &app.market.errors {
         lines.push(Line::styled(
-            util::truncate(&format!("✗ {name}: {err}"), inner.width as usize),
+            util::truncate(
+                &util::sanitize(&format!("✗ {name}: {err}")),
+                inner.width as usize,
+            ),
             Style::default().fg(BAD),
         ));
     }
@@ -1725,14 +1748,14 @@ fn draw_market_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if let Some(entry) = app.market.entries.get(app.market.sel) {
         let mut head = vec![Span::styled(
-            entry.title.clone(),
+            util::sanitize(&entry.title),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
         if let Some(v) = &entry.version {
-            head.push(Span::styled(format!("  {v}"), muted()));
+            head.push(Span::styled(format!("  {}", util::sanitize(v)), muted()));
         }
         if let Some(id) = &entry.plugin_id {
-            head.push(Span::styled(format!("  ({id})"), muted()));
+            head.push(Span::styled(format!("  ({})", util::sanitize(id)), muted()));
         }
         lines.push(Line::from(head));
         lines.push(kv(
@@ -1756,7 +1779,8 @@ fn draw_market_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::styled(
                 format!(
                     "installed as {} {}",
-                    row.plugin.plugin_id, row.plugin.version
+                    util::sanitize(&row.plugin.plugin_id),
+                    util::sanitize(&row.plugin.version)
                 ),
                 Style::default().fg(OK),
             ));
@@ -1911,7 +1935,10 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
         + 4;
     let rect = centered(area, width, body.len() as u16 + 4);
     f.render_widget(Clear, rect);
-    let mut lines: Vec<Line> = body.into_iter().map(Line::raw).collect();
+    let mut lines: Vec<Line> = body
+        .into_iter()
+        .map(|l| Line::raw(util::sanitize(&l)))
+        .collect();
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled("y", Style::default().fg(OK).add_modifier(Modifier::BOLD)),

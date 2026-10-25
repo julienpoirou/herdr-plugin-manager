@@ -1,0 +1,42 @@
+name: Bug report
+description: Report incorrect or unsafe GitBridge behavior
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and the actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Commands, minimal manifest/export, and output. Remove credentials and private URLs.
+      placeholder: herdr-pm install …
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, herdr-pm version, Herdr version and Git version.
+      placeholder: Windows 11; herdr-pm 0.1.0; herdr 0.8.2; git 2.55
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options: [CLI, Popup, Git install, GitHub install, Marketplace, Import/export, Offline registry, Build script]
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This report contains no credentials, private tokens, or sensitive repository content.
+          required: true

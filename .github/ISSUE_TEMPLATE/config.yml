@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and usage
+    url: https://github.com/julienpoirou/herdr-plugin-manager/discussions
+    about: Ask questions and share configurations in Discussions.
+  - name: Security reports
+    url: https://github.com/julienpoirou/herdr-plugin-manager/security/policy
+    about: Use the private contact in the security policy, not a public issue.

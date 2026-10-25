@@ -115,6 +115,28 @@ out="$("$HPM" history team.hello)"
 contains "$out" "rollback"
 ok "history records changes"
 
+# --- abbreviated commit ids remain checkable
+SHORT="$(git -C "$T/work/hello" rev-parse --short HEAD)"
+expect "switch to an abbreviated commit" "$HPM" switch team.hello "$SHORT" --yes
+expect "check updates after abbreviated commit" "$HPM" outdated
+
+
+# --- annotated tags peel to commits and deleted refs leave the mirror
+git -C "$T/work/hello" tag -a v-temp -m temporary
+git -C "$T/work/hello" push -q "$HELLO" refs/tags/v-temp
+expect "switch to an annotated tag" "$HPM" switch team.hello v-temp --yes
+git -C "$T/work/hello" tag -d v-temp >/dev/null
+git -C "$T/work/hello" push -q "$HELLO" :refs/tags/v-temp
+expect_fail "deleted tag is pruned from the mirror" "$HPM" switch team.hello v-temp --yes
+expect "restore default branch after tag test" "$HPM" unpin team.hello
+
+# --- a corrupt private registry must not masquerade as local links
+REG="$XDG_STATE_HOME/herdr/plugins/gitbridge/registry.json"
+cp "$REG" "$T/registry.good"
+printf 'not json\n' > "$REG"
+expect_fail "corrupt registry is reported" "$HPM" list
+mv "$T/registry.good" "$REG"
+
 # --- refusals
 plugin "$T/work/newer" team.newer Newer 0.0.1
 sed -i.bak 's/min_herdr_version = "0.7.0"/min_herdr_version = "99.0.0"/' "$T/work/newer/herdr-plugin.toml"
@@ -132,6 +154,38 @@ contains "$out" "pass --yes"
 out="$("$HPM" list)"
 case "$out" in *team.quiet*) fail "installed without confirmation" ;; esac
 ok "refuses a non-interactive install without --yes"
+
+# --- path traversal and hostile import transports
+expect_fail "rejects parent components in --subdir" "$HPM" install "$MONO" --subdir ../hello --yes
+MARKER="$T/ext-transport-ran"
+cat > "$T/hostile-import.json" <<EOF
+{"format":"gitbridge-export","version":1,"exported_unix":0,"plugins":[{"id":"hostile","kind":"git","source":"ext::touch $MARKER","enabled":true},{"id":"hostile-ansi","kind":"git","source":"https://example.invalid/repo\u001b[2K","enabled":true}]}
+EOF
+expect_fail "rejects ext transport in an import" env GIT_ALLOW_PROTOCOL=ext "$HPM" import "$T/hostile-import.json" --yes
+case "$out" in *"$(printf '\033')"*) fail "source URL escape reached the terminal" ;; esac
+ok "hostile source URLs are sanitized"
+[ ! -e "$MARKER" ] || fail "ext transport executed before confirmation"
+ok "hostile import executes nothing"
+
+# --- terminal control sequences cannot rewrite the trust preview
+plugin "$T/work/ansi" team.ansi Ansi 0.1.0
+cat >> "$T/work/ansi/herdr-plugin.toml" <<'EOF'
+
+[[events]]
+on = "worktree.created\u001b[2K\r"
+command = ["sh", "-c", "true"]
+
+[[link_handlers]]
+id = "web\u001b[2K"
+title = "Open"
+pattern = "^https://example.test/\u001b]0;disguised\u0007"
+action = "hello"
+EOF
+publish "$T/work/ansi" ansi
+out="$("$HPM" install "$SRV/team/ansi.git" --yes 2>&1 || true)"
+contains "$out" "Plugin install preview"
+case "$out" in *"$(printf '\033')"*) fail "escape sequence reached the terminal" ;; esac
+ok "manifest escape sequences are sanitized"
 
 # --- enable/disable without and with a server
 expect "disable (no server)" "$HPM" disable team.a

@@ -4,10 +4,11 @@
 //! first, then the platform default) so the CLI, the popup, and Herdr agree
 //! on locations without asking a running server.
 
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// The plugin id declared in `herdr-plugin.toml`.
-pub const PLUGIN_ID: &str = "herdr-plugin-manager";
+pub const PLUGIN_ID: &str = "gitbridge";
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
@@ -66,8 +67,39 @@ pub fn herdr_plugin_config_dir(plugin_id: &str) -> PathBuf {
         .join(plugin_path_component(plugin_id))
 }
 
+/// Windows rejects these device names even with an extension.
+fn has_windows_reserved_stem(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 /// Same encoding Herdr uses for per-plugin directories: lowercase letters,
 /// digits, `.`, `_` and `-` pass through; everything else is `%XX`.
+/// Reserved device names and long ids are made safe exactly as Herdr does.
 pub fn plugin_path_component(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -82,11 +114,22 @@ pub fn plugin_path_component(value: &str) -> String {
         out.pop();
         out.push_str("%2E");
     }
-    if out.is_empty() {
-        "%plugin".to_string()
-    } else {
-        out
+    if has_windows_reserved_stem(&out) {
+        out = format!("%{out}");
     }
+    if out.is_empty() {
+        return "%plugin".to_string();
+    }
+    if out.chars().count() > 120 {
+        let digest = Sha256::digest(value.as_bytes());
+        let hash = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let prefix = out.chars().take(120 - hash.len() - 1).collect::<String>();
+        return format!("{prefix}-{hash}");
+    }
+    out
 }
 
 fn running_as_this_plugin() -> bool {
@@ -167,5 +210,10 @@ mod tests {
         assert_eq!(plugin_path_component("Example"), "%45xample");
         assert_eq!(plugin_path_component("example."), "example%2E");
         assert_eq!(plugin_path_component(PLUGIN_ID), PLUGIN_ID);
+        assert_eq!(plugin_path_component("con"), "%con");
+        let long_a = plugin_path_component(&"A".repeat(128));
+        let long_b = plugin_path_component(&"B".repeat(128));
+        assert_ne!(long_a, long_b);
+        assert!(long_a.len() <= 120);
     }
 }

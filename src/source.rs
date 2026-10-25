@@ -97,7 +97,7 @@ pub fn normalize_subdir(value: &str) -> String {
         .join("/")
 }
 
-fn validate_subdir(subdir: &str) -> Result<()> {
+pub fn validate_subdir(subdir: &str) -> Result<()> {
     if subdir.split('/').any(|s| s == "..") {
         bail!("subdirectory may not contain '..': {subdir}");
     }

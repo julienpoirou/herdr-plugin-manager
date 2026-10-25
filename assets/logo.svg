@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">GitBridge for Herdr</title>
+  <desc id="desc">A luminous bridge linking three commit nodes</desc>
+  <defs>
+    <linearGradient id="signal" x1="80" y1="80" x2="432" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#11131A"/>
+  <rect x="28" y="28" width="456" height="456" rx="100" fill="none" stroke="#282D3A" stroke-width="4"/>
+  <g fill="none" stroke="url(#signal)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M112 348V248c0-82 64-136 144-136s144 54 144 136v100"/>
+    <path d="M112 288c72 0 96 64 144 64s72-64 144-64"/>
+  </g>
+  <g fill="#11131A" stroke="url(#signal)" stroke-width="20">
+    <circle cx="112" cy="348" r="43"/>
+    <circle cx="256" cy="352" r="43"/>
+    <circle cx="400" cy="348" r="43"/>
+  </g>
+  <g fill="url(#signal)">
+    <circle cx="112" cy="348" r="14"/>
+    <circle cx="256" cy="352" r="14"/>
+    <circle cx="400" cy="348" r="14"/>
+  </g>
+</svg>

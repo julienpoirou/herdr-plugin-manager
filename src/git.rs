@@ -516,9 +516,12 @@ mod tests {
             "git://example.test/repo.git",
             "file:///srv/repo.git",
             "git@example.test:team/repo.git",
-            "/srv/repo.git",
         ] {
             assert!(validate_remote(remote).is_ok(), "rejected {remote:?}");
         }
+        #[cfg(unix)]
+        assert!(validate_remote("/srv/repo.git").is_ok());
+        #[cfg(windows)]
+        assert!(validate_remote(r"C:\srv\repo.git").is_ok());
     }
 }

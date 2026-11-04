@@ -1,0 +1,351 @@
+name: Release
+
+# Pushes to main keep a release-please pull request up to date. Merging it
+# tags the version, creates the GitHub release, and publishes the binaries,
+# the crate and the container image from that exact commit.
+#
+# workflow_dispatch publishes (or republishes) a given tag. A missing tag is
+# created on the head of the branch the workflow runs from.
+#
+# Pull requests that touch the release inputs run every build and the image
+# build without publishing anything.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .release-please-config.json
+      - .release-please-manifest.json
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - herdr-plugin.toml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.2.0 (Cargo.toml and herdr-plugin.toml must carry that version)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release-please:
+    name: Release pull request
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  plan:
+    name: Resolve release
+    needs: release-please
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'push' || needs.release-please.outputs.created == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      sha: ${{ steps.plan.outputs.sha }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          TAG: ${{ inputs.tag || needs.release-please.outputs.tag }}
+        run: |
+          set -euo pipefail
+          publish=true
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            # Dry run: the version the pull request would release.
+            publish=false
+            TAG="v$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+          if [[ "$publish" == true ]] && git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          else
+            sha="$GITHUB_SHA"
+          fi
+          git show "$sha:Cargo.toml" > "$RUNNER_TEMP/Cargo.toml"
+          git show "$sha:herdr-plugin.toml" > "$RUNNER_TEMP/herdr-plugin.toml"
+          version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$RUNNER_TEMP/Cargo.toml")"
+          plugin="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$RUNNER_TEMP/herdr-plugin.toml")"
+          if [[ "$version" != "${TAG#v}" || "$plugin" != "$version" ]]; then
+            echo "::error::$TAG does not match $sha (Cargo.toml $version, herdr-plugin.toml $plugin)"
+            exit 1
+          fi
+          prerelease=false
+          if [[ "$version" == *-* ]]; then prerelease=true; fi
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $TAG from $sha (prerelease: $prerelease, publish: $publish)"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: plan
+    # release-please is skipped outside pushes; without an explicit condition
+    # that skip would propagate to every downstream job.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Static Linux binaries: ring's C code must be compiled for musl too.
+          if [[ "$TARGET" == *-musl ]]; then export "CC_${TARGET//-/_}=musl-gcc"; fi
+          cargo build --release --locked --target "$TARGET"
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=herdr-pm
+          if [[ "$TARGET" == *-windows-* ]]; then exe=herdr-pm.exe; fi
+          bin="target/$TARGET/release/$exe"
+          # x86_64 macOS is cross-compiled on an arm64 runner; everything else runs here.
+          if [[ "$TARGET" != x86_64-apple-darwin ]]; then
+            reported="$("$bin" --version)"
+            if [[ "$reported" != "herdr-pm $VERSION" ]]; then
+              echo "::error::$bin reports '$reported', expected 'herdr-pm $VERSION'"
+              exit 1
+            fi
+          fi
+          name="gitbridge-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$bin" README.md LICENSE CHANGELOG.md "dist/$name/"
+          cd dist
+          if [[ "$TARGET" == *-windows-* ]]; then
+            archive="$name.zip"
+            7z a -tzip -bso0 "$archive" "$name"
+          else
+            archive="$name.tar.gz"
+            tar -czf "$archive" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gitbridge-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gitbridge-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload assets
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # The CHANGELOG.md section of this version ("## 0.2.0 — …" or
+            # release-please's "## [0.3.0](…) (…)").
+            awk -v v="$VERSION" '
+              $1 == "##" { h = $2; sub(/^\[/, "", h); sub(/\].*$/, "", h); if (found) exit; found = (h == v); next }
+              found
+            ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+            if [[ ! -s "$RUNNER_TEMP/notes.md" ]]; then
+              echo "See [CHANGELOG.md](CHANGELOG.md)." > "$RUNNER_TEMP/notes.md"
+            fi
+            flags=()
+            if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --target "$SHA" --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+  crates-io:
+    name: crates.io
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - id: gate
+        name: Choose publish, dry run or skip
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH" != true ]]; then
+            mode=dry-run
+          elif [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipping crates.io"
+            mode=skip
+          elif [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -A "gitbridge-release (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})" \
+                    "https://crates.io/api/v1/crates/gitbridge/$VERSION")" == 200 ]]; then
+            echo "::notice::gitbridge $VERSION is already on crates.io"
+            mode=skip
+          else
+            mode=publish
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.mode != 'skip'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - if: steps.gate.outputs.mode != 'skip'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.gate.outputs.mode == 'dry-run'
+        run: cargo publish --locked --dry-run
+      - if: steps.gate.outputs.mode == 'publish'
+        run: cargo publish --locked
+
+  container:
+    name: GHCR image
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gitbridge-*-linux-musl
+          path: dist
+          merge-multiple: true
+      - name: Stage static binaries
+        run: |
+          set -euo pipefail
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}"
+            name="gitbridge-$VERSION-${pair#*:}-unknown-linux-musl"
+            mkdir -p "image/$arch"
+            tar -xzf "dist/$name.tar.gz" -C "image/$arch" --strip-components=1 "$name/herdr-pm"
+          done
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - if: needs.plan.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/gitbridge
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.plan.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.plan.outputs.prerelease == 'false' }}
+          flavor: latest=false
+          labels: |
+            org.opencontainers.image.title=GitBridge for Herdr
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+          annotations: |
+            org.opencontainers.image.title=GitBridge for Herdr
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+      - name: Build the amd64 image locally
+        uses: docker/build-push-action@v7
+        with:
+          context: image
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: gitbridge:smoke
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          reported="$(docker run --rm gitbridge:smoke --version)"
+          if [[ "$reported" != "herdr-pm $VERSION" ]]; then
+            echo "::error::image reports '$reported', expected 'herdr-pm $VERSION'"
+            exit 1
+          fi
+          docker run --rm --entrypoint git gitbridge:smoke --version
+      - name: Build and push linux/amd64 and linux/arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: image
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.plan.outputs.publish == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}

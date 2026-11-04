@@ -1,10 +1,12 @@
 [package]
 name = "gitbridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "GitBridge for Herdr: reviewed installs from any Git transport, rollback, and multi-forge plugin discovery."
 license = "MIT"
+repository = "https://github.com/julienpoirou/herdr-plugin-manager"
+readme = "README.md"
 keywords = ["herdr", "herdr-plugin", "tui", "plugin-manager", "git"]
 categories = ["command-line-utilities"]
 

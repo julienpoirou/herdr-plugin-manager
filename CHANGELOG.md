@@ -1,8 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-11-04
 
-## Unreleased
-
+- Publish releases: release-please release pull requests, prebuilt
+  `herdr-pm` archives for Linux (static musl), macOS and Windows with
+  SHA-256 checksums, the `ghcr.io/julienpoirou/gitbridge` container image,
+  and the `gitbridge` crate on crates.io when `CARGO_REGISTRY_TOKEN` is set.
 - Rename the user-facing interface and Herdr plugin id to GitBridge
   (`gitbridge`), add an original logo, rewrite the documentation, and expand
   community/CI configuration.

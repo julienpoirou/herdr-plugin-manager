@@ -619,7 +619,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitbridge"
+name = "herdr-plugin-manager"
 version = "0.2.0"
 dependencies = [
  "anyhow",

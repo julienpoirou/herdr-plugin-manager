@@ -12,8 +12,9 @@ plugins from GitHub, GitLab, Gitea/Forgejo, a company Git appliance, a bare
 repository, or a directory on disk. The same `herdr-pm` binary provides a
 Ratatui popup and a scriptable CLI.
 
-The repository remains `herdr-plugin-manager`; the Herdr plugin id and Cargo
-package are **`gitbridge`**. The user-facing name is **GitBridge for Herdr**.
+The repository, Cargo package and published packages are
+**`herdr-plugin-manager`**; the Herdr plugin id is **`gitbridge`**. The
+user-facing name is **GitBridge for Herdr**.
 
 [English](#why-gitbridge) · [Français](#français)
 
@@ -83,9 +84,9 @@ publishes the same `herdr-pm` binary in three forms:
 
 | Package | Install |
 |---|---|
-| Archives with `.sha256` checksums: Linux x86_64/arm64 (static musl), macOS x86_64/arm64, Windows x86_64 | Download `gitbridge-<version>-<target>.tar.gz` or `.zip` and put `herdr-pm` on `PATH` |
-| [crates.io](https://crates.io/crates/gitbridge) | `cargo install gitbridge --locked` |
-| [GHCR](https://github.com/julienpoirou/herdr-plugin-manager/pkgs/container/gitbridge) image (linux/amd64, linux/arm64) with Git | `docker run --rm -v "$PWD:/work" ghcr.io/julienpoirou/gitbridge index check herdr-index.json` |
+| Archives with `.sha256` checksums: Linux x86_64/arm64 (static musl), macOS x86_64/arm64, Windows x86_64 | Download `herdr-plugin-manager-<version>-<target>.tar.gz` or `.zip` and put `herdr-pm` on `PATH` |
+| [crates.io](https://crates.io/crates/herdr-plugin-manager) | `cargo install herdr-plugin-manager --locked` |
+| [GHCR](https://github.com/julienpoirou/herdr-plugin-manager/pkgs/container/herdr-plugin-manager) image (linux/amd64, linux/arm64) with Git | `docker run --rm -v "$PWD:/work" ghcr.io/julienpoirou/herdr-plugin-manager index check herdr-index.json` |
 
 The container image is meant for catalog jobs (`index build`, `index check`,
 `search`, `sources`). Plugin management needs a local Herdr.
@@ -351,8 +352,9 @@ natif ne propose pas cette opération de remplacement.
 
 **Releases et paquets** : chaque release GitHub publie des archives
 `herdr-pm` (Linux musl x86_64/arm64, macOS x86_64/arm64, Windows x86_64) avec
-leurs sommes SHA-256, la crate `gitbridge` (`cargo install gitbridge --locked`)
-et l'image `ghcr.io/julienpoirou/gitbridge` pour les tâches d'index. Les
+leurs sommes SHA-256, la crate `herdr-plugin-manager`
+(`cargo install herdr-plugin-manager --locked`) et l'image
+`ghcr.io/julienpoirou/herdr-plugin-manager` pour les tâches d'index. Les
 versions sont préparées par release-please à partir des Conventional Commits ;
 fusionner la pull request de release déclenche la publication.
 

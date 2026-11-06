@@ -212,7 +212,7 @@ fn agent_for(url: &str) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout(Duration::from_secs(20))
-        .user_agent(concat!("gitbridge/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("herdr-plugin-manager/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = proxy_for(url).and_then(|p| ureq::Proxy::new(p).ok()) {
         builder = builder.proxy(proxy);
     }

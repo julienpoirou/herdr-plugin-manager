@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">GitBridge for Herdr</title>
+  <title id="title">Herdr Plugin Manager</title>
   <desc id="desc">A luminous bridge linking three commit nodes</desc>
   <defs>
     <linearGradient id="signal" x1="80" y1="80" x2="432" y2="432" gradientUnits="userSpaceOnUse">

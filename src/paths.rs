@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// The plugin id declared in `herdr-plugin.toml`.
-pub const PLUGIN_ID: &str = "gitbridge";
+pub const PLUGIN_ID: &str = "herdr-plugin-manager";
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)

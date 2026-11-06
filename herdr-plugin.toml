@@ -1,10 +1,10 @@
-id = "gitbridge"
-name = "GitBridge for Herdr"
+id = "herdr-plugin-manager"
+name = "Herdr Plugin Manager"
 # x-release-please-start-version
 version = "0.2.0"
 # x-release-please-end
 min_herdr_version = "0.7.4"
-description = "GitBridge installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."
+description = "Installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."
 platforms = ["linux", "macos", "windows"]
 
 # Builds bin/herdr-pm from source (needs a Rust toolchain), unless a
@@ -19,7 +19,7 @@ command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"
 
 [[panes]]
 id = "manager"
-title = "GitBridge"
+title = "Herdr Plugin Manager"
 placement = "popup"
 width = "85%"
 height = "85%"

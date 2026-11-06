@@ -5,7 +5,7 @@
 //! suspends the UI and runs the same code path as the CLI on the plain
 //! terminal, then returns.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::git::Git;
 use crate::market::{self, Entry, Sort};
 use crate::ops::{self, Ctx, InstallRequest, Origin, Row, Status};
-use crate::{detach, paths, source, util};
+use crate::{paths, source, util};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -51,12 +51,6 @@ fn muted() -> Style {
 enum View {
     Installed,
     Market,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Item {
-    Plugin(usize),
-    Action(usize, usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,9 +107,8 @@ struct App {
     view: View,
     rows: Vec<Row>,
     checks: HashMap<String, Check>,
-    expanded: HashSet<String>,
-    keys: BTreeMap<String, Vec<String>>,
-    items: Vec<Item>,
+    /// Indexes into `rows` of the plugins the filter lets through.
+    items: Vec<usize>,
     sel: usize,
     offset: usize,
     filter: String,
@@ -129,6 +122,8 @@ struct App {
     herdr_version: String,
     quit: bool,
     list_area: Rect,
+    /// Clickable header tabs.
+    tab_areas: Vec<(Rect, View)>,
     /// Lines above the first marketplace entry (loading/errors).
     market_header: usize,
     load_error: Option<String>,
@@ -147,8 +142,6 @@ impl App {
             view: View::Installed,
             rows: Vec::new(),
             checks: HashMap::new(),
-            expanded: HashSet::new(),
-            keys: BTreeMap::new(),
             items: Vec::new(),
             sel: 0,
             offset: 0,
@@ -174,6 +167,7 @@ impl App {
             herdr_version,
             quit: false,
             list_area: Rect::default(),
+            tab_areas: Vec::new(),
             market_header: 0,
             load_error: None,
         }
@@ -198,13 +192,13 @@ impl App {
             }
         }
         self.rows.sort_by_key(|r| r.plugin.name.to_lowercase());
-        self.keys = crate::herdr::action_keybindings();
         self.rebuild_items();
         if let Some(id) = selected_id {
-            if let Some(pos) = self.items.iter().position(|i| match i {
-                Item::Plugin(p) => self.rows[*p].plugin.plugin_id == id,
-                _ => false,
-            }) {
+            if let Some(pos) = self
+                .items
+                .iter()
+                .position(|&i| self.rows[i].plugin.plugin_id == id)
+            {
                 self.sel = pos;
             }
         }
@@ -230,12 +224,7 @@ impl App {
             if !terms.iter().all(|t| hay.contains(t)) {
                 continue;
             }
-            self.items.push(Item::Plugin(i));
-            if self.expanded.contains(&row.plugin.plugin_id) {
-                for a in 0..row.plugin.actions.len() {
-                    self.items.push(Item::Action(i, a));
-                }
-            }
+            self.items.push(i);
         }
     }
 
@@ -345,14 +334,8 @@ impl App {
 
     // ---- selection helpers
 
-    fn selected_item(&self) -> Option<Item> {
-        self.items.get(self.sel).copied()
-    }
-
     fn selected_row(&self) -> Option<&Row> {
-        match self.selected_item()? {
-            Item::Plugin(i) | Item::Action(i, _) => self.rows.get(i),
-        }
+        self.items.get(self.sel).and_then(|&i| self.rows.get(i))
     }
 
     fn status_of(&self, id: &str) -> Option<&Check> {
@@ -405,6 +388,15 @@ impl App {
 
 // ---------------------------------------------------------------- terminal
 
+/// crossterm turns mouse capture on through the console API on Windows and
+/// never emits the VT request, so the hosting terminal (Herdr, Windows
+/// Terminal) keeps the mouse for itself. Ask for button reports in SGR
+/// encoding explicitly; ConPTY hands them to crossterm as mouse events.
+#[cfg(windows)]
+const VT_MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+#[cfg(windows)]
+const VT_MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
 fn enter(term: &mut Term) -> Result<()> {
     terminal::enable_raw_mode()?;
     execute!(
@@ -413,11 +405,23 @@ fn enter(term: &mut Term) -> Result<()> {
         EnableMouseCapture,
         cursor::Hide
     )?;
+    #[cfg(windows)]
+    {
+        let mut out = io::stdout();
+        out.write_all(VT_MOUSE_ON.as_bytes())?;
+        out.flush()?;
+    }
     term.clear()?;
     Ok(())
 }
 
 fn leave() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut out = io::stdout();
+        let _ = out.write_all(VT_MOUSE_OFF.as_bytes());
+        let _ = out.flush();
+    }
     let _ = execute!(
         io::stdout(),
         DisableMouseCapture,
@@ -720,7 +724,9 @@ fn clone_ctx(ctx: &Ctx) -> Ctx {
 // ---------------------------------------------------------------- input
 
 fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool {
-    let area = app.list_area;
+    let inside = |area: Rect| {
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+    };
     match kind {
         MouseEventKind::ScrollDown => {
             move_sel(app, 1);
@@ -731,11 +737,12 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if col < area.x
-                || col >= area.x + area.width
-                || row < area.y
-                || row >= area.y + area.height
-            {
+            if let Some(&(_, view)) = app.tab_areas.iter().find(|(area, _)| inside(*area)) {
+                switch_view(app, view);
+                return true;
+            }
+            let area = app.list_area;
+            if !inside(area) {
                 return false;
             }
             let line = (row - area.y) as usize;
@@ -743,11 +750,6 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
                 View::Installed => {
                     let idx = app.offset + line;
                     if idx < app.items.len() {
-                        if idx == app.sel {
-                            if let Item::Plugin(_) = app.items[idx] {
-                                toggle_expand(app);
-                            }
-                        }
                         app.sel = idx;
                     }
                 }
@@ -788,22 +790,11 @@ fn move_sel(app: &mut App, delta: isize) {
     }
 }
 
-fn toggle_expand(app: &mut App) {
-    let Some(Item::Plugin(i)) = app.selected_item() else {
-        return;
-    };
-    let row = &app.rows[i];
-    let id = row.plugin.plugin_id.clone();
-    if row.plugin.actions.is_empty() {
-        let name = row.plugin.name.clone();
-        app.say(Level::Info, format!("{name} declares no actions"));
-        return;
+fn switch_view(app: &mut App, view: View) {
+    app.view = view;
+    if view == View::Market && !app.market.loaded && !app.market.loading {
+        app.load_market(false);
     }
-    if !app.expanded.remove(&id) {
-        app.expanded.insert(id);
-    }
-    app.rebuild_items();
-    app.clamp();
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
@@ -882,14 +873,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             return None;
         }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('m') => {
-            app.view = if app.view == View::Installed {
+            let next = if app.view == View::Installed {
                 View::Market
             } else {
                 View::Installed
             };
-            if app.view == View::Market && !app.market.loaded && !app.market.loading {
-                app.load_market(false);
-            }
+            switch_view(app, next);
             return None;
         }
         KeyCode::Down | KeyCode::Char('j') => move_sel(app, 1),
@@ -912,60 +901,6 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     let row = app.selected_row().cloned();
     let id = row.as_ref().map(|r| r.plugin.plugin_id.clone());
     match key.code {
-        KeyCode::Enter | KeyCode::Char(' ') if key.code == KeyCode::Enter => {
-            match app.selected_item() {
-                Some(Item::Plugin(_)) => toggle_expand(app),
-                Some(Item::Action(p, a)) => {
-                    let row = &app.rows[p];
-                    let action = format!("{}.{}", row.plugin.plugin_id, row.plugin.actions[a].id);
-                    if !row.plugin.enabled {
-                        app.say(
-                            Level::Warn,
-                            format!(
-                                "{} is disabled; press e to enable it first",
-                                row.plugin.name
-                            ),
-                        );
-                    } else if app.ctx.dry_run {
-                        app.say(
-                            Level::Warn,
-                            format!("[dry-run] close popup → herdr plugin action invoke {action}"),
-                        );
-                    } else {
-                        match detach::spawn_invoke_after_exit(&action) {
-                            Ok(()) => app.quit = true,
-                            Err(err) => app.say(Level::Error, format!("{err:#}")),
-                        }
-                    }
-                }
-                None => {}
-            }
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            if let Some(Item::Plugin(i)) = app.selected_item() {
-                if !app.expanded.contains(&app.rows[i].plugin.plugin_id) {
-                    toggle_expand(app);
-                }
-            }
-        }
-        KeyCode::Left | KeyCode::Char('h') => match app.selected_item() {
-            Some(Item::Action(p, _)) => {
-                let id = app.rows[p].plugin.plugin_id.clone();
-                app.expanded.remove(&id);
-                app.rebuild_items();
-                if let Some(pos) = app.items.iter().position(|i| *i == Item::Plugin(p)) {
-                    app.sel = pos;
-                }
-            }
-            Some(Item::Plugin(i)) => {
-                let id = app.rows[i].plugin.plugin_id.clone();
-                if app.expanded.remove(&id) {
-                    app.rebuild_items();
-                    app.clamp();
-                }
-            }
-            None => {}
-        },
         KeyCode::Char('u') => {
             let (row, id) = (row?, id?);
             match app.status_of(&id) {
@@ -1289,7 +1224,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let tab = |label: String, active: bool| {
         if active {
             Span::styled(
@@ -1314,15 +1249,28 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Marketplace".to_string()
     };
-    let mut spans = vec![
-        Span::styled(
-            " gitbridge // herdr ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+    let tabs = [
         tab(installed_label, app.view == View::Installed),
-        Span::raw(" "),
         tab(market_label, app.view == View::Market),
     ];
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    app.tab_areas.clear();
+    for (span, view) in tabs.into_iter().zip([View::Installed, View::Market]) {
+        let width = span.content.chars().count() as u16;
+        app.tab_areas.push((
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            view,
+        ));
+        x += width + 1;
+        spans.push(span);
+        spans.push(Span::raw(" "));
+    }
     let mut right = format!("herdr {}", app.herdr_version);
     if app.ctx.dry_run {
         right = format!("DRY RUN · {right}");
@@ -1417,95 +1365,51 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(10)
         .clamp(8, (width / 3).max(8));
     let mut lines = Vec::new();
-    let mut plugin_number = 0usize;
-    for (pos, item) in app.items.iter().enumerate() {
-        if let Item::Plugin(_) = item {
-            plugin_number += 1;
-        }
+    for (pos, &i) in app.items.iter().enumerate() {
         if pos < app.offset || pos >= app.offset + height {
             continue;
         }
-        let selected = pos == app.sel;
-        let base = if selected {
+        let base = if pos == app.sel {
             Style::default()
                 .bg(SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let line = match *item {
-            Item::Plugin(i) => {
-                let row = &app.rows[i];
-                let dot = if row.plugin.enabled {
-                    Span::styled("● ", Style::default().fg(OK))
-                } else {
-                    Span::styled("○ ", muted())
-                };
-                let fold = if row.plugin.actions.is_empty() {
-                    " "
-                } else if app.expanded.contains(&row.plugin.plugin_id) {
-                    "⌄"
-                } else {
-                    "›"
-                };
-                let origin_color = match row.origin {
-                    Origin::Git => Color::Magenta,
-                    Origin::Github => Color::Blue,
-                    Origin::Local => MUTED,
-                };
-                let status = status_span(app, row);
-                let left = format!("{plugin_number:>2} ");
-                let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1;
-                let status_w = status.content.chars().count();
-                let src_w = width.saturating_sub(used + status_w + 2);
-                let mut spans = vec![
-                    Span::styled(left, muted()),
-                    dot,
-                    Span::raw(pad(&row.plugin.name, name_w)),
-                    Span::raw(" "),
-                    Span::styled(pad(&row.plugin.version, 9), muted()),
-                    Span::styled(
-                        pad(row.origin.label(), 7),
-                        Style::default().fg(origin_color),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(pad(&row.source_display(), src_w), muted()),
-                    Span::raw(" "),
-                    status,
-                ];
-                let used_now: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                spans.push(Span::raw(" ".repeat(width.saturating_sub(used_now + 1))));
-                spans.push(Span::styled(fold, Style::default().fg(ACCENT)));
-                Line::from(spans)
-            }
-            Item::Action(p, a) => {
-                let row = &app.rows[p];
-                let action = &row.plugin.actions[a];
-                let full = format!("{}.{}", row.plugin.plugin_id, action.id);
-                let keys = app.keys.get(&full).map(|k| k.join(", "));
-                let mut spans = vec![
-                    Span::raw("       "),
-                    Span::styled("↳ ", Style::default().fg(ACCENT)),
-                    Span::raw(pad(&action.id, 18)),
-                    Span::raw(" "),
-                    Span::styled(
-                        util::truncate(
-                            &util::sanitize(&action.title),
-                            width.saturating_sub(48).max(10),
-                        ),
-                        muted(),
-                    ),
-                ];
-                let used_now: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let key_text = keys.unwrap_or_default();
-                spans.push(Span::raw(" ".repeat(
-                    width.saturating_sub(used_now + key_text.chars().count() + 1),
-                )));
-                spans.push(Span::styled(key_text, Style::default().fg(OK)));
-                Line::from(spans)
-            }
+        let row = &app.rows[i];
+        let dot = if row.plugin.enabled {
+            Span::styled("● ", Style::default().fg(OK))
+        } else {
+            Span::styled("○ ", muted())
         };
-        lines.push(line.style(base));
+        let origin_color = match row.origin {
+            Origin::Git => Color::Magenta,
+            Origin::Github => Color::Blue,
+            Origin::Local => MUTED,
+        };
+        let status = status_span(app, row);
+        let left = format!("{:>2} ", pos + 1);
+        let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1;
+        let status_w = status.content.chars().count();
+        let src_w = width.saturating_sub(used + status_w + 2);
+        let mut spans = vec![
+            Span::styled(left, muted()),
+            dot,
+            Span::raw(pad(&row.plugin.name, name_w)),
+            Span::raw(" "),
+            Span::styled(pad(&row.plugin.version, 9), muted()),
+            Span::styled(
+                pad(row.origin.label(), 7),
+                Style::default().fg(origin_color),
+            ),
+            Span::raw(" "),
+            Span::styled(pad(&row.source_display(), src_w), muted()),
+            Span::raw(" "),
+            status,
+        ];
+        let used_now: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used_now))));
+        lines.push(Line::from(spans).style(base));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1518,103 +1422,74 @@ fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
 }
 
 fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::new();
-    match app.selected_item() {
-        Some(Item::Plugin(i)) => {
-            let row = &app.rows[i];
-            lines.push(Line::from(vec![
-                Span::styled(
-                    row.plugin.plugin_id.clone(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        "  {} · {}",
-                        if row.plugin.enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        },
-                        row.origin.label()
-                    ),
-                    muted(),
-                ),
-            ]));
-            match row.origin {
-                Origin::Local => lines.push(kv("path", row.plugin.plugin_root.clone())),
-                _ => {
-                    lines.push(kv("source", row.source_display()));
-                    let commit = row.commit().map(util::short_sha).unwrap_or("-").to_string();
-                    let mut text = format!("{} @ {commit}", row.ref_display());
-                    if let Some(r) = &row.record {
-                        text.push_str(&format!(
-                            "  · installed {}{}",
-                            util::relative_age(r.current.installed_unix),
-                            if r.previous.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {} kept for rollback", r.previous.len())
-                            }
-                        ));
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            row.plugin.plugin_id.clone(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} · {}",
+                if row.plugin.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                row.origin.label()
+            ),
+            muted(),
+        ),
+    ])];
+    match row.origin {
+        Origin::Local => lines.push(kv("path", row.plugin.plugin_root.clone())),
+        _ => {
+            lines.push(kv("source", row.source_display()));
+            let commit = row.commit().map(util::short_sha).unwrap_or("-").to_string();
+            let mut text = format!("{} @ {commit}", row.ref_display());
+            if let Some(r) = &row.record {
+                text.push_str(&format!(
+                    "  · installed {}{}",
+                    util::relative_age(r.current.installed_unix),
+                    if r.previous.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} kept for rollback", r.previous.len())
                     }
-                    lines.push(kv("ref", text));
-                }
-            }
-            match app.checks.get(&row.plugin.plugin_id) {
-                Some(Check::Done(Status::Error { message })) => lines.push(Line::from(vec![
-                    Span::styled("check    ", muted()),
-                    Span::styled(util::sanitize(message), Style::default().fg(BAD)),
-                ])),
-                Some(Check::Done(Status::Available { commit, version })) => {
-                    lines.push(Line::from(vec![
-                        Span::styled("update   ", muted()),
-                        Span::styled(
-                            format!(
-                                "{} → {} ({}) — press u",
-                                util::sanitize(&row.plugin.version),
-                                util::sanitize(
-                                    &version.clone().unwrap_or_else(|| "new commit".into())
-                                ),
-                                util::short_sha(commit)
-                            ),
-                            Style::default().fg(WARN),
-                        ),
-                    ]))
-                }
-                _ => {}
-            }
-            if let Some(d) = &row.plugin.description {
-                lines.push(Line::styled(util::sanitize(d), muted()));
-            }
-            for w in &row.plugin.warnings {
-                lines.push(Line::styled(
-                    util::sanitize(&format!("warning: {w}")),
-                    Style::default().fg(WARN),
                 ));
             }
+            lines.push(kv("ref", text));
         }
-        Some(Item::Action(p, a)) => {
-            let row = &app.rows[p];
-            let action = &row.plugin.actions[a];
-            let full = format!("{}.{}", row.plugin.plugin_id, action.id);
-            lines.push(Line::styled(
-                full.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-            lines.push(match app.keys.get(&full) {
-                Some(keys) => kv("key", keys.join(", ")),
-                None => Line::from(vec![
-                    Span::styled("key      ", muted()),
-                    Span::styled("not bound", muted()),
-                ]),
-            });
-            lines.push(kv("runs", crate::manifest::render_argv(&action.command)));
-            if !action.contexts.is_empty() {
-                lines.push(kv("contexts", action.contexts.join(", ")));
-            }
-            lines.push(Line::styled("Enter closes the popup and runs it", muted()));
-        }
-        None => {}
+    }
+    match app.checks.get(&row.plugin.plugin_id) {
+        Some(Check::Done(Status::Error { message })) => lines.push(Line::from(vec![
+            Span::styled("check    ", muted()),
+            Span::styled(util::sanitize(message), Style::default().fg(BAD)),
+        ])),
+        Some(Check::Done(Status::Available { commit, version })) => lines.push(Line::from(vec![
+            Span::styled("update   ", muted()),
+            Span::styled(
+                format!(
+                    "{} → {} ({}) — press u",
+                    util::sanitize(&row.plugin.version),
+                    util::sanitize(&version.clone().unwrap_or_else(|| "new commit".into())),
+                    util::short_sha(commit)
+                ),
+                Style::default().fg(WARN),
+            ),
+        ])),
+        _ => {}
+    }
+    if let Some(d) = &row.plugin.description {
+        lines.push(Line::styled(util::sanitize(d), muted()));
+    }
+    for w in &row.plugin.warnings {
+        lines.push(Line::styled(
+            util::sanitize(&format!("warning: {w}")),
+            Style::default().fg(WARN),
+        ));
     }
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),
@@ -1838,26 +1713,16 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.view {
-        View::Installed => match app.selected_item() {
-            Some(Item::Action(..)) => &[
-                ("↵", "run"),
-                ("h", "fold"),
-                ("m", "market"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-            _ => &[
-                ("↵", "actions"),
-                ("u", "update"),
-                ("U", "all"),
-                ("e", "toggle"),
-                ("x", "remove"),
-                ("i", "install"),
-                ("m", "market"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-        },
+        View::Installed => &[
+            ("u", "update"),
+            ("U", "all"),
+            ("e", "toggle"),
+            ("x", "remove"),
+            ("i", "install"),
+            ("m", "market"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         View::Market => &[
             ("↵", "install"),
             ("/", "search"),
@@ -1974,7 +1839,6 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines = vec![
         section("Installed"),
-        key("↵ / → / ←", "fold actions · run the selected action"),
         key("u / U", "update selected / every outdated plugin"),
         key("e", "enable or disable"),
         key("x", "uninstall (local links are only unlinked)"),
@@ -1995,6 +1859,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         section("Anywhere"),
         key("m / Tab", "switch views"),
         key("q / Esc", "back or close"),
+        key(
+            "mouse",
+            "wheel moves · click selects · click a tab to switch views",
+        ),
     ];
     lines.push(Line::raw(""));
     lines.push(Line::styled(

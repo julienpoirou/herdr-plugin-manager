@@ -317,10 +317,10 @@ jobs:
             type=raw,value=latest,enable=${{ needs.plan.outputs.prerelease == 'false' }}
           flavor: latest=false
           labels: |
-            org.opencontainers.image.title=GitBridge for Herdr
+            org.opencontainers.image.title=Herdr Plugin Manager
             org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
           annotations: |
-            org.opencontainers.image.title=GitBridge for Herdr
+            org.opencontainers.image.title=Herdr Plugin Manager
             org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
       - name: Build the amd64 image locally
         uses: docker/build-push-action@v7

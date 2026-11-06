@@ -1467,7 +1467,7 @@ pub fn switch(ctx: &Ctx, id: &str, reference: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- export / import
 
-pub const EXPORT_FORMAT: &str = "gitbridge-export";
+pub const EXPORT_FORMAT: &str = "herdr-plugin-manager-export";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExportEntry {
@@ -1547,7 +1547,10 @@ pub fn export(herdr: &Herdr) -> Result<(ExportFile, Vec<String>)> {
 /// number of failures.
 pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
     if file.format != EXPORT_FORMAT {
-        bail!("not a GitBridge export (format {:?})", file.format);
+        bail!(
+            "not a herdr-plugin-manager export (format {:?})",
+            file.format
+        );
     }
     let rows = rows(&ctx.herdr)?;
     let mut failures = 0;

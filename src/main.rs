@@ -1,8 +1,7 @@
-//! GitBridge (`herdr-pm`): manage Herdr plugins from a popup or the command
-//! line, from GitHub or any git server.
+//! Herdr Plugin Manager (`herdr-pm`): manage Herdr plugins from a popup or
+//! the command line, from GitHub or any git server.
 
 mod config;
-mod detach;
 mod git;
 mod herdr;
 mod index;
@@ -30,7 +29,7 @@ use crate::ops::{Ctx, InstallRequest, Origin, Status};
 #[command(
     name = "herdr-pm",
     version,
-    about = "GitBridge for Herdr: reviewed installs from any Git transport, rollback, and multi-forge discovery.",
+    about = "Herdr Plugin Manager: reviewed installs from any Git transport, rollback, and multi-forge discovery.",
     after_help = "Run without a command to open the interactive manager.\n\
                   Sources: owner/repo (GitHub), https://… ssh://… git@host:path git://… file://… /local/path, \
                   alias:path (see `herdr-pm config init`). Append //subdir to pick a plugin inside a repository."
@@ -200,8 +199,6 @@ enum Cmd {
     },
     /// Open the manager as a Herdr popup (what the `open` action runs).
     Open,
-    #[command(hide = true, name = "__invoke-after-exit")]
-    InvokeAfterExit { pid: u32, action: String },
 }
 
 #[derive(Subcommand)]
@@ -363,10 +360,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Open => {
             let herdr = Herdr::detect(false);
             herdr.open_popup(paths::PLUGIN_ID, "manager")?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Cmd::InvokeAfterExit { pid, action } => {
-            detach::invoke_after_exit(&Herdr::detect(false), pid, &action);
             Ok(ExitCode::SUCCESS)
         }
     }

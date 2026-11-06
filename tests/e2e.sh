@@ -131,7 +131,7 @@ expect_fail "deleted tag is pruned from the mirror" "$HPM" switch team.hello v-t
 expect "restore default branch after tag test" "$HPM" unpin team.hello
 
 # --- a corrupt private registry must not masquerade as local links
-REG="$XDG_STATE_HOME/herdr/plugins/gitbridge/registry.json"
+REG="$XDG_STATE_HOME/herdr/plugins/herdr-plugin-manager/registry.json"
 cp "$REG" "$T/registry.good"
 printf 'not json\n' > "$REG"
 expect_fail "corrupt registry is reported" "$HPM" list
@@ -159,7 +159,7 @@ ok "refuses a non-interactive install without --yes"
 expect_fail "rejects parent components in --subdir" "$HPM" install "$MONO" --subdir ../hello --yes
 MARKER="$T/ext-transport-ran"
 cat > "$T/hostile-import.json" <<EOF
-{"format":"gitbridge-export","version":1,"exported_unix":0,"plugins":[{"id":"hostile","kind":"git","source":"ext::touch $MARKER","enabled":true},{"id":"hostile-ansi","kind":"git","source":"https://example.invalid/repo\u001b[2K","enabled":true}]}
+{"format":"herdr-plugin-manager-export","version":1,"exported_unix":0,"plugins":[{"id":"hostile","kind":"git","source":"ext::touch $MARKER","enabled":true},{"id":"hostile-ansi","kind":"git","source":"https://example.invalid/repo\u001b[2K","enabled":true}]}
 EOF
 expect_fail "rejects ext transport in an import" env GIT_ALLOW_PROTOCOL=ext "$HPM" import "$T/hostile-import.json" --yes
 case "$out" in *"$(printf '\033')"*) fail "source URL escape reached the terminal" ;; esac

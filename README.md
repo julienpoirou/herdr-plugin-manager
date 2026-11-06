@@ -1,27 +1,26 @@
-# GitBridge for Herdr
+# Herdr Plugin Manager
 
-<img src="assets/logo.png" alt="GitBridge logo" width="112" align="right">
+<img src="assets/logo.png" alt="Herdr Plugin Manager logo" width="112" align="right">
 
 [![CI](https://github.com/julienpoirou/herdr-plugin-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/julienpoirou/herdr-plugin-manager/actions/workflows/ci.yml)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-a78bfa)](https://www.rust-lang.org/)
 [![Herdr 0.7.4+](https://img.shields.io/badge/herdr-0.7.4%2B-2dd4bf)](https://herdr.dev/)
 [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**GitBridge connects Herdr to the Git servers you actually use.** It installs
-plugins from GitHub, GitLab, Gitea/Forgejo, a company Git appliance, a bare
-repository, or a directory on disk. The same `herdr-pm` binary provides a
+**Herdr Plugin Manager connects Herdr to the Git servers you actually use.** It
+installs plugins from GitHub, GitLab, Gitea/Forgejo, a company Git appliance, a
+bare repository, or a directory on disk. The same `herdr-pm` binary provides a
 Ratatui popup and a scriptable CLI.
 
-The repository, Cargo package and published packages are
-**`herdr-plugin-manager`**; the Herdr plugin id is **`gitbridge`**. The
-user-facing name is **GitBridge for Herdr**.
+The repository, Herdr plugin id, Cargo package and published packages are all
+**`herdr-plugin-manager`**.
 
-[English](#why-gitbridge) · [Français](#français)
+[English](#why-herdr-plugin-manager) · [Français](#français)
 
-## Why GitBridge
+## Why herdr-plugin-manager
 
-Herdr's own installer accepts GitHub `owner/repo`. GitBridge adds the other
-transports without asking a forge API for a checkout:
+Herdr's own installer accepts GitHub `owner/repo`. herdr-plugin-manager adds the
+other transports without asking a forge API for a checkout:
 
 | Capability | Behavior |
 |---|---|
@@ -61,14 +60,14 @@ sh scripts/build.sh
 herdr plugin link "$PWD"
 ```
 
-Bind the popup (recommended: `prefix+g`):
+Bind the popup (recommended: `prefix+m`; Herdr uses `prefix+g` for `goto`):
 
 ```toml
 [[keys.command]]
-key = "prefix+g"
+key = "prefix+m"
 type = "plugin_action"
-command = "gitbridge.open"
-description = "Open GitBridge"
+command = "herdr-plugin-manager.open"
+description = "Open the plugin manager"
 ```
 
 Then run `herdr server reload-config`. Put `bin/herdr-pm` on `PATH` (or use
@@ -105,7 +104,7 @@ with that tag.
 
 ```sh
 herdr-pm install owner/repo[/subdir]                       # native Herdr/GitHub
-herdr-pm install owner/repo --git                          # same repo through GitBridge
+herdr-pm install owner/repo --git                          # same repo through the Git pipeline
 herdr-pm install https://gitlab.corp.example/tools/notify.git
 herdr-pm install git@git.corp.example:tools/notify.git
 herdr-pm install ssh://git@host:2222/srv/git/mono.git//plugins/foo
@@ -135,7 +134,7 @@ replacement operation for an existing local link. Therefore
 
 ## Trust and build model
 
-For Git-managed installations, GitBridge:
+For Git-managed installations, herdr-plugin-manager:
 
 1. mirrors the remote and resolves the branch, annotated/lightweight tag or
    commit to a full object id;
@@ -157,19 +156,20 @@ Plugins remain arbitrary code running as the user. Review the commands and the
 repository, and pin the reviewed commit when appropriate. GitHub shorthand
 installs use Herdr's own preview/build implementation instead.
 
-A hard crash between Herdr's registration and GitBridge's `registry.json`
+A hard crash between Herdr's registration and the manager's `registry.json`
 update can require manual recovery. Avoid running multiple mutating
 `herdr-pm` commands for the same plugin concurrently; `herdr-pm doctor` reports
 registry/list inconsistencies.
 
 ## Popup
 
-Open with `herdr-pm`, the configured key, or the `gitbridge.open` action.
+Open with `herdr-pm`, the configured key, or the `herdr-plugin-manager.open`
+action.
 
 | Area | Keys |
 |---|---|
-| Navigation | arrows / `j` / `k`, mouse, `/` filter |
-| Actions | Enter folds actions; Enter on an action closes the popup then invokes it |
+| Navigation | arrows / `j` / `k`, `/` filter |
+| Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review |
 | State | `e` enable/disable, `x` uninstall, `p` pin/unpin |
 | Versions | `s` switch ref, `z` rollback |
@@ -274,10 +274,10 @@ the format. See `examples/publish-index.sh` for incremental publication.
 
 ## State and offline behavior
 
-GitBridge stores its data under Herdr's state directory:
+herdr-plugin-manager stores its data under Herdr's state directory:
 
 ```text
-~/.local/state/herdr/plugins/gitbridge/
+~/.local/state/herdr/plugins/herdr-plugin-manager/
 ├── registry.json       # remotes, followed refs, current and previous installs
 ├── installs/           # independent checkouts
 ├── cache/              # bare mirrors and marketplace responses
@@ -286,9 +286,9 @@ GitBridge stores its data under Herdr's state directory:
 ```
 
 On Windows the default root is `%LOCALAPPDATA%\herdr`. `HERDR_PM_HOME` and
-`HERDR_PM_CONFIG_DIR` override GitBridge's directories.
+`HERDR_PM_CONFIG_DIR` override the manager's directories.
 
-Enable/disable first uses Herdr's CLI. If the server is stopped, GitBridge
+Enable/disable first uses Herdr's CLI. If the server is stopped, the manager
 updates Herdr's `plugins.json` under `.plugins.lock`, preserves unknown JSON
 fields and follows registry symlinks, including a dangling final target.
 
@@ -320,7 +320,7 @@ marketplace indexes, malicious imports, terminal escapes and invalid paths.
 
 ## Français
 
-**GitBridge for Herdr** installe des plugins depuis GitHub, GitLab,
+**Herdr Plugin Manager** installe des plugins depuis GitHub, GitLab,
 Gitea/Forgejo, un dépôt nu, `git daemon` ou un chemin local. Le binaire
 `herdr-pm` fournit une interface Ratatui et une CLI scriptable.
 
@@ -336,9 +336,10 @@ herdr-pm install git@git.corp.example:outils/notify.git
 herdr-pm install /srv/git/mono.git//plugins/foo --ref v1.4.0
 ```
 
-Raccourci conseillé : `prefix+g` avec la commande
-`gitbridge.open` (exemple TOML ci-dessus). `herdr-pm config init`
-crée une configuration commentée et `?` affiche l'aide du popup.
+Raccourci conseillé : `prefix+m` avec la commande
+`herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
+fonctionne aussi : molette, clic sur une ligne ou sur un onglet. `herdr-pm config
+init` crée une configuration commentée et `?` affiche l'aide du popup.
 
 **Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
 `..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build

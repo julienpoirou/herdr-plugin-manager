@@ -1,5 +1,5 @@
 name: Bug report
-description: Report incorrect or unsafe GitBridge behavior
+description: Report incorrect or unsafe herdr-plugin-manager behavior
 title: "[Bug] "
 labels: [bug]
 body:

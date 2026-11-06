@@ -316,11 +316,6 @@ impl Herdr {
         }
     }
 
-    pub fn invoke(&self, action_id: &str) -> Result<()> {
-        self.mutate(&["plugin", "action", "invoke", action_id])
-            .map(|_| ())
-    }
-
     /// Opens one of a plugin's panes as a focused popup.
     pub fn open_popup(&self, plugin_id: &str, entrypoint: &str) -> Result<()> {
         self.mutate(&[
@@ -540,7 +535,7 @@ mouse_capture = true
 [[keys.command]]
 key = "prefix+p"
 type = "plugin_action"
-command = "gitbridge.open"
+command = "herdr-plugin-manager.open"
 
 [[keys.command]]
 key = "prefix+g"
@@ -550,10 +545,10 @@ command = "lazygit"
 [[keys.command]]
 key = "alt+p"
 type = "plugin_action"
-command = "gitbridge.open"
+command = "herdr-plugin-manager.open"
 "#;
         let keys = parse_action_keybindings(toml);
-        assert_eq!(keys["gitbridge.open"], vec!["prefix+p", "alt+p"]);
+        assert_eq!(keys["herdr-plugin-manager.open"], vec!["prefix+p", "alt+p"]);
         assert_eq!(keys.len(), 1);
     }
 

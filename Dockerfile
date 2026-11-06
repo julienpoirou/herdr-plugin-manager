@@ -1,4 +1,4 @@
-# GitBridge's standalone commands in a container, for CI jobs and Git
+# herdr-pm's standalone commands in a container, for CI jobs and Git
 # servers that publish catalogs (`index build`, `index check`, `search`,
 # `sources`). Plugin management itself needs a local Herdr and is not served
 # by this image.

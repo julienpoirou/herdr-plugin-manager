@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.2.0...v0.3.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* the plugin id is now herdr-plugin-manager. Uninstall the gitbridge plugin and install this one again, bind the popup to herdr-plugin-manager.open, and move plugins/gitbridge under Herdr's state directory to plugins/herdr-plugin-manager to keep git-managed installs. Exports must use the herdr-plugin-manager-export format.
+
+### Features
+
+* Rename the plugin to herdr-plugin-manager ([#8](https://github.com/julienpoirou/herdr-plugin-manager/issues/8)) ([11f93bb](https://github.com/julienpoirou/herdr-plugin-manager/commit/11f93bbae5072096f3fd72967c00a78875fe29cc))
+* **tui:** Remove the per-plugin actions menu ([11f93bb](https://github.com/julienpoirou/herdr-plugin-manager/commit/11f93bbae5072096f3fd72967c00a78875fe29cc))
+
+
+### Bug Fixes
+
+* **tui:** Request mouse reports from the terminal on Windows ([11f93bb](https://github.com/julienpoirou/herdr-plugin-manager/commit/11f93bbae5072096f3fd72967c00a78875fe29cc))
+
 ## 0.2.0 — 2026-11-04
 
 - Publish releases: release-please release pull requests, prebuilt

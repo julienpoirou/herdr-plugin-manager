@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.3.0...v0.4.0) (2026-11-06)
+
+
+### Features
+
+* **market:** List the full herdr.dev catalog from a background-refreshed cache ([#10](https://github.com/julienpoirou/herdr-plugin-manager/issues/10)) ([cf4fc28](https://github.com/julienpoirou/herdr-plugin-manager/commit/cf4fc28fa8f41dd55e6c5f51a1bc26f99918cc72))
+
 ## [0.3.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.2.0...v0.3.0) (2026-11-06)
 
 

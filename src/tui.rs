@@ -100,6 +100,8 @@ struct MarketState {
     source: Option<String>,
     sel: usize,
     page_size: usize,
+    /// Report the outcome of the running refresh even when nothing changed.
+    announce: bool,
 }
 
 struct App {
@@ -161,6 +163,7 @@ impl App {
                 source: None,
                 sel: 0,
                 page_size: 10,
+                announce: false,
             },
             tx,
             rx,
@@ -282,12 +285,27 @@ impl App {
         }
     }
 
+    /// Shows the cached catalog at once (any age), then revalidates it in
+    /// the background; `drain` swaps in the result and reports the changes.
     fn load_market(&mut self, refresh: bool) {
         self.market.generation += 1;
-        self.market.loading = true;
         let generation = self.market.generation;
         let query = self.market.query.clone();
         let only = self.market.source.clone();
+        if !refresh {
+            let cached = market::cached_all(&self.ctx.config, &query, only.as_deref());
+            if !cached.is_empty() {
+                self.market.entries = cached.into_iter().flat_map(|(_, l)| l.entries).collect();
+                market::sort_entries(&mut self.market.entries, self.market.sort);
+                self.market.errors.clear();
+                self.market.loaded = true;
+                self.market.sel = self
+                    .market
+                    .sel
+                    .min(self.market.entries.len().saturating_sub(1));
+            }
+        }
+        self.market.loading = true;
         let config = self.ctx.config.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -312,20 +330,59 @@ impl App {
                         continue;
                     }
                     self.market.loading = false;
-                    self.market.loaded = true;
-                    self.market.entries.clear();
+                    let selected = self
+                        .market
+                        .entries
+                        .get(self.market.sel)
+                        .map(|e| (e.market.clone(), e.install_spec()));
+                    let previous = std::mem::take(&mut self.market.entries);
+                    let had_listing = self.market.loaded && !previous.is_empty();
                     self.market.errors.clear();
+                    let mut entries = Vec::new();
                     for (name, result) in results {
                         match result {
-                            Ok(listing) => self.market.entries.extend(listing.entries),
-                            Err(err) => self.market.errors.push((name, err)),
+                            Ok(listing) => entries.extend(listing.entries),
+                            Err(err) => {
+                                // Keep what this source listed before.
+                                let kept: Vec<Entry> = previous
+                                    .iter()
+                                    .filter(|e| e.market == name)
+                                    .cloned()
+                                    .collect();
+                                let err = if kept.is_empty() {
+                                    err
+                                } else {
+                                    format!("{err} (showing the cached list)")
+                                };
+                                entries.extend(kept);
+                                self.market.errors.push((name, err));
+                            }
                         }
                     }
-                    market::sort_entries(&mut self.market.entries, self.market.sort);
-                    self.market.sel = self
-                        .market
-                        .sel
-                        .min(self.market.entries.len().saturating_sub(1));
+                    let changes = market::changes(&previous, &entries);
+                    market::sort_entries(&mut entries, self.market.sort);
+                    self.market.sel = selected
+                        .and_then(|key| {
+                            entries
+                                .iter()
+                                .position(|e| (e.market.clone(), e.install_spec()) == key)
+                        })
+                        .unwrap_or(self.market.sel)
+                        .min(entries.len().saturating_sub(1));
+                    self.market.entries = entries;
+                    self.market.loaded = true;
+                    let announce = std::mem::take(&mut self.market.announce);
+                    if had_listing && !changes.is_empty() {
+                        self.say(
+                            Level::Info,
+                            format!(
+                                "marketplace updated: {} new · {} removed · {} changed",
+                                changes.added, changes.removed, changes.updated
+                            ),
+                        );
+                    } else if announce && self.market.errors.is_empty() {
+                        self.say(Level::Ok, "marketplace is up to date");
+                    }
                 }
             }
         }
@@ -453,6 +510,7 @@ pub fn run(ctx: Ctx) -> Result<()> {
     let mut app = App::new(ctx);
     app.reload();
     app.start_checks(None);
+    app.load_market(false);
     if app.ctx.dry_run {
         app.say(Level::Warn, "dry run: changes are printed, not made");
     }
@@ -1081,6 +1139,7 @@ fn market_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             app.load_market(false);
         }
         KeyCode::Char('r') => {
+            app.market.announce = true;
             app.load_market(true);
             app.say(Level::Info, "refreshing marketplace…");
         }

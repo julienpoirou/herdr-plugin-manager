@@ -640,10 +640,15 @@ fn sources(config: &Config) -> Result<ExitCode> {
             },
             util::sanitize(&s.name),
             s.kind.label(),
-            util::sanitize(s.url.as_deref().unwrap_or("https://api.github.com")),
+            util::sanitize(s.url.as_deref().unwrap_or(match s.kind {
+                config::MarketKind::Herdr => market::HERDR_INDEX_URL,
+                _ => "https://api.github.com",
+            })),
             if matches!(
                 s.kind,
-                config::MarketKind::Index | config::MarketKind::GitIndex
+                config::MarketKind::Herdr
+                    | config::MarketKind::Index
+                    | config::MarketKind::GitIndex
             ) {
                 String::new()
             } else {

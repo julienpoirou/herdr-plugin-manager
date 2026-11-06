@@ -12,9 +12,11 @@ use crate::paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MarketKind {
-    /// GitHub repository search by topic (what herdr.dev/plugins indexes).
+    /// GitHub repository search by topic (GitHub Enterprise, custom topics).
     #[default]
     Github,
+    /// The official herdr.dev index behind herdr.dev/plugins.
+    Herdr,
     /// Gitea or Forgejo `/api/v1/repos/search?topic=true`.
     Gitea,
     /// GitLab `/api/v4/projects?topic=`.
@@ -29,6 +31,7 @@ impl MarketKind {
     pub fn label(self) -> &'static str {
         match self {
             MarketKind::Github => "github",
+            MarketKind::Herdr => "herdr",
             MarketKind::Gitea => "gitea",
             MarketKind::Gitlab => "gitlab",
             MarketKind::Index => "index",
@@ -53,7 +56,8 @@ pub struct MarketSource {
     pub kind: MarketKind,
     /// Forge base URL (gitea/gitlab, and github for GitHub Enterprise: the
     /// API root such as `https://ghe.example/api/v3`), index URL or path
-    /// (index), or git remote (git-index).
+    /// (index, and herdr to override the herdr.dev index), or git remote
+    /// (git-index).
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default = "default_topic")]
@@ -76,7 +80,7 @@ pub struct MarketSource {
     /// Which clone URL forge listings install from.
     #[serde(default)]
     pub clone: CloneProtocol,
-    /// Upper bound on listed repositories per source.
+    /// Upper bound on listed entries per source.
     #[serde(default = "default_max")]
     pub max: usize,
     #[serde(default = "default_true")]
@@ -88,7 +92,7 @@ fn default_topic() -> String {
 }
 
 fn default_max() -> usize {
-    300
+    10_000
 }
 
 fn default_true() -> bool {
@@ -136,8 +140,8 @@ pub struct Config {
 
 fn default_markets() -> Vec<MarketSource> {
     vec![MarketSource {
-        name: "github".into(),
-        kind: MarketKind::Github,
+        name: "herdr.dev".into(),
+        kind: MarketKind::Herdr,
         url: None,
         topic: default_topic(),
         path: None,
@@ -171,7 +175,9 @@ pub const EXAMPLE: &str = r#"# Herdr Plugin Manager configuration.
 # Previous installations kept per plugin, for `herdr-pm rollback`.
 keep_installs = 3
 
-# Seconds marketplace listings are cached (press r in the popup to refresh).
+# Seconds a marketplace listing counts as fresh. The popup shows the cached
+# listing at any age and refreshes it in the background once it is older;
+# r forces a refresh.
 market_ttl = 600
 
 # Short names for your git servers. With these,
@@ -182,12 +188,19 @@ market_ttl = 600
 # lab  = "https://gitlab.lab.local/{path}.git"
 
 # Marketplace sources, shown together in the popup (m) and `herdr-pm search`.
-# Remove the GitHub block to browse only your own servers.
+# Remove the herdr.dev block to browse only your own servers.
 
 [[marketplace]]
-name = "github"
-kind = "github"            # topic search, the same index as herdr.dev/plugins
-topic = "herdr-plugin"
+name = "herdr.dev"
+kind = "herdr"             # the official index behind herdr.dev/plugins
+
+# GitHub topic search: GitHub Enterprise (url = the API root) or another topic.
+# The search API returns at most 1000 repositories.
+# [[marketplace]]
+# name = "ghe"
+# kind = "github"
+# url = "https://ghe.corp.local/api/v3"
+# topic = "herdr-plugin"
 
 # Gitea / Forgejo: repositories tagged with the topic.
 # [[marketplace]]
@@ -248,7 +261,7 @@ impl Config {
             if !names.insert(source.name.as_str()) {
                 bail!("two [[marketplace]] entries are named {:?}", source.name);
             }
-            let needs_url = !matches!(source.kind, MarketKind::Github);
+            let needs_url = !matches!(source.kind, MarketKind::Github | MarketKind::Herdr);
             if needs_url && source.url.as_deref().is_none_or(|u| u.trim().is_empty()) {
                 bail!(
                     "marketplace {:?} ({}) needs a url",

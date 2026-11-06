@@ -29,7 +29,7 @@ other transports without asking a forge API for a checkout:
 | Reviewed execution | Resolved commit and every build/startup/action/event/pane command are shown before confirmation |
 | Version history | Separate installations, rollback, pin/unpin and branch/tag/commit switching |
 | Update context | New commits and changes to the executable surface, not only a version bump |
-| Discovery | GitHub/GHE, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
+| Discovery | The full herdr.dev catalog, GitHub/GHE topic search, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
 | Reproducibility | JSON export/import at exact exported commits |
 | Operations | Enable/disable (including offline), uninstall, history, doctor, dry-run |
 
@@ -208,7 +208,7 @@ config directory.
 
 ```toml
 keep_installs = 3        # previous installations retained for rollback
-market_ttl = 600         # marketplace cache lifetime in seconds
+market_ttl = 600         # seconds a marketplace listing counts as fresh
 check_concurrency = 6    # parallel background update checks
 
 [aliases]
@@ -216,9 +216,8 @@ corp = "ssh://git@git.corp.example/"
 lab = "https://gitlab.corp.example/{path}.git"
 
 [[marketplace]]
-name = "github"
-kind = "github"
-topic = "herdr-plugin"
+name = "herdr.dev"
+kind = "herdr"                # the official herdr.dev/plugins index (default)
 
 [[marketplace]]
 name = "ghe"
@@ -251,6 +250,16 @@ name = "team"
 kind = "index"
 url = "https://intranet.corp.example/herdr-index.json"
 ```
+
+The default `herdr` source downloads the catalog behind herdr.dev/plugins
+(every public GitHub repository tagged `herdr-plugin`, one entry per
+manifest, monorepo plugins included). Every source except `github` lists its
+whole catalog once; searching filters the cached copy locally. The popup shows
+the cached marketplace immediately at any age, refreshes it in the background
+once it is older than `market_ttl`, and reports what changed (`r` forces a
+refresh). Static indexes are revalidated with `If-None-Match` /
+`If-Modified-Since`, so an unchanged catalog costs a 304. GitHub topic search
+is capped at 1000 repositories by the GitHub API.
 
 GitHub authentication uses an explicit source token, `GH_TOKEN`,
 `GITHUB_TOKEN`, then `gh auth token`. GHE additionally prefers

@@ -1,10 +1,11 @@
-//! The manager's own record of git-managed plugins.
+//! The manager's own record of git-managed plugins, and its per-plugin
+//! settings.
 //!
 //! To Herdr these are ordinary linked directories, so Herdr does not know
 //! where they came from. This registry remembers the remote, the ref being
 //! followed, the installed commit, and earlier installations for rollback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -58,6 +59,10 @@ pub struct Registry {
     pub version: u32,
     #[serde(default)]
     pub plugins: BTreeMap<String, Record>,
+    /// Plugin ids `herdr-pm auto-update` updates without a preview, whether
+    /// the plugin is enabled or not (GitHub- and git-installed plugins).
+    #[serde(default)]
+    pub auto_update: BTreeSet<String>,
 }
 
 fn format_version() -> u32 {
@@ -97,6 +102,7 @@ impl Registry {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Registry {
                 version: 1,
                 plugins: BTreeMap::new(),
+                auto_update: BTreeSet::new(),
             },
             Err(err) => {
                 return Err(err).with_context(|| format!("could not read {}", path.display()))

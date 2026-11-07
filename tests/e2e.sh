@@ -115,6 +115,24 @@ out="$("$HPM" history team.hello)"
 contains "$out" "rollback"
 ok "history records changes"
 
+# --- auto-update: disabled plugins too, no preview, then off again
+expect "auto-update enable on a disabled plugin" "$HPM" auto-update enable team.b
+out="$("$HPM" info team.b)"
+contains "$out" "auto-update"
+contains "$out" "on"
+sed -i.bak 's/0.2.0/0.3.0/g' "$T/work/mono/plugins/b/herdr-plugin.toml" && rm -f "$T/work/mono/plugins/b/herdr-plugin.toml.bak"
+git -C "$T/work/mono" commit -q -am "b 0.3.0"
+git -C "$T/work/mono" push -q "$SRV/team/mono.git" main
+out="$("$HPM" auto-update < /dev/null 2>&1)"
+contains "$out" "Updated team.b 0.3.0"
+out="$("$HPM" list)"
+contains "$out" "○ team.b"
+ok "auto-update applies without a preview and keeps the plugin disabled"
+expect "auto-update disable" "$HPM" auto-update disable team.b
+out="$("$HPM" auto-update 2>&1)"
+contains "$out" "No plugin has auto-update turned on"
+expect_fail "auto-update refuses an unknown plugin" "$HPM" auto-update enable does.not.exist
+
 # --- abbreviated commit ids remain checkable
 SHORT="$(git -C "$T/work/hello" rev-parse --short HEAD)"
 expect "switch to an abbreviated commit" "$HPM" switch team.hello "$SHORT" --yes

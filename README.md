@@ -170,7 +170,7 @@ action.
 |---|---|
 | Navigation | arrows / `j` / `k`, `/` filter |
 | Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
-| Updates | `u` selected, `U` all, each with its own review |
+| Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
 | State | `e` enable/disable, `x` uninstall, `p` pin/unpin |
 | Versions | `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
@@ -178,6 +178,13 @@ action.
 
 Install, update, rollback, pin and uninstall suspend the popup and use the same
 terminal review paths as the CLI.
+
+Auto-update is a per-plugin switch, independent of enable/disable. When Herdr
+starts, the manager's `[[startup]]` hook runs `herdr-pm auto-update`, which
+updates every GitHub- or git-installed plugin with the switch on, **without the
+trust preview**, disabled plugins included. Pinned plugins stay where they are;
+local links cannot use it. Turn it on only for repositories you trust to run new
+commands unattended.
 
 ## CLI
 
@@ -187,6 +194,7 @@ herdr-pm list [--check] [--json]
 herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id>        herdr-pm enable|disable <id>
+herdr-pm auto-update [enable|disable <id>]
 herdr-pm info <id> [--json]    herdr-pm history [id]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]
 herdr-pm unpin <id> [ref]      herdr-pm switch <id> <ref>
@@ -349,6 +357,11 @@ Raccourci conseillé : `prefix+m` avec la commande
 `herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
 fonctionne aussi : molette, clic sur une ligne ou sur un onglet. `herdr-pm config
 init` crée une configuration commentée et `?` affiche l'aide du popup.
+
+**Mise à jour automatique** : `A` dans « Installed » l'active ou la désactive
+pour un plugin, qu'il soit activé ou non (`⟳` dans la liste). Au démarrage de
+Herdr, `herdr-pm auto-update` met ces plugins à jour **sans aperçu** ; les
+plugins épinglés ne bougent pas et les liens locaux ne sont pas concernés.
 
 **Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
 `..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build

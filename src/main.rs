@@ -109,6 +109,12 @@ enum Cmd {
     Enable { id: String },
     /// Disable a plugin.
     Disable { id: String },
+    /// Update the plugins with auto-update on, without previews (Herdr runs
+    /// this at startup), or turn auto-update on or off for one plugin.
+    AutoUpdate {
+        #[command(subcommand)]
+        command: Option<AutoUpdateCmd>,
+    },
     /// Show everything known about a plugin.
     Info {
         id: String,
@@ -199,6 +205,14 @@ enum Cmd {
     },
     /// Open the manager as a Herdr popup (what the `open` action runs).
     Open,
+}
+
+#[derive(Subcommand)]
+enum AutoUpdateCmd {
+    /// Update this plugin automatically, enabled or not.
+    Enable { id: String },
+    /// Stop updating this plugin automatically.
+    Disable { id: String },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +329,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Disable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, false).map(|_| ExitCode::SUCCESS)
         }
+        Cmd::AutoUpdate { command: None } => Ok(code(ops::auto_update(&ctx(dry, true)?)?)),
+        Cmd::AutoUpdate {
+            command: Some(AutoUpdateCmd::Enable { id }),
+        } => auto_update_setting(&ctx(dry, false)?, &id, true),
+        Cmd::AutoUpdate {
+            command: Some(AutoUpdateCmd::Disable { id }),
+        } => auto_update_setting(&ctx(dry, false)?, &id, false),
         Cmd::Info { id, json } => info(&ctx(dry, false)?, &id, json),
         Cmd::Rollback { id, yes } => {
             ops::rollback(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
@@ -365,6 +386,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+fn auto_update_setting(ctx: &Ctx, id: &str, on: bool) -> Result<ExitCode> {
+    ops::set_auto_update(ctx, id, on)?;
+    let state = if on { "on" } else { "off" };
+    if ctx.dry_run {
+        println!("[dry-run] would turn auto-update {state} for {id}");
+    } else {
+        println!("{} Auto-update {state} for {id}", ops::green("✓"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
     let rows = ops::rows(&ctx.herdr)?;
     let statuses: Vec<Option<Status>> = if check {
@@ -382,6 +414,7 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
                     "name": row.plugin.name,
                     "version": row.plugin.version,
                     "enabled": row.plugin.enabled,
+                    "auto_update": row.auto_update,
                     "origin": row.origin,
                     "source": row.source_display(),
                     "ref": row.requested_ref(),

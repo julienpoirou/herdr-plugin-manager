@@ -91,6 +91,8 @@ pub struct Row {
     pub plugin: Plugin,
     pub record: Option<Record>,
     pub origin: Origin,
+    /// Updated without a preview by `herdr-pm auto-update`.
+    pub auto_update: bool,
 }
 
 impl Row {
@@ -203,10 +205,12 @@ pub fn rows(herdr: &Herdr) -> Result<Vec<Row>> {
             } else {
                 Origin::Local
             };
+            let auto_update = registry.auto_update.contains(&plugin.plugin_id);
             Row {
                 plugin,
                 record,
                 origin,
+                auto_update,
             }
         })
         .collect())
@@ -1208,6 +1212,12 @@ pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
             cleanup_installs(&plugin_id);
         }
     }
+    {
+        let mut locked = Registry::lock()?;
+        if locked.registry.auto_update.remove(&plugin_id) {
+            locked.save()?;
+        }
+    }
     registry::log_event(Event {
         unix: util::now_unix(),
         action: "uninstall".into(),
@@ -1232,6 +1242,61 @@ pub fn set_enabled(ctx: &Ctx, id: &str, enabled: bool) -> Result<()> {
         row.plugin.plugin_id
     );
     Ok(())
+}
+
+/// Turns unattended updates on or off for one plugin, enabled or not.
+/// Prints nothing, so the popup can call it.
+pub fn set_auto_update(ctx: &Ctx, id: &str, on: bool) -> Result<()> {
+    let row = require_row(ctx, id)?;
+    let id = &row.plugin.plugin_id;
+    if row.origin == Origin::Local {
+        bail!("{id} is a local link: there is no remote to update it from");
+    }
+    if ctx.dry_run {
+        return Ok(());
+    }
+    let mut locked = Registry::lock()?;
+    let changed = if on {
+        locked.registry.auto_update.insert(id.clone())
+    } else {
+        locked.registry.auto_update.remove(id)
+    };
+    if changed {
+        locked.save()?;
+        drop(locked);
+        registry::log_event(Event {
+            unix: util::now_unix(),
+            action: if on {
+                "auto-update on"
+            } else {
+                "auto-update off"
+            }
+            .into(),
+            plugin_id: id.clone(),
+            source: Some(row.source_display()),
+            from: None,
+            to: None,
+            ok: true,
+            detail: None,
+        });
+    }
+    Ok(())
+}
+
+/// Updates every plugin with auto-update on (what Herdr runs at startup).
+/// Callers pass a `ctx` with `yes`: nobody is there to review a preview.
+/// Pinned plugins stay where they are. Returns the number of failures.
+pub fn auto_update(ctx: &Ctx) -> Result<usize> {
+    let ids: Vec<String> = rows(&ctx.herdr)?
+        .into_iter()
+        .filter(|r| r.auto_update && r.origin != Origin::Local)
+        .map(|r| r.plugin.plugin_id)
+        .collect();
+    if ids.is_empty() {
+        println!("No plugin has auto-update turned on.");
+        return Ok(0);
+    }
+    update(ctx, &ids)
 }
 
 pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
@@ -1762,6 +1827,10 @@ pub fn describe(row: &Row) -> Vec<(String, String)> {
         ("name".into(), p.name.clone()),
         ("version".into(), p.version.clone()),
         ("enabled".into(), p.enabled.to_string()),
+        (
+            "auto-update".into(),
+            if row.auto_update { "on" } else { "off" }.into(),
+        ),
         ("origin".into(), row.origin.label().into()),
         ("source".into(), row.source_display()),
         ("ref".into(), row.ref_display()),

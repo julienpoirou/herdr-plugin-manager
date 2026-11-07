@@ -1798,9 +1798,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.view {
         View::Installed => &[
             ("u", "update"),
-            ("U", "all"),
+            ("U", "update all"),
             ("e", "toggle"),
-            ("A", "auto"),
+            ("A", "auto-update"),
             ("x", "remove"),
             ("i", "install"),
             ("m", "market"),
@@ -1812,7 +1812,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("/", "search"),
             ("←→", "page"),
             ("s", "sort"),
-            ("f", "source"),
+            ("f", "switch source"),
             ("o", "open"),
             ("r", "refresh"),
             ("q", "back"),
@@ -1923,7 +1923,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines = vec![
         section("Installed"),
-        key("u / U", "update selected / every outdated plugin"),
+        key("u / U", "update selected / update all outdated plugins"),
         key("e", "enable or disable"),
         key(
             "A",
@@ -1941,7 +1941,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("r", "refresh and re-check updates"),
         section("Marketplace"),
         key("↵", "install the selection (preview first)"),
-        key("/ s f", "search · sort · cycle sources"),
+        key("/ s f", "search · sort · switch source"),
         key("← →", "previous / next page"),
         key("o r", "open in browser · refresh listings"),
         section("Anywhere"),

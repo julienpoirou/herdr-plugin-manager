@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -283,31 +283,27 @@ pub fn ask_line(prompt: &str) -> Result<String> {
 }
 
 /// Splits an input line like a shell would for simple cases: whitespace
-/// separates words, single or double quotes group them, backslash escapes.
+/// separates words, single or double quotes group them, and a backslash
+/// escapes a quote, a space or another backslash. Any other backslash is
+/// kept, so Windows paths (`C:\Users\…`) survive.
 pub fn split_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
-    let mut chars = input.chars();
+    let mut chars = input.chars().peekable();
+    let escapable = |c: char| c == '\\' || c == '"' || c == '\'' || c.is_whitespace();
     while let Some(ch) = chars.next() {
         match (quote, ch) {
             (Some(q), c) if c == q => quote = None,
-            (Some(_), '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
+            (_, '\\') if chars.peek().is_some_and(|&n| escapable(n)) => {
+                current.extend(chars.next());
+                in_word = true;
             }
             (Some(_), c) => current.push(c),
             (None, '\'' | '"') => {
                 quote = Some(ch);
                 in_word = true;
-            }
-            (None, '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                    in_word = true;
-                }
             }
             (None, c) if c.is_whitespace() => {
                 if in_word {
@@ -380,6 +376,45 @@ pub fn run_captured(mut command: Command, timeout: Option<Duration>) -> Result<O
         Some(timeout) => wait_with_timeout(child, timeout),
         None => Ok(child.wait_with_output()?),
     }
+}
+
+/// Runs a command with stdin closed, handing every line it prints (stdout
+/// and stderr, as they come) to `on_line`. Returns its exit status.
+pub fn stream_command(command: &mut Command, on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let program = format!("{:?}", command.get_program());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start {program}"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    let stdout = child
+        .stdout
+        .take()
+        .map(|s| Box::new(s) as Box<dyn io::Read + Send>);
+    let stderr = child
+        .stderr
+        .take()
+        .map(|s| Box::new(s) as Box<dyn io::Read + Send>);
+    for pipe in [stdout, stderr].into_iter().flatten() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx);
+    for line in rx {
+        on_line(line.trim_end_matches('\r'));
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    Ok(child.wait()?)
 }
 
 /// Opens a URL with the platform's default handler, detached and silent.
@@ -472,6 +507,14 @@ mod tests {
         assert_eq!(
             split_words(r#"ssh://h/a.git --ref "v 1" --subdir 'x y' a\ b"#),
             vec!["ssh://h/a.git", "--ref", "v 1", "--subdir", "x y", "a b"]
+        );
+        assert_eq!(
+            split_words(r#"C:\srv\git\a.git "C:\Program Files\Editor\edit.exe" -w"#),
+            vec![
+                r"C:\srv\git\a.git",
+                r"C:\Program Files\Editor\edit.exe",
+                "-w"
+            ]
         );
         assert!(split_words("   ").is_empty());
     }

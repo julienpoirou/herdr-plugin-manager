@@ -273,6 +273,7 @@ fn ctx(dry_run: bool, yes: bool) -> Result<Ctx> {
         herdr: Herdr::detect(dry_run),
         config: Config::load()?,
         yes,
+        report: std::sync::Arc::new(ops::TerminalReport),
         dry_run,
     })
 }

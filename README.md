@@ -176,10 +176,17 @@ action.
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
 | Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
 
-Install, update, rollback, pin to another version and uninstall suspend the
-popup and use the same terminal review paths as the CLI. The detail panel shows
-the installed version as `branch@commit` (`main@8cda521`, `v1.4.0@8cda521`), or
-`@8cda521 (pinned)`.
+Install, update (one or all), removal, rollback, pinning another version and
+switching run inside the popup. The trust preview appears as a dialog (`y`
+yes, `n` no, `a` yes to the rest of an update-all, arrows to scroll); the work
+then runs in the background behind a progress dialog: the current step, a bar
+(`plugin k/n` for update-all), and the command output on `l`. It closes by
+itself on success; on failure it stays open with the output. GitHub
+shorthands get the same preview from a mirror of the repository before Herdr
+installs them. Only the editor (`c`/`C`) takes over the terminal.
+
+The detail panel shows the installed version as `branch@commit`
+(`main@8cda521`, `v1.4.0@8cda521`), or `@8cda521 (pinned)`.
 
 `p` lists the repository's tags (one `git ls-remote`), newest version first:
 

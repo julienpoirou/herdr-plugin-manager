@@ -6,7 +6,8 @@
 //! terminal, then returns.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ use ratatui::{Frame, Terminal};
 use crate::config::Config;
 use crate::git::{Git, RemoteTag};
 use crate::market::{self, Entry, Sort};
-use crate::ops::{self, Ctx, InstallRequest, Origin, Row, Status};
+use crate::ops::{self, Ctx, InstallRequest, Origin, Report, Row, Status};
 use crate::{paths, source, util};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -78,8 +79,6 @@ enum Confirm {
         path: String,
     },
     UpdateAll(Vec<String>),
-    InstallEntry(Box<Entry>),
-    Rollback(String),
     AutoUpdateOn {
         id: String,
         name: String,
@@ -101,6 +100,8 @@ enum Msg {
     Branch(String, String),
     /// Tags for the version picker.
     Versions(String, Result<Vec<RemoteTag>, String>),
+    /// Progress of the running operation.
+    Task(TaskEvent),
 }
 
 struct MarketState {
@@ -137,8 +138,99 @@ struct Picker {
     error: Option<String>,
 }
 
+enum TaskEvent {
+    Step(String),
+    Line(String),
+    Review(Review),
+    Progress(usize, usize),
+    Done(Result<(), String>),
+}
+
+/// A trust preview waiting for y/n.
+struct Review {
+    title: String,
+    lines: Vec<String>,
+    question: String,
+    reply: Sender<bool>,
+    scroll: usize,
+}
+
+/// An install, update, removal… running on a worker thread. Its output is
+/// kept in `log` (shown with `l`, and when it fails).
+struct Task {
+    title: String,
+    started: Instant,
+    step: String,
+    log: Vec<String>,
+    progress: Option<(usize, usize)>,
+    review: Option<Review>,
+    show_log: bool,
+    /// Keep the dialog open after success (log listings).
+    hold: bool,
+    done: Option<Result<(), String>>,
+    /// `a` on a review approves the rest of a batch.
+    batch: bool,
+    accept_all: Arc<AtomicBool>,
+    touched: Option<Vec<String>>,
+}
+
+/// How operations report while the popup runs them: stages and output go
+/// to the task dialog, previews become a y/n dialog, nothing touches the
+/// terminal.
+struct TaskReport {
+    tx: Sender<Msg>,
+    accept_all: Arc<AtomicBool>,
+}
+
+impl TaskReport {
+    fn send(&self, event: TaskEvent) {
+        let _ = self.tx.send(Msg::Task(event));
+    }
+}
+
+impl Report for TaskReport {
+    fn step(&self, text: &str) {
+        self.send(TaskEvent::Step(text.to_string()));
+    }
+
+    fn line(&self, text: &str) {
+        self.send(TaskEvent::Line(text.to_string()));
+    }
+
+    fn review(&self, title: &str, lines: &[String], question: Option<&str>) -> Result<bool> {
+        let Some(question) = question else {
+            for line in lines {
+                self.line(line);
+            }
+            return Ok(true);
+        };
+        if self.accept_all.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let (reply, answer) = mpsc::channel();
+        self.send(TaskEvent::Review(Review {
+            title: title.to_string(),
+            lines: lines.to_vec(),
+            question: question.to_string(),
+            reply,
+            scroll: 0,
+        }));
+        Ok(answer.recv().unwrap_or(false))
+    }
+
+    fn progress(&self, done: usize, total: usize) {
+        self.send(TaskEvent::Progress(done, total));
+    }
+
+    fn interactive(&self) -> bool {
+        false
+    }
+}
+
 struct App {
     ctx: Ctx,
+    /// The operation running in the background, if any.
+    task: Option<Task>,
     view: View,
     rows: Vec<Row>,
     checks: HashMap<String, Check>,
@@ -202,6 +294,7 @@ impl App {
             tx,
             rx,
             quit: false,
+            task: None,
             list_area: Rect::default(),
             tab_areas: Vec::new(),
             market_header: 0,
@@ -365,6 +458,7 @@ impl App {
                     self.branches.insert(id, branch);
                 }
                 Msg::Versions(id, result) => fill_picker(self, &id, result),
+                Msg::Task(event) => task_event(self, event),
                 Msg::Market(generation, results) => {
                     if generation != self.market.generation {
                         continue;
@@ -504,6 +598,7 @@ fn enter(term: &mut Term) -> Result<()> {
     )?;
     #[cfg(windows)]
     {
+        use std::io::Write;
         let mut out = io::stdout();
         out.write_all(VT_MOUSE_ON.as_bytes())?;
         out.flush()?;
@@ -515,6 +610,7 @@ fn enter(term: &mut Term) -> Result<()> {
 fn leave() -> Result<()> {
     #[cfg(windows)]
     {
+        use std::io::Write;
         let mut out = io::stdout();
         let _ = out.write_all(VT_MOUSE_OFF.as_bytes());
         let _ = out.flush();
@@ -527,18 +623,6 @@ fn leave() -> Result<()> {
     );
     terminal::disable_raw_mode()?;
     Ok(())
-}
-
-fn wait_for_key() {
-    let _ = terminal::enable_raw_mode();
-    loop {
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    let _ = terminal::disable_raw_mode();
 }
 
 pub fn run(ctx: Ctx) -> Result<()> {
@@ -561,6 +645,7 @@ pub fn run(ctx: Ctx) -> Result<()> {
         let _ = leave();
         default_hook(info);
     }));
+    ops::set_plain();
     enter(&mut term)?;
     let result = event_loop(&mut app, &mut term);
     leave()?;
@@ -581,7 +666,9 @@ fn event_loop(app: &mut App, term: &mut Term) -> Result<()> {
         if app.quit {
             return Ok(());
         }
-        let busy = app.market.loading || app.checks.values().any(|c| matches!(c, Check::Pending));
+        let busy = app.market.loading
+            || app.task.is_some()
+            || app.checks.values().any(|c| matches!(c, Check::Pending));
         let timeout = if busy {
             Duration::from_millis(80)
         } else {
@@ -646,179 +733,313 @@ fn editor_command(config: &Config) -> Vec<String> {
     util::split_words(&raw)
 }
 
+/// Runs a job: the editor takes over the terminal; everything else runs as
+/// a background task behind a progress dialog.
 fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
-    // An editor returns straight to the UI; everything else waits so the
-    // output (preview, build log, result) can be read.
-    let pause = !matches!(job, Job::EditFile(_));
-    leave()?;
-    print!("\x1b[2J\x1b[H");
-    let _ = io::stdout().flush();
-    let mut touched: Option<Vec<String>> = None;
-    let result: Result<()> = (|| match job {
-        Job::Install(spec) => {
-            let words = util::split_words(&spec);
-            let mut source_arg = None;
-            let mut reference = None;
-            let mut subdir = None;
-            let mut force_git = false;
-            let mut replace = false;
-            let mut it = words.into_iter();
-            while let Some(w) = it.next() {
-                match w.as_str() {
-                    "--ref" => reference = it.next(),
-                    "--subdir" => subdir = it.next(),
-                    "--git" => force_git = true,
-                    "--replace" => replace = true,
-                    _ if source_arg.is_none() => source_arg = Some(w),
-                    other => anyhow::bail!("unexpected {other:?}"),
-                }
-            }
-            let source_arg = source_arg.ok_or_else(|| anyhow::anyhow!("no source given"))?;
-            let mut parsed = source::parse(&source_arg, &app.ctx.config.aliases)?;
-            if force_git {
-                parsed = parsed.into_git();
-            }
-            if let Some(s) = subdir.as_deref() {
-                source::validate_subdir(&source::normalize_subdir(s))?;
-            }
-            println!(
-                "{} {}\n",
-                ops::bold("install"),
-                util::sanitize(&parsed.display())
-            );
-            ops::install(
-                &app.ctx,
-                InstallRequest {
-                    source: parsed.with_subdir(subdir),
-                    reference,
-                    enabled: None,
-                    replace,
-                },
-            )
-            .map(|_| ())
+    if let Job::EditFile(path) = job {
+        leave()?;
+        let result = edit_file(app, &path);
+        enter(term)?;
+        app.reload();
+        match result {
+            Ok(()) => app.message = None,
+            Err(err) => app.say(Level::Error, util::truncate(&format!("{err:#}"), 200)),
         }
-        Job::InstallEntry(entry) => {
+        return Ok(());
+    }
+    let one = |id: &String| Some(vec![id.clone()]);
+    let (title, touched, batch, yes, hold): (String, Option<Vec<String>>, bool, bool, bool) =
+        match &job {
+            Job::Install(spec) => (format!("Installing {spec}"), None, false, false, false),
+            Job::InstallEntry(entry) => (
+                format!("Installing {}", entry.title),
+                None,
+                false,
+                false,
+                false,
+            ),
+            Job::Update(ids) if ids.len() == 1 => (
+                format!("Updating {}", ids[0]),
+                Some(ids.clone()),
+                false,
+                false,
+                false,
+            ),
+            Job::Update(ids) => (
+                format!("Updating {} plugins", ids.len()),
+                Some(ids.clone()),
+                true,
+                false,
+                false,
+            ),
+            Job::Uninstall(id, true) => (format!("Deleting {id}"), None, false, true, false),
+            Job::Uninstall(id, false) => (format!("Removing {id}"), None, false, true, false),
+            Job::Rollback(id) => (format!("Rolling back {id}"), one(id), false, false, false),
+            Job::PinTo(id, commit) => (
+                format!("Pinning {id} at {}", util::short_sha(commit)),
+                one(id),
+                false,
+                false,
+                false,
+            ),
+            Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false, false, false),
+            Job::Switch(id, r) => (
+                format!("Switching {id} to {r}"),
+                one(id),
+                false,
+                false,
+                false,
+            ),
+            Job::Logs(id) => (format!("Recent commands of {id}"), None, false, false, true),
+            Job::EditFile(_) => unreachable!(),
+        };
+    let run: Operation = match job {
+        Job::Install(spec) => Box::new(move |ctx| {
+            let request = parse_install(&spec, &ctx.config.aliases)?;
+            ops::install(ctx, request).map(|_| ())
+        }),
+        Job::InstallEntry(entry) => Box::new(move |ctx| {
             let spec = entry.install_spec();
             let parsed = if entry.is_github() {
-                source::parse(&format!("github:{spec}"), &app.ctx.config.aliases)?
+                source::parse(&format!("github:{spec}"), &ctx.config.aliases)?
             } else {
-                source::parse(&spec, &app.ctx.config.aliases)?
+                source::parse(&spec, &ctx.config.aliases)?
             };
-            println!(
-                "{} {} {}\n",
-                ops::bold("install"),
-                util::sanitize(&parsed.display()),
-                ops::dim(&format!("[{}]", util::sanitize(&entry.market)))
-            );
-            ops::install(
-                &app.ctx,
-                InstallRequest {
-                    source: parsed,
-                    reference: entry.git_ref.clone(),
-                    enabled: None,
-                    replace: false,
-                },
-            )
-            .map(|_| ())
-        }
-        Job::Update(ids) => {
-            touched = Some(ids.clone());
-            let failures = ops::update(&app.ctx, &ids)?;
-            if failures > 0 {
-                anyhow::bail!("{failures} update(s) failed");
-            }
-            Ok(())
-        }
-        Job::Uninstall(id, purge) => {
-            let ctx = Ctx {
-                yes: true,
-                ..clone_ctx(&app.ctx)
+            let request = InstallRequest {
+                source: parsed,
+                reference: entry.git_ref.clone(),
+                enabled: None,
+                replace: false,
             };
-            ops::uninstall(&ctx, &id, purge)
-        }
-        Job::Rollback(id) => {
-            touched = Some(vec![id.clone()]);
-            ops::rollback(&app.ctx, &id)
-        }
-        Job::PinTo(id, commit) => {
-            touched = Some(vec![id.clone()]);
-            ops::pin(&app.ctx, &id, Some(&commit))
-        }
-        Job::Unpin(id) => {
-            touched = Some(vec![id.clone()]);
-            ops::unpin(&app.ctx, &id, None)
-        }
-        Job::Switch(id, reference) => {
-            touched = Some(vec![id.clone()]);
-            ops::switch(&app.ctx, &id, &reference)
-        }
-        Job::EditFile(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            if !path.exists() && path.ends_with("config.toml") {
-                crate::config::Config::init()?;
-            }
-            let argv = editor_command(&app.ctx.config);
-            if app.ctx.dry_run {
-                println!("[dry-run] {} {}", argv.join(" "), path.display());
-                return Ok(());
-            }
-            let status = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .arg(&path)
-                .status()?;
+            ops::install(ctx, request).map(|_| ())
+        }),
+        Job::Update(ids) => Box::new(move |ctx| match ops::update(ctx, &ids)? {
+            0 => Ok(()),
+            failures => anyhow::bail!("{failures} update(s) failed"),
+        }),
+        Job::Uninstall(id, purge) => Box::new(move |ctx| ops::uninstall(ctx, &id, purge)),
+        Job::Rollback(id) => Box::new(move |ctx| ops::rollback(ctx, &id)),
+        Job::PinTo(id, commit) => Box::new(move |ctx| ops::pin(ctx, &id, Some(&commit))),
+        Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
+        Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
+        Job::Logs(id) => Box::new(move |ctx| {
+            let status = ctx.herdr.logs(&id, &|line| ctx.report.line(line))?;
             if !status.success() {
-                anyhow::bail!("editor exited with {status}");
-            }
-            if path.ends_with("config.toml") {
-                match Config::load() {
-                    Ok(c) => app.ctx.config = c,
-                    Err(err) => anyhow::bail!("config not reloaded: {err:#}"),
-                }
+                anyhow::bail!("herdr plugin log list failed ({status})");
             }
             Ok(())
+        }),
+        Job::EditFile(_) => unreachable!(),
+    };
+    start_task(app, title, touched, batch, yes, hold, run);
+    Ok(())
+}
+
+/// The words typed at the `i` prompt: a source and optional flags.
+fn parse_install(
+    spec: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> Result<InstallRequest> {
+    let mut source_arg = None;
+    let mut reference = None;
+    let mut subdir = None;
+    let mut force_git = false;
+    let mut replace = false;
+    let mut words = util::split_words(spec).into_iter();
+    while let Some(w) = words.next() {
+        match w.as_str() {
+            "--ref" => reference = words.next(),
+            "--subdir" => subdir = words.next(),
+            "--git" => force_git = true,
+            "--replace" => replace = true,
+            _ if source_arg.is_none() => source_arg = Some(w),
+            other => anyhow::bail!("unexpected {other:?}"),
         }
-        Job::Logs(id) => {
-            let status = app
-                .ctx
-                .herdr
-                .interactive(&["plugin", "log", "list", "--plugin", &id, "--limit", "20"])?;
-            if !status.success() {
-                anyhow::bail!("herdr plugin log list failed");
-            }
-            Ok(())
-        }
-    })();
-    if pause || result.is_err() {
-        match &result {
-            Ok(()) => println!("\n{}", ops::green("✓ done")),
-            Err(err) => println!("\n{} {err:#}", ops::red("✗")),
-        }
-        print!("{}", ops::dim("press any key to return"));
-        let _ = io::stdout().flush();
-        wait_for_key();
     }
-    enter(term)?;
-    app.reload();
-    match touched {
-        Some(ids) => app.start_checks(Some(&ids)),
-        None => app.start_checks(None),
+    let source_arg = source_arg.ok_or_else(|| anyhow::anyhow!("no source given"))?;
+    let mut parsed = source::parse(&source_arg, aliases)?;
+    if force_git {
+        parsed = parsed.into_git();
     }
-    match result {
-        Ok(()) => app.message = None,
-        Err(err) => app.say(Level::Error, util::truncate(&format!("{err:#}"), 200)),
+    if let Some(s) = subdir.as_deref() {
+        source::validate_subdir(&source::normalize_subdir(s))?;
+    }
+    Ok(InstallRequest {
+        source: parsed.with_subdir(subdir),
+        reference,
+        enabled: None,
+        replace,
+    })
+}
+
+fn edit_file(app: &mut App, path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() && path.ends_with("config.toml") {
+        crate::config::Config::init()?;
+    }
+    let argv = editor_command(&app.ctx.config);
+    if app.ctx.dry_run {
+        return Ok(());
+    }
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    if path.ends_with("config.toml") {
+        match Config::load() {
+            Ok(c) => app.ctx.config = c,
+            Err(err) => anyhow::bail!("config not reloaded: {err:#}"),
+        }
     }
     Ok(())
 }
 
-fn clone_ctx(ctx: &Ctx) -> Ctx {
-    Ctx {
-        herdr: ctx.herdr.clone(),
-        config: ctx.config.clone(),
-        yes: ctx.yes,
-        dry_run: ctx.dry_run,
+/// The work of a task, run on its worker thread.
+type Operation = Box<dyn FnOnce(&Ctx) -> Result<()> + Send>;
+
+fn start_task(
+    app: &mut App,
+    title: String,
+    touched: Option<Vec<String>>,
+    batch: bool,
+    yes: bool,
+    hold: bool,
+    run: Operation,
+) {
+    let accept_all = Arc::new(AtomicBool::new(false));
+    let ctx = Ctx {
+        herdr: app.ctx.herdr.clone(),
+        config: app.ctx.config.clone(),
+        yes,
+        dry_run: app.ctx.dry_run,
+        report: Arc::new(TaskReport {
+            tx: app.tx.clone(),
+            accept_all: Arc::clone(&accept_all),
+        }),
+    };
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        let result = run(&ctx).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Task(TaskEvent::Done(result)));
+    });
+    app.message = None;
+    app.task = Some(Task {
+        title,
+        started: Instant::now(),
+        step: "starting".into(),
+        log: Vec::new(),
+        progress: None,
+        review: None,
+        show_log: hold,
+        hold,
+        done: None,
+        batch,
+        accept_all,
+        touched,
+    });
+}
+
+fn task_event(app: &mut App, event: TaskEvent) {
+    let Some(task) = app.task.as_mut() else {
+        return;
+    };
+    match event {
+        TaskEvent::Step(text) => {
+            task.log.push(format!("› {text}"));
+            task.step = text;
+        }
+        TaskEvent::Line(text) => {
+            task.log.push(text);
+            if task.log.len() > 5000 {
+                task.log.drain(..1000);
+            }
+        }
+        TaskEvent::Review(review) => task.review = Some(review),
+        TaskEvent::Progress(done, total) => task.progress = Some((done, total)),
+        TaskEvent::Done(Ok(())) if !task.hold => finish_task(app),
+        TaskEvent::Done(result) => {
+            task.show_log = true;
+            task.done = Some(result);
+        }
     }
+}
+
+/// Closes the task dialog and reports how it ended in the status line.
+fn finish_task(app: &mut App) {
+    let Some(task) = app.task.take() else {
+        return;
+    };
+    app.reload();
+    match &task.touched {
+        Some(ids) => app.start_checks(Some(ids)),
+        None => app.start_checks(None),
+    }
+    match task.done {
+        Some(Err(err)) => app.say(Level::Error, util::truncate(&err, 200)),
+        _ => {
+            let summary = task
+                .log
+                .iter()
+                .rev()
+                .find(|l| l.starts_with('✓') || l.as_str() == "cancelled")
+                .cloned()
+                .unwrap_or_else(|| format!("{}: done", task.title));
+            let level = if summary == "cancelled" {
+                Level::Info
+            } else {
+                Level::Ok
+            };
+            app.say(level, summary.trim_start_matches("✓ ").to_string());
+        }
+    }
+}
+
+fn task_key(app: &mut App, key: KeyEvent) -> Option<Job> {
+    let task = app.task.as_mut()?;
+    if let Some(review) = task.review.as_mut() {
+        let answer = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+            KeyCode::Char('a') | KeyCode::Char('A') if task.batch => {
+                task.accept_all.store(true, Ordering::Relaxed);
+                Some(true)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+            KeyCode::Down | KeyCode::Char('j') => {
+                review.scroll += 1;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                review.scroll = review.scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                review.scroll += 10;
+                None
+            }
+            KeyCode::PageUp => {
+                review.scroll = review.scroll.saturating_sub(10);
+                None
+            }
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            let review = task.review.take().unwrap();
+            let _ = review.reply.send(answer);
+            task.step = if answer { "approved" } else { "declined" }.into();
+        }
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('l') | KeyCode::Char('L') => task.show_log = !task.show_log,
+        _ if task.done.is_some() => finish_task(app),
+        _ => {}
+    }
+    None
 }
 
 // ---------------------------------------------------------------- input
@@ -834,7 +1055,11 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
             } else {
                 -1
             };
-            if app.help {
+            if let Some(review) = app.task.as_mut().and_then(|t| t.review.as_mut()) {
+                review.scroll = review.scroll.saturating_add_signed(delta * 3);
+            } else if app.task.is_some() {
+                // The task dialog covers the list.
+            } else if app.help {
                 app.help_scroll = app.help_scroll.saturating_add_signed(delta * 3);
             } else if let Some(picker) = &mut app.picker {
                 picker.sel = (picker.sel as isize + delta)
@@ -845,7 +1070,11 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
             }
             true
         }
-        MouseEventKind::Down(MouseButton::Left) if app.help || app.picker.is_some() => false,
+        MouseEventKind::Down(MouseButton::Left)
+            if app.help || app.picker.is_some() || app.task.is_some() =>
+        {
+            false
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(&(_, view)) = app.tab_areas.iter().find(|(area, _)| inside(*area)) {
                 switch_view(app, view);
@@ -911,6 +1140,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.quit = true;
         return None;
+    }
+    if app.task.is_some() {
+        return task_key(app, key);
     }
     if app.help {
         match key.code {
@@ -1121,7 +1353,7 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             } else if row.record.as_ref().is_none_or(|r| r.previous.is_empty()) {
                 app.say(Level::Info, "no earlier installation kept");
             } else {
-                app.confirm = Some(Confirm::Rollback(row.plugin.plugin_id.clone()));
+                return Some(Job::Rollback(row.plugin.plugin_id.clone()));
             }
         }
         KeyCode::Char('p') => {
@@ -1251,7 +1483,7 @@ fn market_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     ),
                 );
             } else {
-                app.confirm = Some(Confirm::InstallEntry(Box::new(entry)));
+                return Some(Job::InstallEntry(Box::new(entry)));
             }
         }
         _ => {}
@@ -1312,8 +1544,6 @@ fn answer_confirm(app: &mut App, confirm: Confirm, key: KeyEvent) -> Option<Job>
             _ => None,
         },
         Confirm::UpdateAll(ids) if yes => Some(Job::Update(ids)),
-        Confirm::InstallEntry(entry) if yes => Some(Job::InstallEntry(entry)),
-        Confirm::Rollback(id) if yes => Some(Job::Rollback(id)),
         Confirm::AutoUpdateOn { id, name } if yes => {
             match ops::set_auto_update(&app.ctx, &id, true) {
                 Ok(()) => {
@@ -1396,6 +1626,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(f, confirm, area);
+    }
+    if app.task.is_some() {
+        draw_task(f, app, area);
     }
 }
 
@@ -2002,20 +2235,6 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
             b.push("Each one still shows its preview before anything runs.".into());
             ("Update all", b, yes_no())
         }
-        Confirm::InstallEntry(e) => (
-            "Install",
-            vec![
-                format!("Install {} from [{}]?", e.title, e.market),
-                format!("  {}", e.install_spec()),
-                "A preview of everything it runs comes next.".into(),
-            ],
-            yes_no(),
-        ),
-        Confirm::Rollback(id) => (
-            "Rollback",
-            vec![format!("Return {id} to its previous installation?")],
-            yes_no(),
-        ),
     };
     let width = body
         .iter()
@@ -2362,6 +2581,162 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             format!(" Pin {} ", util::sanitize(&picker.name)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+// ---------------------------------------------------------------- task dialogs
+
+fn progress_bar(task: &Task, width: usize) -> String {
+    if task.done.is_some() {
+        return "█".repeat(width);
+    }
+    if let Some((done, total)) = task.progress.filter(|(_, t)| *t > 0) {
+        let filled = (done * width / total).min(width);
+        return format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+    }
+    // Unknown duration: a block sweeping across the bar.
+    let block = 6.min(width);
+    let span = width + block;
+    let pos = (task.started.elapsed().as_millis() / 60) as usize % span.max(1);
+    (0..width)
+        .map(|i| {
+            if i + block > pos && i <= pos {
+                '█'
+            } else {
+                '░'
+            }
+        })
+        .collect()
+}
+
+fn draw_task(f: &mut Frame, app: &App, area: Rect) {
+    let Some(task) = &app.task else {
+        return;
+    };
+    let width: u16 = 78.min(area.width.saturating_sub(2));
+    let inner = width.saturating_sub(2) as usize;
+    let (state, color) = match &task.done {
+        None => (
+            format!(
+                "{} {}",
+                spinner(),
+                util::truncate(&util::sanitize(&task.step), inner.saturating_sub(3))
+            ),
+            ACCENT,
+        ),
+        Some(Ok(())) => ("✓ done".to_string(), OK),
+        Some(Err(err)) => (
+            format!(
+                "✗ {}",
+                util::truncate(&util::sanitize(err), inner.saturating_sub(3))
+            ),
+            BAD,
+        ),
+    };
+    let label = match task.progress {
+        Some((done, total)) => format!(" {done}/{total}"),
+        None => format!(" {}s", task.started.elapsed().as_secs()),
+    };
+    let bar_width = inner.saturating_sub(label.chars().count() + 1);
+    let mut lines = vec![
+        Line::styled(state, Style::default().fg(color)),
+        Line::from(vec![
+            Span::styled(progress_bar(task, bar_width), Style::default().fg(color)),
+            Span::styled(label, muted()),
+        ]),
+    ];
+    if task.show_log {
+        lines.push(Line::raw(""));
+        let height = (area.height as usize).saturating_sub(12).clamp(4, 18);
+        if task.log.is_empty() {
+            lines.push(Line::styled("(no output yet)", muted()));
+        }
+        for line in task.log.iter().rev().take(height).rev() {
+            lines.push(Line::styled(
+                util::truncate(&util::sanitize(line), inner),
+                muted(),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    let toggle = if task.show_log {
+        " hide output"
+    } else {
+        " show output"
+    };
+    let mut hint = vec![
+        Span::styled(
+            "l",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(toggle, muted()),
+    ];
+    if task.done.is_some() {
+        hint.push(Span::styled("   any other key closes", muted()));
+    }
+    lines.push(Line::from(hint));
+    let rect = centered(area, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            format!(" {} ", util::sanitize(&task.title)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+    if let Some(review) = &task.review {
+        draw_review(f, review, task.batch, area);
+    }
+}
+
+/// The trust preview of an operation, waiting for y/n.
+fn draw_review(f: &mut Frame, review: &Review, batch: bool, area: Rect) {
+    let width: u16 = 100.min(area.width.saturating_sub(2));
+    let inner = width.saturating_sub(2) as usize;
+    let max_height = area.height.saturating_sub(2) as usize;
+    let visible = review.lines.len().min(max_height.saturating_sub(5)).max(1);
+    let max_scroll = review.lines.len().saturating_sub(visible);
+    let first = review.scroll.min(max_scroll);
+    let last = (first + visible).min(review.lines.len());
+    let mut lines: Vec<Line> = review.lines[first..last]
+        .iter()
+        .map(|l| Line::raw(util::truncate(l, inner)))
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        util::sanitize(&review.question),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let key =
+        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let mut hint = vec![
+        key("y"),
+        Span::raw(" yes   "),
+        key("n"),
+        Span::raw(" no   "),
+    ];
+    if batch {
+        hint.push(key("a"));
+        hint.push(Span::raw(" yes to all   "));
+    }
+    if max_scroll > 0 {
+        hint.push(key("↑↓"));
+        hint.push(Span::styled(
+            format!(" scroll {}–{last}/{}", first + 1, review.lines.len()),
+            muted(),
+        ));
+    }
+    lines.push(Line::from(hint));
+    let rect = centered(area, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(WARN))
+        .title(Span::styled(
+            format!(" {} ", util::sanitize(&review.title)),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Paragraph::new(lines).block(block), rect);

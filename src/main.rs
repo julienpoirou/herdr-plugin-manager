@@ -625,7 +625,7 @@ fn search(
     }
     let shown = entries.len().min(limit);
     for e in entries.iter().take(limit) {
-        let stars = e.stars.map(|s| format!("★{s}")).unwrap_or_default();
+        let stars = e.stars.map(|s| format!("★ {s}")).unwrap_or_default();
         let version = e
             .version
             .as_deref()

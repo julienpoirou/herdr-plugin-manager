@@ -93,6 +93,8 @@ pub struct Row {
     pub origin: Origin,
     /// Updated without a preview by `herdr-pm auto-update`.
     pub auto_update: bool,
+    /// Commit this manager holds a GitHub-installed plugin at.
+    pub pin: Option<String>,
 }
 
 impl Row {
@@ -128,6 +130,9 @@ impl Row {
     }
 
     pub fn ref_display(&self) -> String {
+        if let Some(pin) = &self.pin {
+            return format!("pinned {}", util::short_sha(pin));
+        }
         match self.requested_ref() {
             None if self.origin == Origin::Local => "-".into(),
             None => "default branch".into(),
@@ -136,8 +141,27 @@ impl Row {
         }
     }
 
+    /// `name@commit`: the followed branch or tag, the default branch when
+    /// its name is known (`HEAD` until then), or `@commit (pinned)`.
+    pub fn ref_label(&self, default_branch: Option<&str>) -> String {
+        let commit = self.commit().map(util::short_sha).unwrap_or("-");
+        if self.pinned() {
+            return format!("@{commit} (pinned)");
+        }
+        let name = self.requested_ref().or(default_branch).unwrap_or("HEAD");
+        format!("{name}@{commit}")
+    }
+
     pub fn pinned(&self) -> bool {
-        self.requested_ref().is_some_and(util::is_full_sha)
+        self.pin.is_some() || self.requested_ref().is_some_and(util::is_full_sha)
+    }
+
+    /// Unpinning needs a reinstall when Herdr itself installed the plugin at
+    /// a commit (its recorded ref can only change through `install`).
+    pub fn unpin_needs_install(&self) -> bool {
+        self.origin == Origin::Github
+            && self.pin.is_none()
+            && self.requested_ref().is_some_and(util::is_full_sha)
     }
 
     /// Browsable page for the source, when there is one.
@@ -206,11 +230,16 @@ pub fn rows(herdr: &Herdr) -> Result<Vec<Row>> {
                 Origin::Local
             };
             let auto_update = registry.auto_update.contains(&plugin.plugin_id);
+            let pin = match origin {
+                Origin::Github => registry.pins.get(&plugin.plugin_id).cloned(),
+                _ => None,
+            };
             Row {
                 plugin,
                 record,
                 origin,
                 auto_update,
+                pin,
             }
         })
         .collect())
@@ -1158,7 +1187,67 @@ fn require_row(ctx: &Ctx, id: &str) -> Result<Row> {
         .ok_or_else(|| anyhow!("plugin not installed: {id}"))
 }
 
-pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
+/// The `<id>-<hash>` directory under Herdr's `github-installations` that
+/// holds every checkout of a GitHub-installed plugin.
+fn github_installation_root(plugin_root: &str) -> Option<PathBuf> {
+    Path::new(plugin_root)
+        .ancestors()
+        .find(|a| {
+            a.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "github-installations")
+        })
+        .map(Path::to_path_buf)
+}
+
+/// What `uninstall --purge` deletes besides the installations it always
+/// removes: config directory, Herdr's leftover GitHub checkouts, the cached
+/// repository when no other plugin uses it, and a local link's directory.
+fn purge_targets(id: &str, row: Option<&Row>, record: Option<&Record>) -> Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+    if let Some(row) = row {
+        match row.origin {
+            Origin::Local => {
+                let dir = PathBuf::from(&row.plugin.plugin_root);
+                let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+                if dir.parent().is_none() || home.is_some_and(|h| Path::new(&h) == dir) {
+                    bail!("refusing to delete {}", dir.display());
+                }
+                targets.push(dir);
+            }
+            Origin::Github => targets.extend(github_installation_root(&row.plugin.plugin_root)),
+            Origin::Git => {}
+        }
+    }
+    if let Some(record) = record {
+        let shared = Registry::load()?
+            .plugins
+            .values()
+            .any(|r| r.id != id && r.url == record.url);
+        if !shared {
+            let mirror = crate::git::cache_path_for(&record.url);
+            targets.push(mirror.with_extension("lock"));
+            targets.push(mirror);
+        }
+    }
+    targets.push(paths::herdr_plugin_config_dir(id));
+    targets.retain(|p| p.exists());
+    Ok(targets)
+}
+
+fn delete_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("could not delete {}", path.display()))
+}
+
+/// Removes a plugin. `purge` also deletes what it leaves on disk (see
+/// `purge_targets`) and removes git-managed installations right away
+/// instead of through the trash.
+pub fn uninstall(ctx: &Ctx, id: &str, purge: bool) -> Result<()> {
     let rows = rows(&ctx.herdr)?;
     let row = find_row(&rows, id).cloned();
     let record = Registry::load()?.get(id).cloned();
@@ -1170,9 +1259,8 @@ pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
                     "unregister it and remove its installations ({})",
                     row.source_display()
                 ),
-                Origin::Github => {
-                    "uninstall it with herdr (herdr removes its GitHub checkout)".into()
-                }
+                Origin::Github => "uninstall it with herdr".into(),
+                Origin::Local if purge => "unlink it".into(),
                 Origin::Local => format!(
                     "unlink it (files in {} stay untouched)",
                     row.plugin.plugin_root
@@ -1185,13 +1273,38 @@ pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
         ),
         (None, None) => bail!("plugin not installed: {id}"),
     };
+    let doomed = if purge {
+        purge_targets(&plugin_id, row.as_ref(), record.as_ref())?
+    } else {
+        Vec::new()
+    };
+    let what = if doomed.is_empty() {
+        what
+    } else {
+        let list: Vec<String> = doomed
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect();
+        format!("{what}, then delete:\n{}\n", list.join("\n"))
+    };
+    let local_dir = row
+        .as_ref()
+        .filter(|r| purge && r.origin == Origin::Local)
+        .map(|r| r.plugin.plugin_root.clone());
     if !ctx.yes {
         if !util::stdin_is_tty() {
             bail!(
                 "refusing to uninstall without confirmation: stdin is not a terminal (pass --yes)"
             );
         }
-        if !util::confirm(&format!("Uninstall {plugin_id}: {what}?"))? {
+        let accepted = match &local_dir {
+            Some(dir) => {
+                eprintln!("Uninstall {plugin_id}: {what}");
+                util::ask_line(&format!("Type {plugin_id} to delete {dir}:"))? == plugin_id
+            }
+            None => util::confirm(&format!("Uninstall {plugin_id}: {what}?"))?,
+        };
+        if !accepted {
             eprintln!("cancelled");
             return Ok(());
         }
@@ -1204,14 +1317,17 @@ pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
         ctx.herdr.unregister(&plugin_id)?;
     }
     if row.as_ref().is_none_or(|r| r.origin == Origin::Git) {
-        if let Some(record) = record {
+        if let Some(record) = &record {
             let mut locked = Registry::lock()?;
             locked.registry.plugins.remove(&plugin_id);
             locked.save()?;
             drop(locked);
             for inst in std::iter::once(&record.current).chain(record.previous.iter()) {
                 let dir = Path::new(&inst.install_dir);
-                if dir.exists() {
+                if !dir.exists() {
+                    continue;
+                }
+                if !purge || delete_path(dir).is_err() {
                     trash(dir);
                 }
             }
@@ -1220,21 +1336,40 @@ pub fn uninstall(ctx: &Ctx, id: &str) -> Result<()> {
     }
     {
         let mut locked = Registry::lock()?;
-        if locked.registry.auto_update.remove(&plugin_id) {
+        let had_setting = locked.registry.auto_update.remove(&plugin_id)
+            | locked.registry.pins.remove(&plugin_id).is_some();
+        if had_setting {
             locked.save()?;
+        }
+    }
+    let mut failures = Vec::new();
+    for path in &doomed {
+        match delete_path(path) {
+            Ok(()) => println!("  {} deleted {}", dim("•"), path.display()),
+            Err(err) => failures.push(format!("{err:#}")),
         }
     }
     registry::log_event(Event {
         unix: util::now_unix(),
-        action: "uninstall".into(),
+        action: if purge { "purge" } else { "uninstall" }.into(),
         plugin_id: plugin_id.clone(),
         source: row.as_ref().map(|r| r.source_display()),
         from: row.as_ref().and_then(|r| r.commit().map(str::to_string)),
         to: None,
-        ok: true,
-        detail: None,
+        ok: failures.is_empty(),
+        detail: (!failures.is_empty()).then(|| failures.join("; ")),
     });
-    println!("{} Uninstalled {plugin_id}.", green("✓"));
+    if !failures.is_empty() {
+        bail!(
+            "{plugin_id} was uninstalled, but some files could not be deleted: {}",
+            failures.join("; ")
+        );
+    }
+    println!(
+        "{} {} {plugin_id}.",
+        green("✓"),
+        if purge { "Deleted" } else { "Uninstalled" }
+    );
     Ok(())
 }
 
@@ -1400,71 +1535,156 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Holds a plugin at its current commit (or at `reference`, resolved).
+fn log_pin_change(row: &Row, action: &str, commit: Option<&str>) {
+    registry::log_event(Event {
+        unix: util::now_unix(),
+        action: action.into(),
+        plugin_id: row.plugin.plugin_id.clone(),
+        source: Some(row.source_display()),
+        from: None,
+        to: commit.map(str::to_string),
+        ok: true,
+        detail: None,
+    });
+}
+
+/// Holds a plugin at the commit it runs now, without reinstalling it.
+/// Prints nothing, so the popup can call it. Returns the short commit.
+pub fn pin_current(ctx: &Ctx, id: &str) -> Result<String> {
+    let row = require_row(ctx, id)?;
+    let id = row.plugin.plugin_id.clone();
+    if row.origin == Origin::Local {
+        bail!("{id} is a local link; there is nothing to pin");
+    }
+    let commit = row
+        .commit()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{id} has no recorded commit"))?;
+    if !ctx.dry_run {
+        let mut locked = Registry::lock()?;
+        if row.origin == Origin::Git {
+            if let Some(rec) = locked.registry.plugins.get_mut(&id) {
+                rec.requested_ref = Some(commit.clone());
+                rec.current.requested_ref = rec.requested_ref.clone();
+            }
+        } else {
+            locked.registry.pins.insert(id.clone(), commit.clone());
+        }
+        locked.save()?;
+        drop(locked);
+        log_pin_change(&row, "pin", Some(&commit));
+    }
+    Ok(util::short_sha(&commit).to_string())
+}
+
+/// Follows the default branch again without reinstalling. Plugins Herdr
+/// installed at a commit (`Row::unpin_needs_install`) need `unpin`.
+/// Prints nothing, so the popup can call it.
+pub fn clear_pin(ctx: &Ctx, id: &str) -> Result<()> {
+    let row = require_row(ctx, id)?;
+    let id = &row.plugin.plugin_id;
+    if row.origin == Origin::Local {
+        bail!("{id} is a local link; there is nothing to unpin");
+    }
+    if row.unpin_needs_install() {
+        bail!("herdr installed {id} at a commit; unpinning reinstalls it");
+    }
+    if !ctx.dry_run {
+        let mut locked = Registry::lock()?;
+        if row.origin == Origin::Git {
+            if let Some(rec) = locked.registry.plugins.get_mut(id) {
+                rec.requested_ref = None;
+            }
+        } else {
+            locked.registry.pins.remove(id);
+        }
+        locked.save()?;
+        drop(locked);
+        log_pin_change(&row, "unpin", None);
+    }
+    Ok(())
+}
+
+fn forget_pin(id: &str) -> Result<()> {
+    let mut locked = Registry::lock()?;
+    if locked.registry.pins.remove(id).is_some() {
+        locked.save()?;
+    }
+    Ok(())
+}
+
+/// Tags of the plugin's repository, newest version first.
+pub fn versions(row: &Row) -> Result<Vec<crate::git::RemoteTag>> {
+    let (url, _) = row
+        .remote()
+        .ok_or_else(|| anyhow!("{} has no remote", row.plugin.plugin_id))?;
+    Git::BACKGROUND.list_tags(&url)
+}
+
+/// Name of the default branch the plugin follows, when it follows one.
+pub fn default_branch(row: &Row) -> Option<String> {
+    if row.requested_ref().is_some() {
+        return None;
+    }
+    let (url, _) = row.remote()?;
+    Git::BACKGROUND.default_branch(&url).ok().flatten()
+}
+
+/// Holds a plugin at its current commit, or at `reference`. Pinning the
+/// commit already installed only records it; another commit is installed
+/// (with its preview) and held there.
 pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
     let row = require_row(ctx, id)?;
-    match row.origin {
-        Origin::Local => bail!("{id} is a local link; there is nothing to pin"),
-        Origin::Git => {
-            let record = row.record.clone().unwrap();
-            match reference {
-                None => {
-                    let mut locked = Registry::lock()?;
-                    if let Some(rec) = locked.registry.plugins.get_mut(id) {
-                        rec.requested_ref = Some(rec.current.commit.clone());
-                        rec.current.requested_ref = rec.requested_ref.clone();
-                    }
-                    if !ctx.dry_run {
-                        locked.save()?;
-                    }
-                    println!(
-                        "{} Pinned {id} at {}.",
-                        green("✓"),
-                        util::short_sha(&record.current.commit)
-                    );
-                    Ok(())
-                }
-                Some(r) => {
-                    let git = Git::FOREGROUND;
-                    let mirror = git.sync(&record.url)?;
-                    let sha = git.resolve(&mirror, Some(r))?;
-                    install_git(
-                        ctx,
-                        GitRequest {
-                            url: record.url,
-                            subdir: record.subdir,
-                            checkout_ref: Some(sha.clone()),
-                            follow_ref: Some(Some(sha)),
-                            mode: Mode::Switch,
-                            enabled: None,
-                            replace: false,
-                            expect_id: Some(id.to_string()),
-                        },
-                    )
-                    .map(|_| ())
-                }
-            }
+    if row.origin == Origin::Local {
+        bail!("{id} is a local link; there is nothing to pin");
+    }
+    let target = match (reference, row.origin) {
+        (None, _) => None,
+        (Some(r), Origin::Git) => {
+            let record = row.record.as_ref().unwrap();
+            let git = Git::FOREGROUND;
+            let mirror = git.sync(&record.url)?;
+            Some(git.resolve(&mirror, Some(r))?)
         }
-        Origin::Github => {
+        (Some(r), _) => {
+            let (url, _) = row.remote().ok_or_else(|| anyhow!("{id} has no remote"))?;
+            Some(Git::FOREGROUND.ls_remote(&url, Some(r))?)
+        }
+    };
+    let sha = match target {
+        Some(sha) if row.commit().is_none_or(|c| !c.eq_ignore_ascii_case(&sha)) => sha,
+        _ => {
+            let short = pin_current(ctx, id)?;
+            println!("{} Pinned {id} at {short}.", green("✓"));
+            return Ok(());
+        }
+    };
+    match row.origin {
+        Origin::Git => {
+            let record = row.record.unwrap();
+            install_git(
+                ctx,
+                GitRequest {
+                    url: record.url,
+                    subdir: record.subdir,
+                    checkout_ref: Some(sha.clone()),
+                    follow_ref: Some(Some(sha)),
+                    mode: Mode::Switch,
+                    enabled: None,
+                    replace: false,
+                    expect_id: Some(id.to_string()),
+                },
+            )
+            .map(|_| ())
+        }
+        _ => {
             let spec = row.plugin.source.github_spec().unwrap_or_default();
-            let sha = match reference {
-                None => row
-                    .commit()
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow!("{id} has no recorded commit"))?,
-                Some(r) => {
-                    let url = format!(
-                        "https://github.com/{}.git",
-                        row.plugin.source.github_slug().unwrap_or_default()
-                    );
-                    Git::FOREGROUND.ls_remote(&url, Some(r))?
-                }
-            };
             let status = ctx.herdr.install_github(&spec, Some(&sha), ctx.yes)?;
             if !status.success() {
                 bail!("herdr plugin install did not complete ({status})");
             }
-            Ok(())
+            // Herdr now records the commit itself.
+            forget_pin(id)
         }
     }
 }
@@ -1489,13 +1709,21 @@ pub fn unpin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
             );
             Ok(())
         }
+        Origin::Github if reference.is_none() && !row.unpin_needs_install() => {
+            clear_pin(ctx, id)?;
+            println!(
+                "{} {id} follows its default branch again; `herdr-pm update {id}` applies it.",
+                green("✓")
+            );
+            Ok(())
+        }
         Origin::Github => {
             let spec = row.plugin.source.github_spec().unwrap_or_default();
             let status = ctx.herdr.install_github(&spec, reference, ctx.yes)?;
             if !status.success() {
                 bail!("herdr plugin install did not complete ({status})");
             }
-            Ok(())
+            forget_pin(id)
         }
     }
 }
@@ -1531,7 +1759,7 @@ pub fn switch(ctx: &Ctx, id: &str, reference: &str) -> Result<()> {
             if !status.success() {
                 bail!("herdr plugin install did not complete ({status})");
             }
-            Ok(())
+            forget_pin(id)
         }
     }
 }

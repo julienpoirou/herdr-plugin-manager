@@ -264,6 +264,26 @@ if git daemon --help >/dev/null 2>&1; then
   expect "install over git://" "$HPM" install "git://127.0.0.1:$port/team/mono.git//plugins/a" --yes
 fi
 
+# --- pinning the installed commit records it without reinstalling
+CUR="$("$HPM" info team.a | sed -n 's/^commit  *//p')"
+out="$("$HPM" pin team.a "$CUR" < /dev/null 2>&1)"
+contains "$out" "Pinned team.a"
+case "$out" in *preview*) fail "pinning the installed commit reinstalled it" ;; esac
+contains "$("$HPM" info team.a)" "pinned"
+expect "unpin" "$HPM" unpin team.a
+
+# --- delete completely
+CFG="$XDG_CONFIG_HOME/herdr/plugins/config/team.a"
+mkdir -p "$CFG" && touch "$CFG/settings.toml"
+expect "purge a git-managed plugin" "$HPM" uninstall team.a --purge --yes
+[ ! -e "$CFG" ] || fail "config directory survived --purge"
+ok "purge deletes the plugin's config directory"
+plugin "$T/dev/gone" team.gone Gone 0.1.0
+herdr plugin link "$T/dev/gone" >/dev/null
+expect "purge a local link" "$HPM" uninstall team.gone --purge --yes
+[ ! -e "$T/dev/gone" ] || fail "linked directory survived --purge"
+ok "purge deletes a local link's directory"
+
 # --- with a live server
 herdr server >/dev/null 2>&1 &
 sleep 2

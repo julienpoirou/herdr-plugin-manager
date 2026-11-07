@@ -432,6 +432,23 @@ impl Git {
         }
         Ok(())
     }
+
+    /// Every tag on the remote, newest version first (one `git ls-remote`).
+    pub fn list_tags(&self, url: &str) -> Result<Vec<RemoteTag>> {
+        validate_remote(url)?;
+        let out = self.run(None, &["ls-remote", "--tags", "--", url], true)?;
+        Ok(parse_tags(&out))
+    }
+
+    /// Name of the remote's default branch (`main`, `master`, …).
+    pub fn default_branch(&self, url: &str) -> Result<Option<String>> {
+        validate_remote(url)?;
+        let out = self.run(None, &["ls-remote", "--symref", "--", url, "HEAD"], true)?;
+        Ok(out.lines().find_map(|line| {
+            let target = line.strip_prefix("ref:")?.split_whitespace().next()?;
+            target.strip_prefix("refs/heads/").map(str::to_string)
+        }))
+    }
 }
 
 /// Picks the commit for `name` out of `git ls-remote` output: a peeled
@@ -460,6 +477,58 @@ pub fn parse_ls_remote(out: &str, name: &str) -> Option<String> {
         }
     }
     peeled.or(tag).or(branch).or(head)
+}
+
+/// A tag and the commit it points to (peeled for annotated tags).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTag {
+    pub name: String,
+    pub commit: String,
+}
+
+/// `v1.10.0` → `[1, 10, 0]` and whether a suffix such as `-rc.1` follows.
+fn version_key(name: &str) -> Option<(Vec<u64>, bool)> {
+    let rest = name.strip_prefix(['v', 'V']).unwrap_or(name);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let numbers = rest[..end]
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    Some((numbers, end < rest.len()))
+}
+
+/// Tags from `git ls-remote --tags`, versions first (highest first, a
+/// release before its pre-releases), then other names in reverse order.
+pub fn parse_tags(out: &str) -> Vec<RemoteTag> {
+    let mut commits: std::collections::BTreeMap<String, String> = Default::default();
+    let mut peeled = std::collections::HashSet::new();
+    for line in out.lines() {
+        let Some((sha, reference)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(name) = reference.trim().strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if let Some(base) = name.strip_suffix("^{}") {
+            commits.insert(base.to_string(), sha.trim().to_string());
+            peeled.insert(base.to_string());
+        } else if !peeled.contains(name) {
+            commits.insert(name.to_string(), sha.trim().to_string());
+        }
+    }
+    let mut tags: Vec<RemoteTag> = commits
+        .into_iter()
+        .map(|(name, commit)| RemoteTag { name, commit })
+        .collect();
+    tags.sort_by(|a, b| match (version_key(&a.name), version_key(&b.name)) {
+        (Some((va, pa)), Some((vb, pb))) => vb.cmp(&va).then(pa.cmp(&pb)).then(b.name.cmp(&a.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.name.cmp(&a.name),
+    });
+    tags
 }
 
 /// `<cache>/repos/<readable>-<hash>.git` so the same remote always maps to
@@ -493,6 +562,25 @@ mod tests {
         let out = "4444444444444444444444444444444444444444\tHEAD\n";
         assert_eq!(parse_ls_remote(out, "").unwrap(), "4".repeat(40));
         assert!(parse_ls_remote("", "main").is_none());
+    }
+
+    #[test]
+    fn tags_peel_and_sort_by_version() {
+        let out = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.2.0
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.2.0^{}
+cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v1.10.0
+dddddddddddddddddddddddddddddddddddddddd\trefs/tags/v1.10.0-rc.1
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/nightly
+ffffffffffffffffffffffffffffffffffffffff\trefs/tags/0.9
+";
+        let tags = parse_tags(out);
+        let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["v1.10.0", "v1.10.0-rc.1", "v1.2.0", "0.9", "nightly"]
+        );
+        assert_eq!(tags[2].commit, "b".repeat(40));
     }
 
     #[test]

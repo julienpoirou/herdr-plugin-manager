@@ -273,6 +273,15 @@ pub fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
+/// One line of input after a prompt on stderr, trimmed.
+pub fn ask_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt} ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
 /// Splits an input line like a shell would for simple cases: whitespace
 /// separates words, single or double quotes group them, backslash escapes.
 pub fn split_words(input: &str) -> Vec<String> {

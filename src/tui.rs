@@ -25,7 +25,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::config::Config;
-use crate::git::Git;
+use crate::git::{Git, RemoteTag};
 use crate::market::{self, Entry, Sort};
 use crate::ops::{self, Ctx, InstallRequest, Origin, Row, Status};
 use crate::{paths, source, util};
@@ -65,15 +65,25 @@ enum Prompt {
     Switch(String),
     Filter,
     Search,
+    /// Typing the id confirms deleting a local link's directory.
+    Purge(String),
 }
 
 #[derive(Debug, Clone)]
 enum Confirm {
-    Uninstall(String),
+    /// `u` removes the plugin, `d` deletes everything it left on disk.
+    Remove {
+        id: String,
+        origin: Origin,
+        path: String,
+    },
     UpdateAll(Vec<String>),
     InstallEntry(Box<Entry>),
     Rollback(String),
-    TogglePin(String, bool),
+    AutoUpdateOn {
+        id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +97,10 @@ enum Level {
 enum Msg {
     Status(String, Status),
     Market(u64, Vec<(String, Result<market::Listing, String>)>),
+    /// Default branch name of a plugin that follows it.
+    Branch(String, String),
+    /// Tags for the version picker.
+    Versions(String, Result<Vec<RemoteTag>, String>),
 }
 
 struct MarketState {
@@ -104,6 +118,25 @@ struct MarketState {
     announce: bool,
 }
 
+/// One line of the `p` version picker.
+#[derive(Debug, Clone)]
+enum Pick {
+    /// The commit installed now, when no tag points at it.
+    Current(String),
+    Tag(RemoteTag),
+    /// Follow the default branch again.
+    Latest,
+}
+
+struct Picker {
+    id: String,
+    name: String,
+    picks: Vec<Pick>,
+    sel: usize,
+    loading: bool,
+    error: Option<String>,
+}
+
 struct App {
     ctx: Ctx,
     view: View,
@@ -118,6 +151,10 @@ struct App {
     confirm: Option<Confirm>,
     message: Option<(Level, String)>,
     help: bool,
+    help_scroll: usize,
+    picker: Option<Picker>,
+    /// Default branch names, for the `ref` line.
+    branches: HashMap<String, String>,
     market: MarketState,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -146,6 +183,9 @@ impl App {
             confirm: None,
             message: None,
             help: false,
+            help_scroll: 0,
+            picker: None,
+            branches: HashMap::new(),
             market: MarketState {
                 entries: Vec::new(),
                 errors: Vec::new(),
@@ -263,6 +303,9 @@ impl App {
                 let id = row.plugin.plugin_id.clone();
                 let status = ops::check(&row, Git::BACKGROUND);
                 let _ = tx.send(Msg::Status(id.clone(), status.clone()));
+                if let Some(branch) = ops::default_branch(&row) {
+                    let _ = tx.send(Msg::Branch(id.clone(), branch));
+                }
                 if let Status::Available { commit, .. } = &status {
                     if let Some(version) = ops::remote_version(&row, commit, Git::BACKGROUND) {
                         let _ = tx.send(Msg::Status(
@@ -318,6 +361,10 @@ impl App {
                 Msg::Status(id, status) => {
                     self.checks.insert(id, Check::Done(status));
                 }
+                Msg::Branch(id, branch) => {
+                    self.branches.insert(id, branch);
+                }
+                Msg::Versions(id, result) => fill_picker(self, &id, result),
                 Msg::Market(generation, results) => {
                     if generation != self.market.generation {
                         continue;
@@ -570,9 +617,11 @@ enum Job {
     Install(String),
     InstallEntry(Box<Entry>),
     Update(Vec<String>),
-    Uninstall(String),
+    /// Plugin id, and whether to delete everything it left on disk.
+    Uninstall(String, bool),
     Rollback(String),
-    Pin(String),
+    /// Install this commit and hold the plugin there.
+    PinTo(String, String),
     Unpin(String),
     Switch(String, String),
     EditFile(std::path::PathBuf),
@@ -680,20 +729,20 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
             }
             Ok(())
         }
-        Job::Uninstall(id) => {
+        Job::Uninstall(id, purge) => {
             let ctx = Ctx {
                 yes: true,
                 ..clone_ctx(&app.ctx)
             };
-            ops::uninstall(&ctx, &id)
+            ops::uninstall(&ctx, &id, purge)
         }
         Job::Rollback(id) => {
             touched = Some(vec![id.clone()]);
             ops::rollback(&app.ctx, &id)
         }
-        Job::Pin(id) => {
+        Job::PinTo(id, commit) => {
             touched = Some(vec![id.clone()]);
-            ops::pin(&app.ctx, &id, None)
+            ops::pin(&app.ctx, &id, Some(&commit))
         }
         Job::Unpin(id) => {
             touched = Some(vec![id.clone()]);
@@ -779,14 +828,24 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
         col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
     };
     match kind {
-        MouseEventKind::ScrollDown => {
-            move_sel(app, 1);
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let delta = if kind == MouseEventKind::ScrollDown {
+                1
+            } else {
+                -1
+            };
+            if app.help {
+                app.help_scroll = app.help_scroll.saturating_add_signed(delta * 3);
+            } else if let Some(picker) = &mut app.picker {
+                picker.sel = (picker.sel as isize + delta)
+                    .clamp(0, picker.picks.len().saturating_sub(1) as isize)
+                    as usize;
+            } else {
+                move_sel(app, delta);
+            }
             true
         }
-        MouseEventKind::ScrollUp => {
-            move_sel(app, -1);
-            true
-        }
+        MouseEventKind::Down(MouseButton::Left) if app.help || app.picker.is_some() => false,
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(&(_, view)) = app.tab_areas.iter().find(|(area, _)| inside(*area)) {
                 switch_view(app, view);
@@ -854,17 +913,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         return None;
     }
     if app.help {
-        app.help = false;
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => app.help = false,
+            KeyCode::Down | KeyCode::Char('j') => app.help_scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => app.help_scroll += 10,
+            KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+            KeyCode::Home | KeyCode::Char('g') => app.help_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => app.help_scroll = usize::MAX,
+            _ => {}
+        }
         return None;
     }
+    if app.picker.is_some() {
+        return picker_key(app, key);
+    }
     if let Some(confirm) = app.confirm.take() {
-        return match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => confirmed(app, confirm),
-            _ => {
-                app.say(Level::Info, "cancelled");
-                None
-            }
-        };
+        return answer_confirm(app, confirm, key);
     }
     if let Some((kind, mut buffer)) = app.prompt.take() {
         match key.code {
@@ -901,6 +966,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     match key.code {
         KeyCode::Char('?') => {
             app.help = true;
+            app.help_scroll = 0;
             return None;
         }
         KeyCode::Char('q') => {
@@ -987,25 +1053,24 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         }
         KeyCode::Char('A') => {
             let row = row?;
-            let on = !row.auto_update;
-            match ops::set_auto_update(&app.ctx, &row.plugin.plugin_id, on) {
-                Ok(()) => {
-                    app.reload();
-                    if !app.ctx.dry_run {
+            if row.origin == Origin::Local {
+                app.say(Level::Info, "local links have no remote to update from");
+            } else if row.auto_update {
+                match ops::set_auto_update(&app.ctx, &row.plugin.plugin_id, false) {
+                    Ok(()) => {
+                        app.reload();
                         app.say(
                             Level::Ok,
-                            if on {
-                                format!(
-                                    "auto-update on for {}: updated without a preview when Herdr starts",
-                                    row.plugin.name
-                                )
-                            } else {
-                                format!("auto-update off for {}", row.plugin.name)
-                            },
+                            format!("auto-update off for {}", row.plugin.name),
                         );
                     }
+                    Err(err) => app.say(Level::Warn, format!("{err:#}")),
                 }
-                Err(err) => app.say(Level::Warn, format!("{err:#}")),
+            } else {
+                app.confirm = Some(Confirm::AutoUpdateOn {
+                    id: row.plugin.plugin_id.clone(),
+                    name: row.plugin.name.clone(),
+                });
             }
         }
         KeyCode::Char('e') => {
@@ -1029,8 +1094,8 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            let id = id?;
-            if id == paths::PLUGIN_ID {
+            let row = row?;
+            if row.plugin.plugin_id == paths::PLUGIN_ID {
                 app.say(
                     Level::Warn,
                     format!(
@@ -1039,7 +1104,11 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     ),
                 );
             } else {
-                app.confirm = Some(Confirm::Uninstall(id));
+                app.confirm = Some(Confirm::Remove {
+                    id: row.plugin.plugin_id.clone(),
+                    origin: row.origin,
+                    path: row.plugin.plugin_root.clone(),
+                });
             }
         }
         KeyCode::Char('z') => {
@@ -1060,10 +1129,7 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             if row.origin == Origin::Local {
                 app.say(Level::Info, "local links cannot be pinned");
             } else {
-                app.confirm = Some(Confirm::TogglePin(
-                    row.plugin.plugin_id.clone(),
-                    !row.pinned(),
-                ));
+                open_picker(app, row);
             }
         }
         KeyCode::Char('s') => {
@@ -1222,19 +1288,50 @@ fn submit_prompt(app: &mut App, kind: Prompt, buffer: String) -> Option<Job> {
                 Some(Job::Switch(id, text))
             }
         }
+        Prompt::Purge(id) => {
+            if text == id {
+                Some(Job::Uninstall(id, true))
+            } else {
+                app.say(Level::Info, "cancelled: the id did not match");
+                None
+            }
+        }
     }
 }
 
-fn confirmed(app: &mut App, confirm: Confirm) -> Option<Job> {
-    let _ = app;
-    Some(match confirm {
-        Confirm::Uninstall(id) => Job::Uninstall(id),
-        Confirm::UpdateAll(ids) => Job::Update(ids),
-        Confirm::InstallEntry(entry) => Job::InstallEntry(entry),
-        Confirm::Rollback(id) => Job::Rollback(id),
-        Confirm::TogglePin(id, true) => Job::Pin(id),
-        Confirm::TogglePin(id, false) => Job::Unpin(id),
-    })
+fn answer_confirm(app: &mut App, confirm: Confirm, key: KeyEvent) -> Option<Job> {
+    let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+    let job = match confirm {
+        Confirm::Remove { id, origin, .. } => match key.code {
+            KeyCode::Char('u') => Some(Job::Uninstall(id, false)),
+            KeyCode::Char('d') if origin == Origin::Local => {
+                app.prompt = Some((Prompt::Purge(id), String::new()));
+                return None;
+            }
+            KeyCode::Char('d') => Some(Job::Uninstall(id, true)),
+            _ => None,
+        },
+        Confirm::UpdateAll(ids) if yes => Some(Job::Update(ids)),
+        Confirm::InstallEntry(entry) if yes => Some(Job::InstallEntry(entry)),
+        Confirm::Rollback(id) if yes => Some(Job::Rollback(id)),
+        Confirm::AutoUpdateOn { id, name } if yes => {
+            match ops::set_auto_update(&app.ctx, &id, true) {
+                Ok(()) => {
+                    app.reload();
+                    if !app.ctx.dry_run {
+                        app.say(Level::Ok, format!("auto-update on for {name}"));
+                    }
+                }
+                Err(err) => app.say(Level::Warn, format!("{err:#}")),
+            }
+            return None;
+        }
+        _ => None,
+    };
+    if job.is_none() {
+        app.say(Level::Info, "cancelled");
+    }
+    job
 }
 
 // ---------------------------------------------------------------- drawing
@@ -1293,6 +1390,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, app, footer);
     if app.help {
         draw_help(f, app, area);
+    }
+    if app.picker.is_some() {
+        draw_picker(f, app, area);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(f, confirm, area);
@@ -1377,7 +1477,7 @@ fn status_span(app: &App, row: &Row) -> Span<'static> {
                 ),
                 Style::default().fg(WARN).add_modifier(Modifier::BOLD),
             ),
-            Status::Pinned => Span::styled("pinned", muted()),
+            Status::Pinned => Span::raw(""),
             Status::Local => Span::styled("local", muted()),
             Status::Unknown => Span::styled("?", muted()),
             Status::Error { .. } => Span::styled("! check failed", Style::default().fg(BAD)),
@@ -1456,13 +1556,15 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let status = status_span(app, row);
         let left = format!("{:>2} ", pos + 1);
-        let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1 + 2;
-        let status_w = status.content.chars().count();
+        let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1 + 4;
+        let status_w = status.width();
         let src_w = width.saturating_sub(used + status_w + 2);
-        let auto = if row.auto_update {
-            Span::styled("⟳ ", Style::default().fg(ACCENT))
-        } else {
-            Span::raw("  ")
+        let badge = |on: bool, glyph: &'static str, style: Style| {
+            if on {
+                Span::styled(glyph, style)
+            } else {
+                Span::raw("  ")
+            }
         };
         let mut spans = vec![
             Span::styled(left, muted()),
@@ -1477,10 +1579,12 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" "),
             Span::styled(pad(&row.source_display(), src_w), muted()),
             Span::raw(" "),
-            auto,
+            badge(row.auto_update, "⟳ ", Style::default().fg(ACCENT)),
+            badge(row.pinned(), "📌", Style::default()),
             status,
         ];
-        let used_now: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        // Width in cells: 📌 takes two.
+        let used_now: usize = spans.iter().map(Span::width).sum();
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used_now))));
         lines.push(Line::from(spans).style(base));
     }
@@ -1520,8 +1624,8 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
         Origin::Local => lines.push(kv("path", row.plugin.plugin_root.clone())),
         _ => {
             lines.push(kv("source", row.source_display()));
-            let commit = row.commit().map(util::short_sha).unwrap_or("-").to_string();
-            let mut text = format!("{} @ {commit}", row.ref_display());
+            let branch = app.branches.get(&row.plugin.plugin_id).map(String::as_str);
+            let mut text = row.ref_label(branch);
             if let Some(r) = &row.record {
                 text.push_str(&format!(
                     "  · installed {}{}",
@@ -1537,9 +1641,9 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(kv(
                 "auto",
                 if row.auto_update {
-                    "on: updated without a preview when Herdr starts (A turns it off)"
+                    "on: updated when Herdr starts (A turns it off)"
                 } else {
-                    "off (A updates it automatically, enabled or not)"
+                    "off (A updates it when Herdr starts, enabled or not)"
                 },
             ));
         }
@@ -1762,6 +1866,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 "install (url, owner/repo, alias:path [--ref R] [--subdir D]): ".to_string()
             }
             Prompt::Switch(id) => format!("switch {id} to branch/tag/commit: "),
+            Prompt::Purge(id) => format!("type {id} to delete it and its directory: "),
             Prompt::Filter => "filter: ".to_string(),
             Prompt::Search => "search marketplace: ".to_string(),
         };
@@ -1847,8 +1952,47 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
-    let (title, body): (&str, Vec<String>) = match confirm {
-        Confirm::Uninstall(id) => ("Uninstall", vec![format!("Uninstall {id}?")]),
+    let (title, body, hint): (&str, Vec<String>, Vec<Span>) = match confirm {
+        Confirm::Remove { id, origin, path } => {
+            let (keep, delete) = match origin {
+                Origin::Local => (
+                    format!("unlink it; {path} stays on disk"),
+                    format!("also delete {path} (you type the id to confirm)"),
+                ),
+                Origin::Github => (
+                    "uninstall it with Herdr".to_string(),
+                    "also delete leftover checkouts, its config and settings".to_string(),
+                ),
+                Origin::Git => (
+                    "unregister it; installations go to the trash for a day".to_string(),
+                    "delete installations, cached repository, config and settings now".to_string(),
+                ),
+            };
+            (
+                "Remove",
+                vec![
+                    format!("Remove {id}?"),
+                    format!("  u  {keep}"),
+                    format!("  d  {delete}"),
+                ],
+                vec![
+                    Span::styled("u", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
+                    Span::raw(" remove   "),
+                    Span::styled("d", Style::default().fg(BAD).add_modifier(Modifier::BOLD)),
+                    Span::raw(" delete completely   "),
+                    Span::styled("any other key", muted()),
+                    Span::raw(" cancels"),
+                ],
+            )
+        }
+        Confirm::AutoUpdateOn { name, .. } => (
+            "Auto-update",
+            vec![
+                format!("Updates of {name} will be installed without review"),
+                "when Herdr starts. Turn auto-update on?".to_string(),
+            ],
+            yes_no(),
+        ),
         Confirm::UpdateAll(ids) => {
             let mut b = vec![format!("Update {} plugin(s)?", ids.len())];
             b.extend(ids.iter().take(8).map(|i| format!("  • {i}")));
@@ -1856,7 +2000,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                 b.push(format!("  … {} more", ids.len() - 8));
             }
             b.push("Each one still shows its preview before anything runs.".into());
-            ("Update all", b)
+            ("Update all", b, yes_no())
         }
         Confirm::InstallEntry(e) => (
             "Install",
@@ -1865,19 +2009,18 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                 format!("  {}", e.install_spec()),
                 "A preview of everything it runs comes next.".into(),
             ],
+            yes_no(),
         ),
         Confirm::Rollback(id) => (
             "Rollback",
             vec![format!("Return {id} to its previous installation?")],
+            yes_no(),
         ),
-        Confirm::TogglePin(id, true) => ("Pin", vec![format!("Hold {id} at its current commit?")]),
-        Confirm::TogglePin(id, false) => {
-            ("Unpin", vec![format!("Let {id} follow its branch again?")])
-        }
     };
     let width = body
         .iter()
         .map(|l| l.chars().count())
+        .chain(std::iter::once(hint.iter().map(Span::width).sum()))
         .max()
         .unwrap_or(20)
         .max(30) as u16
@@ -1889,12 +2032,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
         .map(|l| Line::raw(util::sanitize(&l)))
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
-        Span::raw(" yes   "),
-        Span::styled("any other key", muted()),
-        Span::raw(" no"),
-    ]));
+    lines.push(Line::from(hint));
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
@@ -1905,7 +2043,16 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+fn yes_no() -> Vec<Span<'static>> {
+    vec![
+        Span::styled("y", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
+        Span::raw(" yes   "),
+        Span::styled("any other key", muted()),
+        Span::raw(" no"),
+    ]
+}
+
+fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let section = |t: &str| {
         Line::styled(
             t.to_string(),
@@ -1915,7 +2062,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
-                format!("  {k:<10}"),
+                format!("  {k:<7}"),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(d.to_string()),
@@ -1923,48 +2070,298 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines = vec![
         section("Installed"),
-        key("u / U", "update selected / update all outdated plugins"),
+        key("u", "update the selected plugin"),
+        key("U", "update all outdated plugins"),
+        key("A", "auto-update on/off (when Herdr starts)"),
         key("e", "enable or disable"),
-        key(
-            "A",
-            "auto-update on/off: no preview, applied when Herdr starts",
-        ),
-        key("x", "uninstall (local links are only unlinked)"),
+        key("x", "remove, or delete completely"),
         key("i", "install from a URL, owner/repo or alias:path"),
-        key("p", "pin to current commit / unpin"),
+        key("p", "pick a version to pin (or unpin)"),
         key("s", "switch to another branch, tag or commit"),
         key("z", "roll back to the previous installation"),
         key("o", "open the source in a browser"),
         key("L", "recent commands herdr ran for the plugin"),
-        key("c / C", "edit plugins.json / this manager's config"),
+        key("c", "edit plugins.json"),
+        key("C", "edit this manager's config"),
         key("/", "filter the list"),
         key("r", "refresh and re-check updates"),
+        Line::raw(""),
         section("Marketplace"),
         key("↵", "install the selection (preview first)"),
-        key("/ s f", "search · sort · switch source"),
-        key("← →", "previous / next page"),
-        key("o r", "open in browser · refresh listings"),
+        key("/", "search"),
+        key("s", "sort"),
+        key("f", "switch source"),
+        key("←", "previous page"),
+        key("→", "next page"),
+        key("o", "open in browser"),
+        key("r", "refresh listings"),
+        Line::raw(""),
         section("Anywhere"),
-        key("m / Tab", "switch views"),
-        key("q / Esc", "back or close"),
-        key(
-            "mouse",
-            "wheel moves · click selects · click a tab to switch views",
-        ),
+        key("↑ ↓", "move"),
+        key("m", "switch views"),
+        key("Tab", "switch views"),
+        key("q", "back or close"),
+        key("Esc", "back or close"),
+        key("?", "this help"),
+        key("wheel", "move the selection"),
+        key("click", "select a row, or switch views on a tab"),
+        Line::raw(""),
+        Line::styled(format!("config: {}", Config::path().display()), muted()),
     ];
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!("config: {}", Config::path().display()),
-        muted(),
-    ));
-    let _ = app;
     let rect = centered(area, 72, lines.len() as u16 + 2);
+    let visible = rect.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+    let first = app.help_scroll;
+    let last = (first + visible).min(lines.len());
+    let title = if max_scroll == 0 {
+        " keys · ? closes ".to_string()
+    } else {
+        format!(
+            " keys {}–{}/{} · ↑↓ scroll · ? closes ",
+            first + 1,
+            last,
+            lines.len()
+        )
+    };
+    let shown: Vec<Line> = lines.drain(first..last).collect();
     f.render_widget(Clear, rect);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " keys — any key closes ",
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(shown).block(block), rect);
+}
+
+// ---------------------------------------------------------------- version picker
+
+fn open_picker(app: &mut App, row: Row) {
+    let id = row.plugin.plugin_id.clone();
+    app.picker = Some(Picker {
+        id: id.clone(),
+        name: row.plugin.name.clone(),
+        picks: Vec::new(),
+        sel: 0,
+        loading: true,
+        error: None,
+    });
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        let result = ops::versions(&row).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Versions(id, result));
+    });
+}
+
+fn fill_picker(app: &mut App, id: &str, result: Result<Vec<RemoteTag>, String>) {
+    let current = app
+        .rows
+        .iter()
+        .find(|r| r.plugin.plugin_id == id)
+        .and_then(|r| r.commit().map(str::to_string));
+    let Some(picker) = app.picker.as_mut().filter(|p| p.id == id) else {
+        return;
+    };
+    picker.loading = false;
+    let tags = match result {
+        Ok(tags) => tags,
+        Err(err) => {
+            picker.error = Some(err);
+            Vec::new()
+        }
+    };
+    let is_current = |commit: &str| {
+        current
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(commit))
+    };
+    let mut picks = Vec::new();
+    if let Some(commit) = current
+        .as_ref()
+        .filter(|_| !tags.iter().any(|t| is_current(&t.commit)))
+    {
+        picks.push(Pick::Current(commit.clone()));
+    }
+    picks.extend(tags.into_iter().map(Pick::Tag));
+    picks.push(Pick::Latest);
+    picker.sel = picks
+        .iter()
+        .position(|p| match p {
+            Pick::Current(_) => true,
+            Pick::Tag(t) => is_current(&t.commit),
+            Pick::Latest => false,
+        })
+        .unwrap_or(0);
+    picker.picks = picks;
+}
+
+fn picker_key(app: &mut App, key: KeyEvent) -> Option<Job> {
+    let picker = app.picker.as_mut()?;
+    let last = picker.picks.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => app.picker = None,
+        KeyCode::Down | KeyCode::Char('j') => picker.sel = (picker.sel + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => picker.sel = picker.sel.saturating_sub(1),
+        KeyCode::PageDown => picker.sel = (picker.sel + 10).min(last),
+        KeyCode::PageUp => picker.sel = picker.sel.saturating_sub(10),
+        KeyCode::Home => picker.sel = 0,
+        KeyCode::End => picker.sel = last,
+        KeyCode::Enter => {
+            let pick = picker.picks.get(picker.sel).cloned()?;
+            let id = picker.id.clone();
+            let name = picker.name.clone();
+            app.picker = None;
+            return apply_pick(app, &id, &name, pick);
+        }
+        _ => {}
+    }
+    None
+}
+
+fn apply_pick(app: &mut App, id: &str, name: &str, pick: Pick) -> Option<Job> {
+    let row = app.rows.iter().find(|r| r.plugin.plugin_id == id)?.clone();
+    let current = row.commit().unwrap_or("").to_string();
+    let commit = match pick {
+        Pick::Latest => {
+            if !row.pinned() {
+                app.say(
+                    Level::Info,
+                    format!("{name} already follows its default branch"),
+                );
+                return None;
+            }
+            if row.unpin_needs_install() {
+                return Some(Job::Unpin(id.to_string()));
+            }
+            match ops::clear_pin(&app.ctx, id) {
+                Ok(()) => {
+                    app.reload();
+                    app.start_checks(Some(&[id.to_string()]));
+                    app.say(
+                        Level::Ok,
+                        format!("{name} follows its default branch again (u updates it)"),
+                    );
+                }
+                Err(err) => app.say(Level::Error, format!("{err:#}")),
+            }
+            return None;
+        }
+        Pick::Current(commit) => commit,
+        Pick::Tag(tag) => tag.commit,
+    };
+    if !commit.eq_ignore_ascii_case(&current) {
+        return Some(Job::PinTo(id.to_string(), commit));
+    }
+    if row.pinned() {
+        app.say(Level::Info, format!("{name} is already pinned here"));
+        return None;
+    }
+    match ops::pin_current(&app.ctx, id) {
+        Ok(short) => {
+            app.reload();
+            app.checks
+                .insert(id.to_string(), Check::Done(Status::Pinned));
+            app.say(Level::Ok, format!("pinned {name} at {short}"));
+        }
+        Err(err) => app.say(Level::Error, format!("{err:#}")),
+    }
+    None
+}
+
+fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let current = app
+        .rows
+        .iter()
+        .find(|r| r.plugin.plugin_id == picker.id)
+        .and_then(|r| r.commit().map(str::to_string))
+        .unwrap_or_default();
+    let mut lines: Vec<Line> = Vec::new();
+    if picker.loading {
+        lines.push(Line::styled(
+            format!("{} listing versions…", spinner()),
+            muted(),
+        ));
+    }
+    if let Some(err) = &picker.error {
+        lines.push(Line::styled(
+            util::truncate(&util::sanitize(err), 66),
+            Style::default().fg(BAD),
+        ));
+    }
+    let height = (area.height.saturating_sub(8) as usize).clamp(3, 18);
+    let start = picker
+        .sel
+        .saturating_sub(height / 2)
+        .min(picker.picks.len().saturating_sub(height));
+    for (i, pick) in picker.picks.iter().enumerate().skip(start).take(height) {
+        let installed = match pick {
+            Pick::Current(_) => true,
+            Pick::Tag(t) => t.commit.eq_ignore_ascii_case(&current),
+            Pick::Latest => false,
+        };
+        let (label, commit, note) = match pick {
+            Pick::Current(c) => (
+                "current".to_string(),
+                util::short_sha(c).to_string(),
+                "installed, untagged",
+            ),
+            Pick::Tag(t) => (
+                util::sanitize(&t.name),
+                util::short_sha(&t.commit).to_string(),
+                if installed { "installed" } else { "" },
+            ),
+            Pick::Latest => (
+                "latest".to_string(),
+                String::new(),
+                "follow the default branch (unpin)",
+            ),
+        };
+        let style = if i == picker.sel {
+            Style::default()
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(
+            Line::from(vec![
+                Span::styled(if installed { "● " } else { "  " }, Style::default().fg(OK)),
+                Span::raw(pad(&label, 22)),
+                Span::styled(format!(" {commit:<8} "), muted()),
+                Span::styled(note.to_string(), muted()),
+            ])
+            .style(style),
+        );
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "↵",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" pin   "),
+        Span::styled(
+            "Esc",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" close   "),
+        Span::styled(
+            "another version is installed first, with its preview",
+            muted(),
+        ),
+    ]));
+    let rect = centered(area, 76, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            format!(" Pin {} ", util::sanitize(&picker.name)),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Paragraph::new(lines).block(block), rect);

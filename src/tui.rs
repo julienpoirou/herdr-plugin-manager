@@ -121,7 +121,6 @@ struct App {
     market: MarketState,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    herdr_version: String,
     quit: bool,
     list_area: Rect,
     /// Clickable header tabs.
@@ -134,11 +133,6 @@ struct App {
 impl App {
     fn new(ctx: Ctx) -> App {
         let (tx, rx) = mpsc::channel();
-        let herdr_version = ctx
-            .herdr
-            .version()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "?".into());
         App {
             ctx,
             view: View::Installed,
@@ -167,7 +161,6 @@ impl App {
             },
             tx,
             rx,
-            herdr_version,
             quit: false,
             list_area: Rect::default(),
             tab_areas: Vec::new(),
@@ -1330,21 +1323,13 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(span);
         spans.push(Span::raw(" "));
     }
-    let mut right = format!("herdr {}", app.herdr_version);
     if app.ctx.dry_run {
-        right = format!("DRY RUN · {right}");
+        let right = "DRY RUN";
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (area.width as usize).saturating_sub(used + right.len() + 1);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(right, Style::default().fg(WARN)));
     }
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let gap = (area.width as usize).saturating_sub(used + right.chars().count() + 1);
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(
-        right,
-        if app.ctx.dry_run {
-            Style::default().fg(WARN)
-        } else {
-            muted()
-        },
-    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

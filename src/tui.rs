@@ -1644,9 +1644,11 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         };
-        let stars = entry.stars.map(|s| format!("★{s}")).unwrap_or_default();
+        // ★ is ambiguous-width: many terminals draw it two cells wide, so a
+        // space keeps it off the first digit.
+        let stars = entry.stars.map(|s| format!("★ {s}")).unwrap_or_default();
         let age = util::relative_age(entry.updated_unix);
-        let right = format!("{stars:>6} {age:>8}");
+        let right = format!("{stars:>7} {age:>8}");
         let mark = if installed {
             Span::styled("✓ ", Style::default().fg(OK))
         } else {

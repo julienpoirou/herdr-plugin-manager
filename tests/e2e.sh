@@ -259,7 +259,13 @@ if git daemon --help >/dev/null 2>&1; then
   port=$((20000 + $$ % 20000))
   git daemon --reuseaddr --base-path="$SRV" --export-all --port="$port" "$SRV" >/dev/null 2>&1 &
   DAEMON_PID=$!
-  sleep 1
+  # Wait until the daemon accepts connections (a fixed sleep raced on CI).
+  tries=0
+  until git ls-remote "git://127.0.0.1:$port/team/mono.git" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || fail "git daemon did not start"
+    sleep 0.2
+  done
   "$HPM" uninstall team.a --yes >/dev/null
   expect "install over git://" "$HPM" install "git://127.0.0.1:$port/team/mono.git//plugins/a" --yes
 fi

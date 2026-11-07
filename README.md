@@ -171,13 +171,31 @@ action.
 | Navigation | arrows / `j` / `k`, `/` filter |
 | Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
-| State | `e` enable/disable, `x` uninstall, `p` pin/unpin |
-| Versions | `s` switch ref, `z` rollback |
+| State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`) |
+| Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
-| Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help, `q` quit |
+| Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
 
-Install, update, rollback, pin and uninstall suspend the popup and use the same
-terminal review paths as the CLI.
+Install, update, rollback, pin to another version and uninstall suspend the
+popup and use the same terminal review paths as the CLI. The detail panel shows
+the installed version as `branch@commit` (`main@8cda521`, `v1.4.0@8cda521`), or
+`@8cda521 (pinned)`.
+
+`p` lists the repository's tags (one `git ls-remote`), newest version first:
+
+- the installed version pins it **without reinstalling**;
+- another version is installed first, with its preview, then pinned;
+- `latest` follows the default branch again.
+
+GitHub-installed plugins are pinned in the manager's `registry.json`, because
+Herdr only changes the ref it follows by reinstalling. `u`, `U` and auto-update
+respect the pin; a `herdr plugin update` run outside the manager does not.
+
+`x` asks what to do: `u` removes the plugin (a local link is only unlinked),
+`d` deletes it completely: installations, Herdr's leftover GitHub checkouts, the
+plugin's config directory, the cached repository (unless another plugin uses
+it), its auto-update and pin settings, and a local link's directory, after you
+type the plugin id.
 
 Auto-update is a per-plugin switch, independent of enable/disable. When Herdr
 starts, the manager's `[[startup]]` hook runs `herdr-pm auto-update`, which
@@ -193,7 +211,7 @@ herdr-pm                       open the interactive manager
 herdr-pm list [--check] [--json]
 herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
-herdr-pm uninstall <id>        herdr-pm enable|disable <id>
+herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
 herdr-pm auto-update [enable|disable <id>]
 herdr-pm info <id> [--json]    herdr-pm history [id]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]

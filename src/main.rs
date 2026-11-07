@@ -98,10 +98,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Uninstall a plugin (linked plugins are only unlinked).
+    /// Uninstall a plugin (linked plugins are only unlinked unless --purge).
     #[command(alias = "remove", alias = "rm")]
     Uninstall {
         id: String,
+        /// Also delete what it leaves on disk: config directory, leftover
+        /// checkouts, cached repository and, for a local link, its directory.
+        #[arg(long)]
+        purge: bool,
         #[command(flatten)]
         yes: YesFlag,
     },
@@ -320,8 +324,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Update { ids, yes } => Ok(code(ops::update(&ctx(dry, yes.yes)?, &ids)?)),
         Cmd::Outdated { json } => outdated(&ctx(dry, false)?, json),
-        Cmd::Uninstall { id, yes } => {
-            ops::uninstall(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
+        Cmd::Uninstall { id, purge, yes } => {
+            ops::uninstall(&ctx(dry, yes.yes)?, &id, purge).map(|_| ExitCode::SUCCESS)
         }
         Cmd::Enable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, true).map(|_| ExitCode::SUCCESS)

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.3...v0.6.0) (2026-11-07)
+
+
+### Features
+
+* Delete a plugin completely with `x` then `d`, or `uninstall --purge` ([630fbf9](https://github.com/julienpoirou/herdr-plugin-manager/commit/630fbf9672f81d7d01bec97e58d72059302a5d6a))
+* **tui:** Pick a version to pin from the repository tags ([#22](https://github.com/julienpoirou/herdr-plugin-manager/issues/22)) ([630fbf9](https://github.com/julienpoirou/herdr-plugin-manager/commit/630fbf9672f81d7d01bec97e58d72059302a5d6a))
+
+
+### Bug Fixes
+
+* **tui:** Explain on activation that auto-update installs without review ([630fbf9](https://github.com/julienpoirou/herdr-plugin-manager/commit/630fbf9672f81d7d01bec97e58d72059302a5d6a))
+* **tui:** One shortcut per line in a scrollable help overlay ([630fbf9](https://github.com/julienpoirou/herdr-plugin-manager/commit/630fbf9672f81d7d01bec97e58d72059302a5d6a))
+* **tui:** Show the followed ref as branch@commit, or [@commit](https://github.com/commit) (pinned) ([630fbf9](https://github.com/julienpoirou/herdr-plugin-manager/commit/630fbf9672f81d7d01bec97e58d72059302a5d6a))
+
 ## [0.5.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.2...v0.5.3) (2026-11-07)
 
 

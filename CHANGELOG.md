@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.2...v0.5.3) (2026-11-07)
+
+
+### Bug Fixes
+
+* **git:** Check out committed bytes regardless of core.autocrlf ([#20](https://github.com/julienpoirou/herdr-plugin-manager/issues/20)) ([6fdf58a](https://github.com/julienpoirou/herdr-plugin-manager/commit/6fdf58af5114bf519c72a692e28f48e09d633997))
+
 ## [0.5.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.1...v0.5.2) (2026-11-07)
 
 

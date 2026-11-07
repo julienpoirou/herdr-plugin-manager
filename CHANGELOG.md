@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.6.0...v0.7.0) (2026-11-07)
+
+
+### Features
+
+* **tui:** Run installs, updates and removals inside the popup ([#26](https://github.com/julienpoirou/herdr-plugin-manager/issues/26)) ([4e063af](https://github.com/julienpoirou/herdr-plugin-manager/commit/4e063af89158a40ff7dc1b75f2ac24447f1ffbfc))
+
+
+### Bug Fixes
+
+* **tui:** Keep backslashes of Windows paths at the install prompt and in the editor command ([4e063af](https://github.com/julienpoirou/herdr-plugin-manager/commit/4e063af89158a40ff7dc1b75f2ac24447f1ffbfc))
+
 ## [0.6.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.3...v0.6.0) (2026-11-07)
 
 

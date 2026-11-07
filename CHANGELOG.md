@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.7.0...v0.8.0) (2026-11-07)
+
+
+### Features
+
+* Clean leftovers of removed plugins with X or herdr-pm clean ([#28](https://github.com/julienpoirou/herdr-plugin-manager/issues/28)) ([6d1d006](https://github.com/julienpoirou/herdr-plugin-manager/commit/6d1d006e8bdbc194c182388f11de8f469106cbf6))
+
+
+### Bug Fixes
+
+* **tui:** List latest (unpin) first in the version picker ([6d1d006](https://github.com/julienpoirou/herdr-plugin-manager/commit/6d1d006e8bdbc194c182388f11de8f469106cbf6))
+
 ## [0.7.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.6.0...v0.7.0) (2026-11-07)
 
 

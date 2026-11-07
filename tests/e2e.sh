@@ -155,6 +155,17 @@ printf 'not json\n' > "$REG"
 expect_fail "corrupt registry is reported" "$HPM" list
 mv "$T/registry.good" "$REG"
 
+# --- Git for Windows defaults to core.autocrlf=true: checkouts must still
+# --- carry the committed bytes, or the reviewed-manifest check fails
+plugin "$T/work/crlf" team.crlf Crlf 0.1.0
+publish "$T/work/crlf" crlf
+expect "install with core.autocrlf=true" env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.autocrlf GIT_CONFIG_VALUE_0=true "$HPM" install "$SRV/team/crlf.git" --yes
+root="$("$HPM" info team.crlf | sed -n 's/^root  *//p')"
+[ -f "$root/herdr-plugin.toml" ] || fail "no manifest under $root"
+if grep -q "$(printf '\r')" "$root/herdr-plugin.toml"; then fail "checkout rewrote line endings"; fi
+ok "checkouts keep the committed line endings"
+"$HPM" uninstall team.crlf --yes >/dev/null
+
 # --- refusals
 plugin "$T/work/newer" team.newer Newer 0.0.1
 sed -i.bak 's/min_herdr_version = "0.7.0"/min_herdr_version = "99.0.0"/' "$T/work/newer/herdr-plugin.toml"

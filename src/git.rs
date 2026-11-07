@@ -77,6 +77,10 @@ impl Git {
 
     fn command(&self) -> Command {
         let mut command = Command::new("git");
+        // Check out the committed bytes. Git for Windows defaults to
+        // core.autocrlf=true, which rewrote manifests (failing the
+        // reviewed-manifest check) and shell scripts (breaking builds).
+        command.args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"]);
         command.env("LC_ALL", "C");
         command.env("GIT_ADVICE", "0");
         if !self.interactive {

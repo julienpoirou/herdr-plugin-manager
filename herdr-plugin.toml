@@ -1,7 +1,7 @@
 id = "herdr-plugin-manager"
 name = "Herdr Plugin Manager"
 # x-release-please-start-version
-version = "0.5.1"
+version = "0.5.2"
 # x-release-please-end
 min_herdr_version = "0.7.4"
 description = "Installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."

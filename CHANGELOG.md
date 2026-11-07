@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.1...v0.5.2) (2026-11-07)
+
+
+### Bug Fixes
+
+* **tui:** Clearer footer and help labels ([#18](https://github.com/julienpoirou/herdr-plugin-manager/issues/18)) ([2551f17](https://github.com/julienpoirou/herdr-plugin-manager/commit/2551f1739c2223ce8fd129a66cbe1cd0ed09cba3))
+
 ## [0.5.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.0...v0.5.1) (2026-11-07)
 
 

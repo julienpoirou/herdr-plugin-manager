@@ -985,6 +985,29 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 app.confirm = Some(Confirm::UpdateAll(ids));
             }
         }
+        KeyCode::Char('A') => {
+            let row = row?;
+            let on = !row.auto_update;
+            match ops::set_auto_update(&app.ctx, &row.plugin.plugin_id, on) {
+                Ok(()) => {
+                    app.reload();
+                    if !app.ctx.dry_run {
+                        app.say(
+                            Level::Ok,
+                            if on {
+                                format!(
+                                    "auto-update on for {}: updated without a preview when Herdr starts",
+                                    row.plugin.name
+                                )
+                            } else {
+                                format!("auto-update off for {}", row.plugin.name)
+                            },
+                        );
+                    }
+                }
+                Err(err) => app.say(Level::Warn, format!("{err:#}")),
+            }
+        }
         KeyCode::Char('e') => {
             let row = row?;
             let enable = !row.plugin.enabled;
@@ -1433,9 +1456,14 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let status = status_span(app, row);
         let left = format!("{:>2} ", pos + 1);
-        let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1;
+        let used = left.len() + 2 + name_w + 1 + 9 + 1 + 7 + 1 + 1 + 2;
         let status_w = status.content.chars().count();
         let src_w = width.saturating_sub(used + status_w + 2);
+        let auto = if row.auto_update {
+            Span::styled("⟳ ", Style::default().fg(ACCENT))
+        } else {
+            Span::raw("  ")
+        };
         let mut spans = vec![
             Span::styled(left, muted()),
             dot,
@@ -1449,6 +1477,7 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" "),
             Span::styled(pad(&row.source_display(), src_w), muted()),
             Span::raw(" "),
+            auto,
             status,
         ];
         let used_now: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1505,6 +1534,14 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             lines.push(kv("ref", text));
+            lines.push(kv(
+                "auto",
+                if row.auto_update {
+                    "on: updated without a preview when Herdr starts (A turns it off)"
+                } else {
+                    "off (A updates it automatically, enabled or not)"
+                },
+            ));
         }
     }
     match app.checks.get(&row.plugin.plugin_id) {
@@ -1761,6 +1798,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("u", "update"),
             ("U", "all"),
             ("e", "toggle"),
+            ("A", "auto"),
             ("x", "remove"),
             ("i", "install"),
             ("m", "market"),
@@ -1885,6 +1923,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         section("Installed"),
         key("u / U", "update selected / every outdated plugin"),
         key("e", "enable or disable"),
+        key(
+            "A",
+            "auto-update on/off: no preview, applied when Herdr starts",
+        ),
         key("x", "uninstall (local links are only unlinked)"),
         key("i", "install from a URL, owner/repo or alias:path"),
         key("p", "pin to current commit / unpin"),

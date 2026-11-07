@@ -30,3 +30,8 @@ id = "open"
 title = "Open plugin manager"
 contexts = ["workspace"]
 command = ["./bin/herdr-pm", "open"]
+
+# Updates the plugins whose auto-update is on (A in the popup) when Herdr
+# starts. Without any, it exits after reading the plugin list.
+[[startup]]
+command = ["./bin/herdr-pm", "auto-update"]

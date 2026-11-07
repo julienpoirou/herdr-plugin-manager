@@ -1465,6 +1465,151 @@ fn delete_path(path: &Path) -> Result<()> {
     .with_context(|| format!("could not delete {}", path.display()))
 }
 
+fn dirs_in(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// What Herdr and this manager keep for plugins that are no longer
+/// installed: config and state directories, Herdr's GitHub checkouts and
+/// their lock files.
+pub fn leftovers(herdr: &Herdr) -> Result<Vec<PathBuf>> {
+    let plugins = herdr.list()?;
+    let mut kept: Vec<String> = plugins
+        .iter()
+        .map(|p| paths::plugin_path_component(&p.plugin_id))
+        .collect();
+    kept.push(paths::plugin_path_component(paths::PLUGIN_ID));
+    let roots: Vec<PathBuf> = plugins
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(&p.plugin_root).ok())
+        .collect();
+    let mut found = Vec::new();
+    let plugin_dirs = [
+        paths::herdr_config_dir().join("plugins").join("config"),
+        paths::herdr_state_dir().join("plugins"),
+    ];
+    for base in &plugin_dirs {
+        for dir in dirs_in(base) {
+            let name = file_name(&dir);
+            if !name.starts_with('.') && !kept.contains(&name) {
+                found.push(dir);
+            }
+        }
+    }
+    // `<id>-<hash>` checkouts. One still in use either holds an installed
+    // plugin's root or carries an installed id; both keep it.
+    let installed_name = |name: &str| {
+        kept.iter().any(|id| {
+            name.strip_prefix(id.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|hash| hash.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+    };
+    let herdr_plugins = paths::herdr_config_dir().join("plugins");
+    for dir in dirs_in(&herdr_plugins.join("github-installations")) {
+        let in_use = std::fs::canonicalize(&dir)
+            .map(|d| roots.iter().any(|r| r.starts_with(&d)))
+            .unwrap_or(true)
+            || installed_name(&file_name(&dir));
+        if !in_use {
+            found.push(dir);
+        }
+    }
+    // Herdr's per-checkout lock files (`.locks/.<id>-<hash>.lock`).
+    if let Ok(entries) = std::fs::read_dir(herdr_plugins.join(".locks")) {
+        for lock in entries.flatten().map(|e| e.path()).filter(|p| p.is_file()) {
+            let name = file_name(&lock);
+            let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".lock")) else {
+                continue;
+            };
+            let checkout = herdr_plugins.join("github-installations").join(stem);
+            if !installed_name(stem) && (!checkout.exists() || found.contains(&checkout)) {
+                found.push(lock);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Deletes `leftovers` after a review, and forgets this manager's settings
+/// (auto-update, pins) for plugins that are gone.
+pub fn clean(ctx: &Ctx) -> Result<()> {
+    ctx.step("looking for leftovers of removed plugins");
+    let found = leftovers(&ctx.herdr)?;
+    let installed: Vec<String> = ctx.herdr.list()?.into_iter().map(|p| p.plugin_id).collect();
+    let registry = Registry::load()?;
+    let stale: Vec<String> = registry
+        .auto_update
+        .iter()
+        .chain(registry.pins.keys())
+        .filter(|id| !installed.contains(id))
+        .cloned()
+        .collect();
+    if found.is_empty() && stale.is_empty() {
+        ctx.line(format!("{} Nothing to clean.", green("✓")));
+        return Ok(());
+    }
+    let mut review: Vec<String> = found.iter().map(|p| format!("  {}", p.display())).collect();
+    if !stale.is_empty() {
+        review.push(format!("  settings of {}", stale.join(", ")));
+    }
+    let question = "Delete them?";
+    if !ctx.report.review(
+        &format!("Leftovers of removed plugins ({})", review.len()),
+        &review,
+        (!ctx.yes).then_some(question),
+    )? {
+        ctx.line("cancelled");
+        return Ok(());
+    }
+    if ctx.dry_run {
+        ctx.line("[dry-run] nothing deleted");
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for path in &found {
+        match delete_path(path) {
+            Ok(()) => ctx.line(format!("  {} deleted {}", dim("•"), path.display())),
+            Err(err) => failures.push(format!("{err:#}")),
+        }
+    }
+    if !stale.is_empty() {
+        let mut locked = Registry::lock()?;
+        locked
+            .registry
+            .auto_update
+            .retain(|id| installed.contains(id));
+        locked.registry.pins.retain(|id, _| installed.contains(id));
+        locked.save()?;
+    }
+    if !failures.is_empty() {
+        bail!(
+            "some leftovers could not be deleted: {}",
+            failures.join("; ")
+        );
+    }
+    ctx.line(format!(
+        "{} Cleaned {} leftover(s) of removed plugins.",
+        green("✓"),
+        review.len()
+    ));
+    Ok(())
+}
+
 /// Removes a plugin. `purge` also deletes what it leaves on disk (see
 /// `purge_targets`) and removes git-managed installations right away
 /// instead of through the trash.

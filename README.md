@@ -171,7 +171,7 @@ action.
 | Navigation | arrows / `j` / `k`, `/` filter |
 | Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
-| State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`) |
+| State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` clean leftovers of removed plugins |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
 | Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
@@ -188,11 +188,12 @@ installs them. Only the editor (`c`/`C`) takes over the terminal.
 The detail panel shows the installed version as `branch@commit`
 (`main@8cda521`, `v1.4.0@8cda521`), or `@8cda521 (pinned)`.
 
-`p` lists the repository's tags (one `git ls-remote`), newest version first:
+`p` lists `latest (unpin)` first, then the repository's tags (one
+`git ls-remote`), newest version first:
 
+- `latest (unpin)` follows the default branch again;
 - the installed version pins it **without reinstalling**;
-- another version is installed first, with its preview, then pinned;
-- `latest` follows the default branch again.
+- another version is installed first, with its preview, then pinned.
 
 GitHub-installed plugins are pinned in the manager's `registry.json`, because
 Herdr only changes the ref it follows by reinstalling. `u`, `U` and auto-update
@@ -203,6 +204,12 @@ respect the pin; a `herdr plugin update` run outside the manager does not.
 plugin's config directory, the cached repository (unless another plugin uses
 it), its auto-update and pin settings, and a local link's directory, after you
 type the plugin id.
+
+`X` (or `herdr-pm clean`) finds what plugins removed earlier left behind,
+whichever way they were removed: config and state directories, Herdr's old
+GitHub checkouts and their lock files, and this manager's auto-update/pin
+settings for them. It lists them and deletes them after confirmation; installed
+plugins and the manager's own data are never touched.
 
 Auto-update is a per-plugin switch, independent of enable/disable. When Herdr
 starts, the manager's `[[startup]]` hook runs `herdr-pm auto-update`, which
@@ -219,6 +226,7 @@ herdr-pm list [--check] [--json]
 herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
+herdr-pm clean [-y]            delete leftovers of removed plugins
 herdr-pm auto-update [enable|disable <id>]
 herdr-pm info <id> [--json]    herdr-pm history [id]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]

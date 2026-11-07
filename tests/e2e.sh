@@ -290,6 +290,17 @@ expect "purge a local link" "$HPM" uninstall team.gone --purge --yes
 [ ! -e "$T/dev/gone" ] || fail "linked directory survived --purge"
 ok "purge deletes a local link's directory"
 
+# --- clean removes leftovers of removed plugins only
+GHOST="$XDG_CONFIG_HOME/herdr/plugins/config/team.ghost"
+KEEP="$XDG_CONFIG_HOME/herdr/plugins/config/team.hello"
+mkdir -p "$GHOST" "$KEEP" "$XDG_STATE_HOME/herdr/plugins/team.ghost"
+expect "clean leftovers" "$HPM" clean --yes
+[ ! -e "$GHOST" ] || fail "clean kept a removed plugin's config"
+[ ! -e "$XDG_STATE_HOME/herdr/plugins/team.ghost" ] || fail "clean kept a removed plugin's state"
+[ -d "$KEEP" ] || fail "clean deleted an installed plugin's config"
+[ -d "$XDG_STATE_HOME/herdr/plugins/herdr-plugin-manager" ] || fail "clean deleted the manager's own data"
+ok "clean deletes only what removed plugins left"
+
 # --- with a live server
 herdr server >/dev/null 2>&1 &
 sleep 2

@@ -713,6 +713,8 @@ enum Job {
     Switch(String, String),
     EditFile(std::path::PathBuf),
     Logs(String),
+    /// Delete what removed plugins left behind.
+    Clean,
 }
 
 fn editor_command(config: &Config) -> Vec<String> {
@@ -791,6 +793,13 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
                 false,
             ),
             Job::Logs(id) => (format!("Recent commands of {id}"), None, false, false, true),
+            Job::Clean => (
+                "Cleaning leftovers of removed plugins".to_string(),
+                None,
+                false,
+                false,
+                false,
+            ),
             Job::EditFile(_) => unreachable!(),
         };
     let run: Operation = match job {
@@ -822,6 +831,7 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::PinTo(id, commit) => Box::new(move |ctx| ops::pin(ctx, &id, Some(&commit))),
         Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
         Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
+        Job::Clean => Box::new(ops::clean),
         Job::Logs(id) => Box::new(move |ctx| {
             let status = ctx.herdr.logs(&id, &|line| ctx.report.line(line))?;
             if !status.success() {
@@ -1392,6 +1402,7 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         KeyCode::Char('c') => return Some(Job::EditFile(paths::herdr_plugins_json())),
         KeyCode::Char('C') => return Some(Job::EditFile(paths::pm_config_file())),
         KeyCode::Char('L') => return Some(Job::Logs(id?)),
+        KeyCode::Char('X') => return Some(Job::Clean),
         KeyCode::Char('r') => {
             app.reload();
             app.start_checks(None);
@@ -2294,6 +2305,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         key("A", "auto-update on/off (when Herdr starts)"),
         key("e", "enable or disable"),
         key("x", "remove, or delete completely"),
+        key("X", "clean leftovers of removed plugins"),
         key("i", "install from a URL, owner/repo or alias:path"),
         key("p", "pick a version to pin (or unpin)"),
         key("s", "switch to another branch, tag or commit"),
@@ -2404,7 +2416,7 @@ fn fill_picker(app: &mut App, id: &str, result: Result<Vec<RemoteTag>, String>) 
         picks.push(Pick::Current(commit.clone()));
     }
     picks.extend(tags.into_iter().map(Pick::Tag));
-    picks.push(Pick::Latest);
+    picks.insert(0, Pick::Latest);
     picker.sel = picks
         .iter()
         .position(|p| match p {
@@ -2535,9 +2547,9 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
                 if installed { "installed" } else { "" },
             ),
             Pick::Latest => (
-                "latest".to_string(),
+                "latest (unpin)".to_string(),
                 String::new(),
-                "follow the default branch (unpin)",
+                "follow the default branch",
             ),
         };
         let style = if i == picker.sel {

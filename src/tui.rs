@@ -6,7 +6,7 @@
 //! terminal, then returns.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -598,6 +598,7 @@ fn enter(term: &mut Term) -> Result<()> {
     )?;
     #[cfg(windows)]
     {
+        use std::io::Write;
         let mut out = io::stdout();
         out.write_all(VT_MOUSE_ON.as_bytes())?;
         out.flush()?;
@@ -609,6 +610,7 @@ fn enter(term: &mut Term) -> Result<()> {
 fn leave() -> Result<()> {
     #[cfg(windows)]
     {
+        use std::io::Write;
         let mut out = io::stdout();
         let _ = out.write_all(VT_MOUSE_OFF.as_bytes());
         let _ = out.flush();

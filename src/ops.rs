@@ -1,17 +1,20 @@
-//! Everything that changes installed plugins. The CLI calls these directly;
-//! the popup suspends itself and calls the same functions, so both share
-//! one trust preview, one build runner and one registry.
+//! Everything that changes installed plugins. The CLI calls these directly
+//! and reports on the terminal; the popup runs the same functions on a
+//! worker thread with its own `Report`, so both share one trust preview,
+//! one build runner and one registry.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::git::Git;
+use crate::git::{Git, Mirror};
 use crate::herdr::{Herdr, Plugin};
 use crate::manifest::{self, Manifest};
 use crate::paths;
@@ -24,12 +27,93 @@ pub struct Ctx {
     pub config: Config,
     pub yes: bool,
     pub dry_run: bool,
+    pub report: Arc<dyn Report>,
+}
+
+impl Ctx {
+    fn step(&self, text: &str) {
+        self.report.step(text);
+    }
+
+    fn line(&self, text: impl AsRef<str>) {
+        self.report.line(text.as_ref());
+    }
+
+    /// Git that prompts for credentials only when someone can answer, and
+    /// waits as long as a user-started operation needs.
+    fn git(&self) -> Git {
+        if self.report.interactive() {
+            Git::FOREGROUND
+        } else {
+            Git::UNATTENDED
+        }
+    }
+}
+
+/// Where operations report progress and ask for approval.
+pub trait Report: Send + Sync {
+    /// A stage of the operation ("fetching …", "build 1/2: …").
+    fn step(&self, text: &str);
+    /// Everything else: results, notes, command output.
+    fn line(&self, text: &str);
+    /// Shows a trust preview. With a `question` it waits for approval
+    /// (false = declined); without one it only shows the preview.
+    fn review(&self, title: &str, lines: &[String], question: Option<&str>) -> Result<bool>;
+    /// Position in a batch: plugin `done` of `total`.
+    fn progress(&self, _done: usize, _total: usize) {}
+    /// Whether tools may use the terminal themselves (git credential
+    /// prompts, Herdr's own install preview).
+    fn interactive(&self) -> bool;
+}
+
+/// The CLI: stages and previews on stderr, results on stdout, `[y/N]`.
+pub struct TerminalReport;
+
+impl Report for TerminalReport {
+    fn step(&self, text: &str) {
+        eprintln!("{} {text}", cyan("›"));
+    }
+
+    fn line(&self, text: &str) {
+        println!("{text}");
+    }
+
+    fn review(&self, title: &str, lines: &[String], question: Option<&str>) -> Result<bool> {
+        eprintln!();
+        eprintln!("{}", bold(title));
+        for line in lines {
+            eprintln!("{line}");
+        }
+        eprintln!();
+        let Some(question) = question else {
+            return Ok(true);
+        };
+        if !util::stdin_is_tty() {
+            bail!(
+                "refusing to continue without confirmation: stdin is not a terminal (pass --yes)"
+            );
+        }
+        util::confirm(question)
+    }
+
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------- output
 
+static PLAIN: AtomicBool = AtomicBool::new(false);
+
+/// Turns ANSI colors off: the popup renders operation output itself.
+pub fn set_plain() {
+    PLAIN.store(true, Ordering::Relaxed);
+}
+
 fn color_on() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+    !PLAIN.load(Ordering::Relaxed)
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::io::stderr().is_terminal()
 }
 
 pub fn paint(code: &str, text: &str) -> String {
@@ -57,10 +141,6 @@ pub fn red(t: &str) -> String {
 }
 pub fn cyan(t: &str) -> String {
     paint("36", t)
-}
-
-fn step(text: &str) {
-    eprintln!("{} {text}", cyan("›"));
 }
 
 // ---------------------------------------------------------------- rows
@@ -377,21 +457,27 @@ pub fn install(ctx: &Ctx, request: InstallRequest) -> Result<bool> {
     match request.source {
         Source::Github { .. } => {
             let spec = request.source.display();
-            let status = ctx
-                .herdr
-                .install_github(&spec, request.reference.as_deref(), ctx.yes)?;
-            registry::log_event(Event {
-                unix: util::now_unix(),
-                action: "install".into(),
-                plugin_id: spec.clone(),
-                source: Some(spec.clone()),
-                from: None,
-                to: request.reference.clone(),
-                ok: status.success(),
-                detail: Some("via herdr plugin install".into()),
-            });
-            if !status.success() {
-                bail!("herdr plugin install {spec} did not complete ({status})");
+            let result = github_install(
+                ctx,
+                &spec,
+                request.reference.as_deref(),
+                None,
+                Mode::Install,
+            );
+            if !matches!(result, Ok(false)) {
+                registry::log_event(Event {
+                    unix: util::now_unix(),
+                    action: "install".into(),
+                    plugin_id: spec.clone(),
+                    source: Some(spec.clone()),
+                    from: None,
+                    to: request.reference.clone(),
+                    ok: result.is_ok(),
+                    detail: Some("via herdr plugin install".into()),
+                });
+            }
+            if !result? {
+                return Ok(false);
             }
             if request.enabled == Some(false) {
                 // Herdr registers installs as enabled; honour --disabled.
@@ -452,7 +538,7 @@ fn manifest_not_found(found: &[String], wanted: &str, url: &str) -> anyhow::Erro
 /// Earlier installations stay on disk (running processes keep their files
 /// and `rollback` can return to them).
 pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
-    let git = Git::FOREGROUND;
+    let git = ctx.git();
     let herdr_version = ctx.herdr.version().ok();
     let subdir = request
         .subdir
@@ -463,7 +549,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         source::validate_subdir(s)?;
     }
 
-    step(&format!("fetching {}", util::sanitize(&request.url)));
+    ctx.step(&format!("fetching {}", util::sanitize(&request.url)));
     let mirror = git.sync(&request.url)?;
     let sha = git.resolve(&mirror, request.checkout_ref.as_deref())?;
     let mut subdir = subdir;
@@ -480,7 +566,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
                         .unwrap_or("")
                         .trim_end_matches('/')
                         .to_string();
-                    step(&format!("using the only plugin in the repository: {dir}"));
+                    ctx.step(&format!("using the only plugin in the repository: {dir}"));
                     manifest_rel = only.clone();
                     subdir = (!dir.is_empty()).then_some(dir);
                     git.show_file(&mirror, &sha, &manifest_rel)?
@@ -559,18 +645,18 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
                 if !ctx.dry_run {
                     locked.save()?;
                 }
-                println!(
+                ctx.line(format!(
                     "{id} is already at {}; it now follows {}.",
                     util::short_sha(&sha),
                     follow.as_deref().unwrap_or("the default branch")
-                );
+                ));
                 return Ok(true);
             }
-            println!(
+            ctx.line(format!(
                 "{} {id} is already up to date ({}).",
                 green("✓"),
                 util::short_sha(&sha)
-            );
+            ));
             return Ok(false);
         }
     }
@@ -582,89 +668,47 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         None => "default branch".to_string(),
     };
     let updating = record_live;
-    eprintln!();
-    eprintln!(
-        "{}",
-        bold(&format!(
-            "Plugin {} preview",
-            if updating {
-                request.mode.verb()
-            } else {
-                "install"
-            }
-        ))
-    );
-    eprintln!("  source    {}", util::sanitize(&source_display));
-    eprintln!(
-        "  ref       {} → {}",
-        util::sanitize(&ref_label),
-        bold(util::short_sha(&sha))
-    );
+    let mut review = vec![
+        format!("  source    {}", util::sanitize(&source_display)),
+        format!(
+            "  ref       {} → {}",
+            util::sanitize(&ref_label),
+            bold(util::short_sha(&sha))
+        ),
+    ];
     if let Some(c) = &commit {
-        eprintln!(
-            "  commit    {}  {}",
-            dim(&format!("{} · {}", c.author, util::format_unix(c.time))),
-            util::truncate(&c.subject, 60)
-        );
+        review.push(commit_line(c));
     }
     if follow != request.checkout_ref {
-        eprintln!(
+        review.push(format!(
             "  follows   {}",
             util::sanitize(follow.as_deref().unwrap_or("default branch"))
-        );
+        ));
     }
-    for line in manifest.preview_lines() {
-        eprintln!("{line}");
-    }
+    review.extend(manifest.preview_lines());
     if let (true, Some(r)) = (updating, &record) {
-        let old_text =
-            std::fs::read_to_string(Path::new(&r.current.plugin_root).join(manifest::FILE_NAME))
-                .ok();
-        let old_manifest = old_text.as_deref().and_then(|t| Manifest::parse(t).ok());
-        eprintln!();
-        eprintln!(
-            "  {} {} ({}) → {} ({})",
-            bold("change"),
-            util::sanitize(&r.current.version),
-            util::short_sha(&r.current.commit),
-            util::sanitize(&manifest.version),
-            util::short_sha(&sha)
-        );
+        review.extend(change_lines(
+            git,
+            &mirror,
+            (
+                &r.current.commit,
+                &r.current.version,
+                &r.current.plugin_root,
+            ),
+            &sha,
+            &manifest,
+        ));
         if r.url != request.url || r.subdir != subdir {
-            eprintln!(
+            review.push(format!(
                 "  {} {} → {}",
                 yellow("source changes:"),
                 util::sanitize(&r.source_display()),
                 util::sanitize(&source_display)
-            );
-        }
-        match git.count_range(&mirror, &r.current.commit, &sha) {
-            Some(0) => eprintln!("  {}", yellow("this goes back to an older commit")),
-            Some(n) => {
-                eprintln!("  {n} new commit{}:", if n == 1 { "" } else { "s" });
-                for line in git.log_range(&mirror, &r.current.commit, &sha, 12) {
-                    eprintln!("    {line}");
-                }
-                if n > 12 {
-                    eprintln!("    {}", dim(&format!("… and {} more", n - 12)));
-                }
-            }
-            None => eprintln!("  {}", yellow("history diverged (force-push?)")),
-        }
-        if let Some(old) = old_manifest {
-            let diff = manifest::diff_runnables(&old, &manifest);
-            if diff.is_empty() {
-                eprintln!("  {}", green("what it runs is unchanged"));
-            } else {
-                eprintln!("  {}", yellow("what it runs changed:"));
-                for line in diff {
-                    eprintln!("{}", yellow(&line));
-                }
-            }
+            ));
         }
     }
     for warning in &warnings {
-        eprintln!("  {} {warning}", yellow("warning:"));
+        review.push(format!("  {} {warning}", yellow("warning:")));
     }
     if let Some(plugin) = &existing {
         if !record_live {
@@ -676,38 +720,33 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
             } else {
                 format!("local link {}", plugin.plugin_root)
             };
-            eprintln!(
+            review.push(format!(
                 "  {} {what}",
                 yellow("replaces"),
                 what = util::sanitize(&what)
-            );
+            ));
         }
     }
-    eprintln!();
-
-    let prompt = if updating {
-        format!("{} {id}?", capitalize(request.mode.verb()))
+    let verb = if updating {
+        request.mode.verb()
     } else {
-        format!("Install {id}?")
+        "install"
     };
-    if !ctx.yes {
-        if !util::stdin_is_tty() {
-            bail!(
-                "refusing to {} without confirmation: stdin is not a terminal (pass --yes)",
-                request.mode.verb()
-            );
-        }
-        if !util::confirm(&prompt)? {
-            eprintln!("cancelled");
-            return Ok(false);
-        }
+    let question = format!("{} {id}?", capitalize(verb));
+    let title = format!("Plugin {verb} preview");
+    if !ctx
+        .report
+        .review(&title, &review, (!ctx.yes).then_some(question.as_str()))?
+    {
+        ctx.line("cancelled");
+        return Ok(false);
     }
     if ctx.dry_run {
-        eprintln!(
+        ctx.line(format!(
             "[dry-run] would check out {}, run {} build step(s) and link {id}",
             util::short_sha(&sha),
             manifest.build_steps().len()
-        );
+        ));
         return Ok(false);
     }
 
@@ -715,7 +754,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
     let install_dir = new_install_dir(&id, &sha)?;
     let result = (|| -> Result<PathBuf> {
         let checkout = install_dir.join("src");
-        step(&format!("checking out {}", util::short_sha(&sha)));
+        ctx.step(&format!("checking out {}", util::short_sha(&sha)));
         git.checkout(&mirror, &sha, &checkout)?;
         let plugin_root = match &subdir {
             Some(s) => checkout.join(s),
@@ -727,7 +766,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         if !same_text(&on_disk, &text) {
             bail!("checked-out manifest differs from the previewed one; aborting");
         }
-        run_builds(&manifest, &plugin_root)?;
+        run_builds(ctx, &manifest, &plugin_root)?;
         let after = std::fs::read_to_string(&manifest_file).unwrap_or_default();
         if !same_text(&after, &text) {
             bail!(
@@ -758,7 +797,7 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         .enabled
         .or(existing.as_ref().map(|p| p.enabled))
         .unwrap_or(true);
-    step(&format!("linking {}", plugin_root.display()));
+    ctx.step(&format!("linking {}", plugin_root.display()));
     if let Err(err) = ctx.herdr.link(&plugin_root, enabled) {
         let _ = std::fs::remove_dir_all(&install_dir);
         log_change(
@@ -821,23 +860,23 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
     );
     cleanup_installs(&id);
 
-    println!(
+    ctx.line(format!(
         "{} {} {id} {} ({}) from {}.",
         green("✓"),
         capitalize(past(request.mode)),
         util::sanitize(&manifest.version),
         util::short_sha(&sha),
         util::sanitize(&source_display),
-    );
-    println!(
+    ));
+    ctx.line(format!(
         "  config: {}",
         paths::herdr_plugin_config_dir(&id).display()
-    );
+    ));
     if !enabled {
-        println!(
+        ctx.line(format!(
             "  {} it is disabled; enable it with herdr-pm enable {id}",
             dim("note:")
-        );
+        ));
     }
     Ok(true)
 }
@@ -856,6 +895,193 @@ fn past(mode: Mode) -> &'static str {
         Mode::Update => "updated",
         Mode::Switch => "switched",
     }
+}
+
+fn commit_line(c: &crate::git::CommitInfo) -> String {
+    format!(
+        "  commit    {}  {}",
+        dim(&format!("{} · {}", c.author, util::format_unix(c.time))),
+        util::truncate(&c.subject, 60)
+    )
+}
+
+/// The "what changes" part of an update preview: versions, commits in
+/// between, and changes to what the plugin runs. `old` is the installed
+/// commit, version and plugin root.
+fn change_lines(
+    git: Git,
+    mirror: &Mirror,
+    old: (&str, &str, &str),
+    sha: &str,
+    manifest: &Manifest,
+) -> Vec<String> {
+    let (old_commit, old_version, old_root) = old;
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "  {} {} ({}) → {} ({})",
+            bold("change"),
+            util::sanitize(old_version),
+            util::short_sha(old_commit),
+            util::sanitize(&manifest.version),
+            util::short_sha(sha)
+        ),
+    ];
+    match git.count_range(mirror, old_commit, sha) {
+        Some(0) => lines.push(format!("  {}", yellow("this goes back to an older commit"))),
+        Some(n) => {
+            lines.push(format!(
+                "  {n} new commit{}:",
+                if n == 1 { "" } else { "s" }
+            ));
+            for line in git.log_range(mirror, old_commit, sha, 12) {
+                lines.push(format!("    {line}"));
+            }
+            if n > 12 {
+                lines.push(format!("    {}", dim(&format!("… and {} more", n - 12))));
+            }
+        }
+        None => lines.push(format!("  {}", yellow("history diverged (force-push?)"))),
+    }
+    let old_manifest = std::fs::read_to_string(Path::new(old_root).join(manifest::FILE_NAME))
+        .ok()
+        .and_then(|t| Manifest::parse(&t).ok());
+    if let Some(old) = old_manifest {
+        let diff = manifest::diff_runnables(&old, manifest);
+        if diff.is_empty() {
+            lines.push(format!("  {}", green("what it runs is unchanged")));
+        } else {
+            lines.push(format!("  {}", yellow("what it runs changed:")));
+            lines.extend(diff.into_iter().map(|line| yellow(&line)));
+        }
+    }
+    lines
+}
+
+/// Herdr installs GitHub shorthands itself and shows its own preview on
+/// the terminal. Reports without a terminal (the popup) get the same review
+/// from a mirror of the repository first; Herdr then runs with `--yes`.
+/// Returns false when the review is declined. `current` is the installed
+/// plugin for updates and version switches.
+fn github_review(
+    ctx: &Ctx,
+    spec: &str,
+    reference: Option<&str>,
+    current: Option<&Row>,
+    mode: Mode,
+) -> Result<bool> {
+    let mut parts = spec.splitn(3, '/');
+    let (owner, repo) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let subdir = parts.next().map(str::to_string);
+    let url = format!("https://github.com/{owner}/{repo}.git");
+    let git = ctx.git();
+    ctx.step(&format!("fetching {url}"));
+    let mirror = git.sync(&url)?;
+    let sha = git.resolve(&mirror, reference)?;
+    let manifest_rel = manifest_path(subdir.as_deref());
+    let text = match git.show_file(&mirror, &sha, &manifest_rel)? {
+        Some(text) => text,
+        None => {
+            let found = git.find_manifests(&mirror, &sha).unwrap_or_default();
+            return Err(manifest_not_found(&found, &manifest_rel, spec));
+        }
+    };
+    let manifest = Manifest::parse(&text)?;
+    let warnings = manifest.validate(ctx.herdr.version().ok().as_ref())?;
+    let mut review = vec![
+        format!("  source    github:{}", util::sanitize(spec)),
+        format!(
+            "  ref       {} → {}",
+            util::sanitize(reference.unwrap_or("default branch")),
+            bold(util::short_sha(&sha))
+        ),
+    ];
+    if let Ok(c) = git.commit_info(&mirror, &sha) {
+        review.push(commit_line(&c));
+    }
+    review.extend(manifest.preview_lines());
+    if let Some(row) = current {
+        if let Some(old_commit) = row.commit() {
+            review.extend(change_lines(
+                git,
+                &mirror,
+                (old_commit, &row.plugin.version, &row.plugin.plugin_root),
+                &sha,
+                &manifest,
+            ));
+        }
+    }
+    for warning in &warnings {
+        review.push(format!("  {} {warning}", yellow("warning:")));
+    }
+    let verb = if current.is_some() {
+        mode.verb()
+    } else {
+        "install"
+    };
+    let question = format!("{} {}?", capitalize(verb), manifest.id.trim());
+    ctx.report.review(
+        &format!("Plugin {verb} preview"),
+        &review,
+        (!ctx.yes).then_some(question.as_str()),
+    )
+}
+
+/// `herdr plugin install` for a GitHub shorthand, reviewed. Returns false
+/// when the review is declined.
+fn github_install(
+    ctx: &Ctx,
+    spec: &str,
+    reference: Option<&str>,
+    current: Option<&Row>,
+    mode: Mode,
+) -> Result<bool> {
+    let status = if ctx.report.interactive() {
+        ctx.herdr.install_github(spec, reference, ctx.yes)?
+    } else {
+        if !github_review(ctx, spec, reference, current, mode)? {
+            ctx.line("cancelled");
+            return Ok(false);
+        }
+        ctx.step("installing with herdr");
+        ctx.herdr
+            .install_github_quiet(spec, reference, &|line| ctx.line(line))?
+    };
+    if !status.success() {
+        bail!("herdr plugin install {spec} did not complete ({status})");
+    }
+    if !ctx.report.interactive() {
+        let verb = if current.is_some() {
+            past(mode)
+        } else {
+            "installed"
+        };
+        ctx.line(format!("{} {} {spec}", green("✓"), capitalize(verb)));
+    }
+    Ok(true)
+}
+
+/// `herdr plugin update` for a GitHub-installed plugin, reviewed.
+fn github_update(ctx: &Ctx, row: &Row) -> Result<bool> {
+    let id = &row.plugin.plugin_id;
+    let status = if ctx.report.interactive() {
+        ctx.herdr.update_github(id, ctx.yes)?
+    } else {
+        let spec = row.plugin.source.github_spec().unwrap_or_default();
+        if !github_review(ctx, &spec, row.requested_ref(), Some(row), Mode::Update)? {
+            ctx.line("cancelled");
+            return Ok(false);
+        }
+        ctx.step("updating with herdr");
+        ctx.herdr.update_github_quiet(id, &|line| ctx.line(line))?
+    };
+    if !status.success() {
+        bail!("herdr plugin update {id} did not complete ({status})");
+    }
+    if !ctx.report.interactive() {
+        ctx.line(format!("{} Updated {id}", green("✓")));
+    }
+    Ok(true)
 }
 
 /// The manifest as reviewed and as checked out may differ only in line
@@ -968,19 +1194,14 @@ pub fn build_command(argv: &[String], cwd: &Path) -> Result<Command> {
     Ok(command)
 }
 
-fn run_builds(manifest: &Manifest, root: &Path) -> Result<()> {
+fn run_builds(ctx: &Ctx, manifest: &Manifest, root: &Path) -> Result<()> {
     let steps = manifest.build_steps();
     let total = steps.len();
     for (index, entry) in steps.into_iter().enumerate() {
         let shown = manifest::render_argv(&entry.command);
-        step(&format!("build {}/{total}: {shown}", index + 1));
+        ctx.step(&format!("build {}/{total}: {shown}", index + 1));
         let mut command = build_command(&entry.command, root)?;
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let status = command
-            .status()
+        let status = util::stream_command(&mut command, &|line| ctx.line(line))
             .with_context(|| format!("build {}/{total} could not start: {shown}", index + 1))?;
         if !status.success() {
             bail!("build {}/{total} failed ({status}): {shown}", index + 1);
@@ -1106,37 +1327,42 @@ pub fn update(ctx: &Ctx, targets: &[String]) -> Result<usize> {
         out
     };
     if selected.is_empty() {
-        println!("Nothing to update: no plugins installed from GitHub or git.");
+        ctx.line("Nothing to update: no plugins installed from GitHub or git.");
         return Ok(0);
     }
+    let total = selected.len();
     let mut failures = 0;
-    for row in selected {
+    for (index, row) in selected.into_iter().enumerate() {
+        if total > 1 {
+            ctx.report.progress(index, total);
+        }
         let id = &row.plugin.plugin_id;
-        match check(row, Git::FOREGROUND) {
-            Status::Current => println!("{} {id} is up to date", green("✓")),
-            Status::Pinned => println!(
+        ctx.step(&format!("checking {id}"));
+        match check(row, ctx.git()) {
+            Status::Current => ctx.line(format!("{} {id} is up to date", green("✓"))),
+            Status::Pinned => ctx.line(format!(
                 "{} {id} is pinned at {} (skipped)",
                 dim("•"),
                 util::short_sha(row.commit().unwrap_or(""))
-            ),
-            Status::Local => println!(
+            )),
+            Status::Local => ctx.line(format!(
                 "{} {id} is a local link (update it in {})",
                 dim("•"),
                 row.plugin.plugin_root
-            ),
-            Status::Unknown => println!("{} {id}: no source recorded", dim("•")),
+            )),
+            Status::Unknown => ctx.line(format!("{} {id}: no source recorded", dim("•"))),
             Status::Error { message } => {
                 failures += 1;
-                println!("{} {id}: {message}", red("✗"));
+                ctx.line(format!("{} {id}: {message}", red("✗")));
             }
             Status::Available { commit, .. } => {
                 if ctx.dry_run {
-                    println!(
+                    ctx.line(format!(
                         "{} {id}: {} → {} available (dry run, nothing changed)",
                         yellow("↑"),
                         util::short_sha(row.commit().unwrap_or("")),
                         util::short_sha(&commit)
-                    );
+                    ));
                     continue;
                 }
                 let result = match row.origin {
@@ -1157,23 +1383,18 @@ pub fn update(ctx: &Ctx, targets: &[String]) -> Result<usize> {
                         )
                         .map(|_| ())
                     }
-                    Origin::Github => ctx.herdr.update_github(id, ctx.yes).and_then(|status| {
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(anyhow!(
-                                "herdr plugin update {id} did not complete ({status})"
-                            ))
-                        }
-                    }),
+                    Origin::Github => github_update(ctx, row).map(|_| ()),
                     Origin::Local => Ok(()),
                 };
                 if let Err(err) = result {
                     failures += 1;
-                    eprintln!("{} {id}: {err:#}", red("✗"));
+                    ctx.line(format!("{} {id}: {err:#}", red("✗")));
                 }
             }
         }
+    }
+    if total > 1 {
+        ctx.report.progress(total, total);
     }
     Ok(failures)
 }
@@ -1305,7 +1526,7 @@ pub fn uninstall(ctx: &Ctx, id: &str, purge: bool) -> Result<()> {
             None => util::confirm(&format!("Uninstall {plugin_id}: {what}?"))?,
         };
         if !accepted {
-            eprintln!("cancelled");
+            ctx.line("cancelled");
             return Ok(());
         }
     }
@@ -1345,7 +1566,7 @@ pub fn uninstall(ctx: &Ctx, id: &str, purge: bool) -> Result<()> {
     let mut failures = Vec::new();
     for path in &doomed {
         match delete_path(path) {
-            Ok(()) => println!("  {} deleted {}", dim("•"), path.display()),
+            Ok(()) => ctx.line(format!("  {} deleted {}", dim("•"), path.display())),
             Err(err) => failures.push(format!("{err:#}")),
         }
     }
@@ -1365,23 +1586,23 @@ pub fn uninstall(ctx: &Ctx, id: &str, purge: bool) -> Result<()> {
             failures.join("; ")
         );
     }
-    println!(
+    ctx.line(format!(
         "{} {} {plugin_id}.",
         green("✓"),
         if purge { "Deleted" } else { "Uninstalled" }
-    );
+    ));
     Ok(())
 }
 
 pub fn set_enabled(ctx: &Ctx, id: &str, enabled: bool) -> Result<()> {
     let row = require_row(ctx, id)?;
     ctx.herdr.set_enabled(&row.plugin.plugin_id, enabled)?;
-    println!(
+    ctx.line(format!(
         "{} {} {}",
         green("✓"),
         if enabled { "Enabled" } else { "Disabled" },
         row.plugin.plugin_id
-    );
+    ));
     Ok(())
 }
 
@@ -1434,7 +1655,7 @@ pub fn auto_update(ctx: &Ctx) -> Result<usize> {
         .map(|r| r.plugin.plugin_id)
         .collect();
     if ids.is_empty() {
-        println!("No plugin has auto-update turned on.");
+        ctx.line("No plugin has auto-update turned on.");
         return Ok(0);
     }
     update(ctx, &ids)
@@ -1457,14 +1678,14 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
     else {
         bail!("no earlier installation of {id} is kept on disk");
     };
-    eprintln!(
-        "Roll back {id}: {} ({}) → {} ({}, installed {})",
-        record.current.version,
+    let mut review = vec![format!(
+        "  change    {} ({}) → {} ({}, installed {})",
+        util::sanitize(&record.current.version),
         util::short_sha(&record.current.commit),
-        prev.version,
+        util::sanitize(&prev.version),
         util::short_sha(&prev.commit),
         util::format_unix(prev.installed_unix)
-    );
+    )];
     if let Ok(text) =
         std::fs::read_to_string(Path::new(&prev.plugin_root).join(manifest::FILE_NAME))
     {
@@ -1476,26 +1697,29 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
             .map_err(anyhow::Error::from)
             .and_then(|t| Manifest::parse(&t)),
         ) {
-            for line in manifest::diff_runnables(&cur, &old) {
-                eprintln!("{}", yellow(&line));
+            let diff = manifest::diff_runnables(&cur, &old);
+            if diff.is_empty() {
+                review.push(format!("  {}", green("what it runs is unchanged")));
+            } else {
+                review.push(format!("  {}", yellow("what it runs changes:")));
+                review.extend(diff.into_iter().map(|line| yellow(&line)));
             }
         }
     }
-    if !ctx.yes {
-        if !util::stdin_is_tty() {
-            bail!(
-                "refusing to roll back without confirmation: stdin is not a terminal (pass --yes)"
-            );
-        }
-        if !util::confirm(&format!("Roll back {id}?"))? {
-            eprintln!("cancelled");
-            return Ok(());
-        }
-    }
-    if ctx.dry_run {
-        eprintln!("[dry-run] would link {}", prev.plugin_root);
+    let question = format!("Roll back {id}?");
+    if !ctx.report.review(
+        &format!("Roll back {id}"),
+        &review,
+        (!ctx.yes).then_some(question.as_str()),
+    )? {
+        ctx.line("cancelled");
         return Ok(());
     }
+    if ctx.dry_run {
+        ctx.line(format!("[dry-run] would link {}", prev.plugin_root));
+        return Ok(());
+    }
+    ctx.step(&format!("linking {}", prev.plugin_root));
     ctx.herdr
         .link(Path::new(&prev.plugin_root), row.plugin.enabled)?;
     {
@@ -1520,17 +1744,17 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
         ok: true,
         detail: None,
     });
-    println!(
+    ctx.line(format!(
         "{} Rolled back {id} to {} ({}).",
         green("✓"),
         prev.version,
         util::short_sha(&prev.commit)
-    );
+    ));
     if !util::is_full_sha(prev.requested_ref.as_deref().unwrap_or("")) {
-        println!(
+        ctx.line(format!(
             "  {} updates will be offered again; `herdr-pm pin {id}` holds this version.",
             dim("note:")
-        );
+        ));
     }
     Ok(())
 }
@@ -1642,20 +1866,20 @@ pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
         (None, _) => None,
         (Some(r), Origin::Git) => {
             let record = row.record.as_ref().unwrap();
-            let git = Git::FOREGROUND;
+            let git = ctx.git();
             let mirror = git.sync(&record.url)?;
             Some(git.resolve(&mirror, Some(r))?)
         }
         (Some(r), _) => {
             let (url, _) = row.remote().ok_or_else(|| anyhow!("{id} has no remote"))?;
-            Some(Git::FOREGROUND.ls_remote(&url, Some(r))?)
+            Some(ctx.git().ls_remote(&url, Some(r))?)
         }
     };
     let sha = match target {
         Some(sha) if row.commit().is_none_or(|c| !c.eq_ignore_ascii_case(&sha)) => sha,
         _ => {
             let short = pin_current(ctx, id)?;
-            println!("{} Pinned {id} at {short}.", green("✓"));
+            ctx.line(format!("{} Pinned {id} at {short}.", green("✓")));
             return Ok(());
         }
     };
@@ -1679,12 +1903,11 @@ pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
         }
         _ => {
             let spec = row.plugin.source.github_spec().unwrap_or_default();
-            let status = ctx.herdr.install_github(&spec, Some(&sha), ctx.yes)?;
-            if !status.success() {
-                bail!("herdr plugin install did not complete ({status})");
+            if github_install(ctx, &spec, Some(&sha), Some(&row), Mode::Switch)? {
+                // Herdr now records the commit itself.
+                forget_pin(id)?;
             }
-            // Herdr now records the commit itself.
-            forget_pin(id)
+            Ok(())
         }
     }
 }
@@ -1702,28 +1925,27 @@ pub fn unpin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
             if !ctx.dry_run {
                 locked.save()?;
             }
-            println!(
+            ctx.line(format!(
                 "{} {id} now follows {}; `herdr-pm update {id}` applies it.",
                 green("✓"),
                 reference.unwrap_or("the default branch")
-            );
+            ));
             Ok(())
         }
         Origin::Github if reference.is_none() && !row.unpin_needs_install() => {
             clear_pin(ctx, id)?;
-            println!(
+            ctx.line(format!(
                 "{} {id} follows its default branch again; `herdr-pm update {id}` applies it.",
                 green("✓")
-            );
+            ));
             Ok(())
         }
         Origin::Github => {
             let spec = row.plugin.source.github_spec().unwrap_or_default();
-            let status = ctx.herdr.install_github(&spec, reference, ctx.yes)?;
-            if !status.success() {
-                bail!("herdr plugin install did not complete ({status})");
+            if github_install(ctx, &spec, reference, Some(&row), Mode::Switch)? {
+                forget_pin(id)?;
             }
-            forget_pin(id)
+            Ok(())
         }
     }
 }
@@ -1755,11 +1977,10 @@ pub fn switch(ctx: &Ctx, id: &str, reference: &str) -> Result<()> {
         }
         Origin::Github => {
             let spec = row.plugin.source.github_spec().unwrap_or_default();
-            let status = ctx.herdr.install_github(&spec, Some(reference), ctx.yes)?;
-            if !status.success() {
-                bail!("herdr plugin install did not complete ({status})");
+            if github_install(ctx, &spec, Some(reference), Some(&row), Mode::Switch)? {
+                forget_pin(id)?;
             }
-            forget_pin(id)
+            Ok(())
         }
     }
 }
@@ -1876,14 +2097,14 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
             let row = current.unwrap();
             if row.plugin.enabled != entry.enabled && !ctx.dry_run {
                 ctx.herdr.set_enabled(&entry.id, entry.enabled)?;
-                println!(
+                ctx.line(format!(
                     "{} {}: {}",
                     green("✓"),
                     entry.id,
                     if entry.enabled { "enabled" } else { "disabled" }
-                );
+                ));
             } else {
-                println!("{} {} unchanged", dim("•"), entry.id);
+                ctx.line(format!("{} {} unchanged", dim("•"), entry.id));
             }
             continue;
         }
@@ -1934,7 +2155,7 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
         };
         if let Err(err) = result {
             failures += 1;
-            eprintln!("{} {}: {err:#}", red("✗"), entry.id);
+            ctx.line(format!("{} {}: {err:#}", red("✗"), entry.id));
         }
     }
     Ok(failures)

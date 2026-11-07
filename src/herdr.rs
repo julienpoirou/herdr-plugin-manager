@@ -375,6 +375,51 @@ impl Herdr {
         }
         self.interactive(&args)
     }
+
+    /// Runs a herdr command without a terminal, handing its output to
+    /// `on_line`. Callers have already shown their own review.
+    fn quiet(&self, args: &[&str], on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
+        if self.dry_run {
+            on_line(&format!("[dry-run] {}", self.display(args)));
+            return Ok(success_status());
+        }
+        let mut command = self.command();
+        command.args(args);
+        util::stream_command(&mut command, on_line)
+            .with_context(|| format!("could not run {}", self.bin.display()))
+    }
+
+    pub fn install_github_quiet(
+        &self,
+        spec: &str,
+        reference: Option<&str>,
+        on_line: &dyn Fn(&str),
+    ) -> Result<ExitStatus> {
+        let mut args = vec!["plugin", "install", spec, "--yes"];
+        if let Some(reference) = reference {
+            args.push("--ref");
+            args.push(reference);
+        }
+        self.quiet(&args, on_line)
+    }
+
+    pub fn update_github_quiet(
+        &self,
+        plugin_id: &str,
+        on_line: &dyn Fn(&str),
+    ) -> Result<ExitStatus> {
+        self.quiet(&["plugin", "update", plugin_id, "--yes"], on_line)
+    }
+
+    /// Recent commands Herdr ran for a plugin.
+    pub fn logs(&self, plugin_id: &str, on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
+        let mut command = self.command();
+        command.args([
+            "plugin", "log", "list", "--plugin", plugin_id, "--limit", "20",
+        ]);
+        util::stream_command(&mut command, on_line)
+            .with_context(|| format!("could not run {}", self.bin.display()))
+    }
 }
 
 #[cfg(unix)]

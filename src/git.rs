@@ -20,8 +20,11 @@ const REMOTE_HEAD: &str = "refs/hpm/remote-head";
 #[derive(Debug, Clone, Copy)]
 pub struct Git {
     /// Interactive calls may prompt for credentials or an SSH passphrase;
-    /// background calls must fail fast instead.
+    /// the others must fail instead of waiting for an answer.
     pub interactive: bool,
+    /// Background checks give up after a timeout; user-started operations
+    /// wait for large fetches and submodules.
+    pub bounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +75,19 @@ fn validate_remote(url: &str) -> Result<()> {
 }
 
 impl Git {
-    pub const FOREGROUND: Git = Git { interactive: true };
-    pub const BACKGROUND: Git = Git { interactive: false };
+    pub const FOREGROUND: Git = Git {
+        interactive: true,
+        bounded: false,
+    };
+    pub const BACKGROUND: Git = Git {
+        interactive: false,
+        bounded: true,
+    };
+    /// No prompts (nobody watches the terminal) and no timeouts.
+    pub const UNATTENDED: Git = Git {
+        interactive: false,
+        bounded: false,
+    };
 
     fn command(&self) -> Command {
         let mut command = Command::new("git");
@@ -99,10 +113,10 @@ impl Git {
     }
 
     fn timeout(&self, network: bool) -> Option<Duration> {
-        match (self.interactive, network) {
-            (true, _) => None,
-            (false, true) => Some(Duration::from_secs(45)),
-            (false, false) => Some(Duration::from_secs(20)),
+        match (self.bounded, network) {
+            (false, _) => None,
+            (true, true) => Some(Duration::from_secs(45)),
+            (true, false) => Some(Duration::from_secs(20)),
         }
     }
 
@@ -422,13 +436,12 @@ impl Git {
             // Submodule URLs relative to the original remote resolve
             // correctly now that origin points back at it. A partial checkout
             // must never reach a build or be linked into Herdr.
-            Git::FOREGROUND
-                .run(
-                    Some(dest),
-                    &["submodule", "update", "--init", "--recursive", "--quiet"],
-                    true,
-                )
-                .context("could not initialize repository submodules")?;
+            self.run(
+                Some(dest),
+                &["submodule", "update", "--init", "--recursive", "--quiet"],
+                true,
+            )
+            .context("could not initialize repository submodules")?;
         }
         Ok(())
     }

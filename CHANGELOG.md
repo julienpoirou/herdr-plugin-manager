@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.4.0...v0.4.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* **tui:** Drop the Herdr version from the popup header ([#12](https://github.com/julienpoirou/herdr-plugin-manager/issues/12)) ([72c9105](https://github.com/julienpoirou/herdr-plugin-manager/commit/72c9105731bf8ce27d28e50d0eb96eb017d7cfac))
+
 ## [0.4.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.3.0...v0.4.0) (2026-11-06)
 
 

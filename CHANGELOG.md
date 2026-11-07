@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.4.1...v0.5.0) (2026-11-07)
+
+
+### Features
+
+* Per-plugin auto-update, toggled with A in the popup ([#14](https://github.com/julienpoirou/herdr-plugin-manager/issues/14)) ([b807f55](https://github.com/julienpoirou/herdr-plugin-manager/commit/b807f55cfecfd5ec8b25e8a705b591f09bca7327))
+
 ## [0.4.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.4.0...v0.4.1) (2026-11-07)
 
 

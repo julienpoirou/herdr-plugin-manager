@@ -695,12 +695,12 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         let manifest_file = plugin_root.join(manifest::FILE_NAME);
         let on_disk = std::fs::read_to_string(&manifest_file)
             .with_context(|| format!("checkout has no {}", manifest_file.display()))?;
-        if on_disk != text {
+        if !same_text(&on_disk, &text) {
             bail!("checked-out manifest differs from the previewed one; aborting");
         }
         run_builds(&manifest, &plugin_root)?;
         let after = std::fs::read_to_string(&manifest_file).unwrap_or_default();
-        if after != text {
+        if !same_text(&after, &text) {
             bail!(
                 "a build step changed {} after the preview; aborting",
                 manifest::FILE_NAME
@@ -827,6 +827,12 @@ fn past(mode: Mode) -> &'static str {
         Mode::Update => "updated",
         Mode::Switch => "switched",
     }
+}
+
+/// The manifest as reviewed and as checked out may differ only in line
+/// endings (an `eol=crlf` attribute in the repository).
+fn same_text(a: &str, b: &str) -> bool {
+    a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
 }
 
 fn log_change(

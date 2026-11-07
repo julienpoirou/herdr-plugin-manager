@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.5.0...v0.5.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* **market:** Keep the star icon off the star count ([#16](https://github.com/julienpoirou/herdr-plugin-manager/issues/16)) ([3649b5b](https://github.com/julienpoirou/herdr-plugin-manager/commit/3649b5b43c3e49f31241e071f6fff1a330e02afc))
+
 ## [0.5.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.4.1...v0.5.0) (2026-11-07)
 
 

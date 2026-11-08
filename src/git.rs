@@ -512,6 +512,40 @@ fn version_key(name: &str) -> Option<(Vec<u64>, bool)> {
     Some((numbers, end < rest.len()))
 }
 
+fn cmp_versions(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    (0..a.len().max(b.len()))
+        .map(|i| a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)))
+        .find(|o| o.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The newest release tag above `current` whose first `same` numbers match
+/// it: 0 allows any newer release, 1 keeps the major version, 2 the minor.
+/// Pre-releases are skipped. `tags` comes from `parse_tags`.
+pub fn newest_release<'a>(
+    tags: &'a [RemoteTag],
+    current: &str,
+    same: usize,
+) -> Option<&'a RemoteTag> {
+    let current = version_key(current).map(|(numbers, _)| numbers);
+    if current.is_none() && same > 0 {
+        return None;
+    }
+    tags.iter().find(|tag| {
+        let Some((numbers, false)) = version_key(&tag.name) else {
+            return false;
+        };
+        match &current {
+            None => true,
+            Some(current) => {
+                cmp_versions(&numbers, current).is_gt()
+                    && (0..same)
+                        .all(|i| numbers.get(i).unwrap_or(&0) == current.get(i).unwrap_or(&0))
+            }
+        }
+    })
+}
+
 /// Tags from `git ls-remote --tags`, versions first (highest first, a
 /// release before its pre-releases), then other names in reverse order.
 pub fn parse_tags(out: &str) -> Vec<RemoteTag> {
@@ -594,6 +628,35 @@ ffffffffffffffffffffffffffffffffffffffff\trefs/tags/0.9
             ["v1.10.0", "v1.10.0-rc.1", "v1.2.0", "0.9", "nightly"]
         );
         assert_eq!(tags[2].commit, "b".repeat(40));
+    }
+
+    #[test]
+    fn release_strategies_pick_the_allowed_newest_tag() {
+        let tag = |name: &str| RemoteTag {
+            name: name.into(),
+            commit: String::new(),
+        };
+        // parse_tags order: highest first, a release before its pre-releases.
+        let tags = [
+            tag("v3.0.0-rc.1"),
+            tag("v2.1.0"),
+            tag("v2.0.1"),
+            tag("v1.4.2"),
+            tag("v1.4"),
+            tag("v1.3.9"),
+            tag("nightly"),
+        ];
+        let pick = |current: &str, same: usize| {
+            newest_release(&tags, current, same).map(|t| t.name.as_str())
+        };
+        assert_eq!(pick("1.3.9", 0), Some("v2.1.0"));
+        assert_eq!(pick("1.3.9", 1), Some("v1.4.2"));
+        assert_eq!(pick("1.3.9", 2), None);
+        assert_eq!(pick("1.4.0", 2), Some("v1.4.2"));
+        assert_eq!(pick("v1.4", 2), Some("v1.4.2"));
+        assert_eq!(pick("2.1.0", 0), None);
+        assert_eq!(pick("main", 0), Some("v2.1.0"));
+        assert_eq!(pick("main", 1), None);
     }
 
     #[test]

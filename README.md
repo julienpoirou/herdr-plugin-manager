@@ -29,7 +29,7 @@ other transports without asking a forge API for a checkout:
 | Reviewed execution | Resolved commit and every build/startup/action/event/pane command are shown before confirmation |
 | Version history | Separate installations, rollback, pin/unpin and branch/tag/commit switching |
 | Update context | New commits and changes to the executable surface, not only a version bump |
-| Discovery | The full herdr.dev catalog, GitHub/GHE topic search, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
+| Discovery | herdr.dev, gitlab.com and codeberg.org built in; GitHub/GHE topic search, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
 | Reproducibility | JSON export/import at exact exported commits |
 | Operations | Enable/disable (including offline), uninstall, history, doctor, dry-run |
 
@@ -174,7 +174,7 @@ action.
 | State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
-| Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
+| Other | `o` open homepage, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
 
 Install, update (one or all), removal, rollback, pinning another version and
 switching run inside the popup. The trust preview appears as a dialog (`y`
@@ -199,11 +199,12 @@ GitHub-installed plugins are pinned in the manager's `registry.json`, because
 Herdr only changes the ref it follows by reinstalling. `u`, `U` and auto-update
 respect the pin; a `herdr plugin update` run outside the manager does not.
 
-`x` asks what to do: `u` removes the plugin (a local link is only unlinked),
-`d` deletes it completely: installations, Herdr's leftover GitHub checkouts, the
-plugin's config directory, the cached repository (unless another plugin uses
+`x` asks what to do: `u` removes the plugin (a local link is only unlinked)
+and keeps its config and data for a reinstall; `d` deletes it completely:
+installations, Herdr's GitHub checkouts and their lock files, the plugin's
+config and data directories, the cached repository (unless another plugin uses
 it), its auto-update and pin settings, and a local link's directory, after you
-type the plugin id.
+type the plugin id. Nothing is left for `X` afterwards.
 
 `X` lists the plugins removed earlier that left something behind, whichever
 way they were removed, with the size and kind of what remains: config and
@@ -220,6 +221,27 @@ updates every GitHub- or git-installed plugin with the switch on, **without the
 trust preview**, disabled plugins included. Pinned plugins stay where they are;
 local links cannot use it. Turn it on only for repositories you trust to run new
 commands unattended.
+
+Where it moves a plugin depends on the strategy:
+
+| Strategy | Moves to |
+|---|---|
+| `latest` (default) | the newest commit of the branch or tag the plugin follows |
+| `release` | the newest version tag (`v2.0.0`), skipping untagged commits and pre-releases |
+| `minor` | the newest version tag with the same major version (`1.3.0` → `1.9.2`, not `2.0.0`) |
+| `patch` | the newest version tag with the same minor version (`1.3.0` → `1.3.4`) |
+
+```toml
+[auto_update]
+strategy = "release"
+
+[auto_update.plugins]
+"examples.agent-telegram-notify" = "patch"
+```
+
+With a tag strategy a git-installed plugin keeps following its branch (`u`
+still offers the newest commit); a GitHub-installed plugin is reinstalled at
+the tag, which Herdr then follows until `p` → `latest (unpin)`.
 
 ## CLI
 
@@ -247,22 +269,32 @@ them.
 
 ## Configuration
 
-`herdr-pm config init` creates a commented `config.toml` in the plugin's Herdr
-config directory.
+`herdr-pm config init` creates `config.toml` in the plugin's Herdr config
+directory; `C` opens it. Every key is optional:
 
 ```toml
-keep_installs = 3        # previous installations retained for rollback
-market_ttl = 600         # seconds a marketplace listing counts as fresh
-check_concurrency = 6    # parallel background update checks
+keep_installs = 3       # versions kept for rollback
+market_ttl = 600        # seconds before the marketplace is refreshed
+check_concurrency = 6   # parallel update checks in the popup
+use_gh_cli = true       # use `gh auth token` for GitHub
+editor = "code --wait"  # for c/C (VISUAL, EDITOR, then vi/notepad otherwise)
+
+[auto_update]
+strategy = "latest"     # latest, release, minor or patch
+
+[auto_update.plugins]
+"some.plugin" = "patch"
 
 [aliases]
 corp = "ssh://git@git.corp.example/"
 lab = "https://gitlab.corp.example/{path}.git"
+```
 
-[[marketplace]]
-name = "herdr.dev"
-kind = "herdr"                # the official herdr.dev/plugins index (default)
+herdr.dev, gitlab.com and codeberg.org are built in. A `[[marketplace]]`
+block adds a source; one named like a built-in replaces it, so
+`name = "codeberg.org"` with `enabled = false` hides it.
 
+```toml
 [[marketplace]]
 name = "ghe"
 kind = "github"
@@ -295,9 +327,10 @@ kind = "index"
 url = "https://intranet.corp.example/herdr-index.json"
 ```
 
-The default `herdr` source downloads the catalog behind herdr.dev/plugins
-(every public GitHub repository tagged `herdr-plugin`, one entry per
-manifest, monorepo plugins included). Every source except `github` lists its
+The `herdr.dev` source downloads the catalog behind herdr.dev/plugins (every
+public GitHub repository tagged `herdr-plugin`, one entry per manifest,
+monorepo plugins included); `gitlab.com` and `codeberg.org` list the
+projects tagged `herdr-plugin` there. Every source except `github` lists its
 whole catalog once; searching filters the cached copy locally. The popup shows
 the cached marketplace immediately at any age, refreshes it in the background
 once it is older than `market_ttl`, and reports what changed (`r` forces a
@@ -380,7 +413,7 @@ Gitea/Forgejo, un dépôt nu, `git daemon` ou un chemin local. Le binaire
 Ses fonctions principales sont les monorepos (`depot.git//plugins/outil`), les
 alias de serveurs, l'aperçu des commandes avant confirmation, les diffs de
 mise à jour, les installations indépendantes avec rollback, pin/unpin/switch,
-plusieurs marketplaces, les index JSON hébergés dans Git, l'export/import aux
+marketplaces (herdr.dev, gitlab.com et codeberg.org par défaut), les index JSON hébergés dans Git, l'export/import aux
 commits exacts, `doctor`, l'historique et le mode hors ligne.
 
 ```sh
@@ -392,12 +425,16 @@ herdr-pm install /srv/git/mono.git//plugins/foo --ref v1.4.0
 Raccourci conseillé : `prefix+m` avec la commande
 `herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
 fonctionne aussi : molette, clic sur une ligne ou sur un onglet. `herdr-pm config
-init` crée une configuration commentée et `?` affiche l'aide du popup.
+init` crée la configuration et `?` affiche l'aide du popup.
 
 **Mise à jour automatique** : `A` dans « Installed » l'active ou la désactive
 pour un plugin, qu'il soit activé ou non (`⟳` dans la liste). Au démarrage de
 Herdr, `herdr-pm auto-update` met ces plugins à jour **sans aperçu** ; les
 plugins épinglés ne bougent pas et les liens locaux ne sont pas concernés.
+La stratégie choisit la cible : `latest` (défaut, dernier commit), `release`
+(dernier tag de version), `minor` (même version majeure) ou `patch` (même
+version mineure), globalement dans `[auto_update]` ou par plugin dans
+`[auto_update.plugins]`.
 
 **Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
 `..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build

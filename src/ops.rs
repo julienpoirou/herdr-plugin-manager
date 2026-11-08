@@ -1422,8 +1422,9 @@ fn github_installation_root(plugin_root: &str) -> Option<PathBuf> {
 }
 
 /// What `uninstall --purge` deletes besides the installations it always
-/// removes: config directory, Herdr's leftover GitHub checkouts, the cached
-/// repository when no other plugin uses it, and a local link's directory.
+/// removes: config and data directories, Herdr's leftover GitHub checkouts
+/// and their lock files, the cached repository when no other plugin uses it,
+/// and a local link's directory.
 fn purge_targets(id: &str, row: Option<&Row>, record: Option<&Record>) -> Result<Vec<PathBuf>> {
     let mut targets = Vec::new();
     if let Some(row) = row {
@@ -1452,6 +1453,23 @@ fn purge_targets(id: &str, row: Option<&Row>, record: Option<&Record>) -> Result
         }
     }
     targets.push(paths::herdr_plugin_config_dir(id));
+    let component = paths::plugin_path_component(id);
+    targets.push(paths::herdr_state_dir().join("plugins").join(&component));
+    let herdr_plugins = paths::herdr_config_dir().join("plugins");
+    for checkout in dirs_in(&herdr_plugins.join("github-installations")) {
+        if checkout_id(&file_name(&checkout)) == component && !targets.contains(&checkout) {
+            targets.push(checkout);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(herdr_plugins.join(".locks")) {
+        for lock in entries.flatten().map(|e| e.path()) {
+            let name = file_name(&lock);
+            let stem = name.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
+            if stem.is_some_and(|s| checkout_id(s) == component) {
+                targets.push(lock);
+            }
+        }
+    }
     targets.retain(|p| p.exists());
     Ok(targets)
 }
@@ -1894,16 +1912,96 @@ pub fn set_auto_update(ctx: &Ctx, id: &str, on: bool) -> Result<()> {
 /// Callers pass a `ctx` with `yes`: nobody is there to review a preview.
 /// Pinned plugins stay where they are. Returns the number of failures.
 pub fn auto_update(ctx: &Ctx) -> Result<usize> {
-    let ids: Vec<String> = rows(&ctx.herdr)?
+    let rows: Vec<Row> = rows(&ctx.herdr)?
         .into_iter()
         .filter(|r| r.auto_update && r.origin != Origin::Local)
-        .map(|r| r.plugin.plugin_id)
         .collect();
-    if ids.is_empty() {
+    if rows.is_empty() {
         ctx.line("No plugin has auto-update turned on.");
         return Ok(0);
     }
-    update(ctx, &ids)
+    let strategies = &ctx.config.auto_update;
+    let (latest, tagged): (Vec<Row>, Vec<Row>) = rows.into_iter().partition(|r| {
+        strategies
+            .strategy_for(&r.plugin.plugin_id)
+            .same()
+            .is_none()
+    });
+    let mut failures = 0;
+    if !latest.is_empty() {
+        let ids: Vec<String> = latest.into_iter().map(|r| r.plugin.plugin_id).collect();
+        failures += update(ctx, &ids)?;
+    }
+    for row in &tagged {
+        let strategy = strategies.strategy_for(&row.plugin.plugin_id);
+        if let Err(err) = update_to_release(ctx, row, strategy) {
+            failures += 1;
+            ctx.line(format!("{} {}: {err:#}", red("✗"), row.plugin.plugin_id));
+        }
+    }
+    Ok(failures)
+}
+
+/// Moves a plugin to the newest version tag its strategy allows. A git
+/// plugin keeps following its branch; a GitHub plugin is reinstalled at the
+/// tag, which Herdr then follows.
+fn update_to_release(ctx: &Ctx, row: &Row, strategy: crate::config::Strategy) -> Result<()> {
+    let id = &row.plugin.plugin_id;
+    if row.pinned() {
+        ctx.line(format!("{} {id} is pinned (skipped)", dim("•")));
+        return Ok(());
+    }
+    ctx.step(&format!("checking {id} ({})", strategy.label()));
+    let tags = versions(row)?;
+    let installed = row.commit().unwrap_or("");
+    // The tag at the installed commit says more than the manifest version.
+    let current = tags
+        .iter()
+        .find(|t| t.commit.eq_ignore_ascii_case(installed))
+        .map_or(row.plugin.version.as_str(), |t| t.name.as_str());
+    let same = strategy.same().unwrap_or(0);
+    let Some(tag) = crate::git::newest_release(&tags, current, same)
+        .filter(|t| !t.commit.eq_ignore_ascii_case(installed))
+    else {
+        ctx.line(format!(
+            "{} {id} is up to date ({})",
+            green("✓"),
+            strategy.label()
+        ));
+        return Ok(());
+    };
+    if ctx.dry_run {
+        ctx.line(format!(
+            "{} {id}: {current} → {} available (dry run, nothing changed)",
+            yellow("↑"),
+            tag.name
+        ));
+        return Ok(());
+    }
+    match row.origin {
+        Origin::Git => {
+            let record = row.record.as_ref().unwrap();
+            install_git(
+                ctx,
+                GitRequest {
+                    url: record.url.clone(),
+                    subdir: record.subdir.clone(),
+                    checkout_ref: Some(tag.commit.clone()),
+                    follow_ref: Some(record.requested_ref.clone()),
+                    mode: Mode::Update,
+                    enabled: None,
+                    replace: false,
+                    expect_id: Some(id.clone()),
+                },
+            )?;
+        }
+        Origin::Github => {
+            let spec = row.plugin.source.github_spec().unwrap_or_default();
+            github_install(ctx, &spec, Some(&tag.name), Some(row), Mode::Update)?;
+        }
+        Origin::Local => {}
+    }
+    Ok(())
 }
 
 pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {

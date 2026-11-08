@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.12.0...v0.13.0) (2026-11-08)
+
+
+### Features
+
+* Show GitHub remotes as owner/repo/subdir and let the manager take itself over ([#39](https://github.com/julienpoirou/herdr-plugin-manager/issues/39)) ([8e352e0](https://github.com/julienpoirou/herdr-plugin-manager/commit/8e352e09887f52925bc6dd3b9f136a244424a9fa))
+
 ## [0.12.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.11.0...v0.12.0) (2026-11-08)
 
 

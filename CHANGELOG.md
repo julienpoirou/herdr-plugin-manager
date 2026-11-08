@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.9.0...v0.10.0) (2026-11-08)
+
+
+### Features
+
+* Auto-update strategies and gitlab.com/codeberg.org marketplaces ([#33](https://github.com/julienpoirou/herdr-plugin-manager/issues/33)) ([ea7c3cf](https://github.com/julienpoirou/herdr-plugin-manager/commit/ea7c3cfe4e4f62cc5c685b032d6dda1f5ed89e69))
+
+
+### Bug Fixes
+
+* Delete a plugin's data directory and Herdr lock files with x then d ([ea7c3cf](https://github.com/julienpoirou/herdr-plugin-manager/commit/ea7c3cfe4e4f62cc5c685b032d6dda1f5ed89e69))
+* **tui:** Spell out labels in the detail panels and the footer, label the description, drop the marketplace hint line and the L log listing ([ea7c3cf](https://github.com/julienpoirou/herdr-plugin-manager/commit/ea7c3cfe4e4f62cc5c685b032d6dda1f5ed89e69))
+
 ## [0.9.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.8.0...v0.9.0) (2026-11-08)
 
 

@@ -176,8 +176,6 @@ struct Task {
     progress: Option<(usize, usize)>,
     review: Option<Review>,
     show_log: bool,
-    /// Keep the dialog open after success (log listings).
-    hold: bool,
     done: Option<Result<(), String>>,
     /// `a` on a review approves the rest of a batch.
     batch: bool,
@@ -726,7 +724,6 @@ enum Job {
     Unpin(String),
     Switch(String, String),
     EditFile(std::path::PathBuf),
-    Logs(String),
     /// Delete what these removed plugins left behind.
     Clean(Vec<String>),
 }
@@ -764,58 +761,40 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         return Ok(());
     }
     let one = |id: &String| Some(vec![id.clone()]);
-    let (title, touched, batch, yes, hold): (String, Option<Vec<String>>, bool, bool, bool) =
-        match &job {
-            Job::Install(spec) => (format!("Installing {spec}"), None, false, false, false),
-            Job::InstallEntry(entry) => (
-                format!("Installing {}", entry.title),
-                None,
-                false,
-                false,
-                false,
-            ),
-            Job::Update(ids) if ids.len() == 1 => (
-                format!("Updating {}", ids[0]),
-                Some(ids.clone()),
-                false,
-                false,
-                false,
-            ),
-            Job::Update(ids) => (
-                format!("Updating {} plugins", ids.len()),
-                Some(ids.clone()),
-                true,
-                false,
-                false,
-            ),
-            Job::Uninstall(id, true) => (format!("Deleting {id}"), None, false, true, false),
-            Job::Uninstall(id, false) => (format!("Removing {id}"), None, false, true, false),
-            Job::Rollback(id) => (format!("Rolling back {id}"), one(id), false, false, false),
-            Job::PinTo(id, commit) => (
-                format!("Pinning {id} at {}", util::short_sha(commit)),
-                one(id),
-                false,
-                false,
-                false,
-            ),
-            Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false, false, false),
-            Job::Switch(id, r) => (
-                format!("Switching {id} to {r}"),
-                one(id),
-                false,
-                false,
-                false,
-            ),
-            Job::Logs(id) => (format!("Recent commands of {id}"), None, false, false, true),
-            Job::Clean(ids) => (
-                format!("Cleaning leftovers of {}", ids.join(", ")),
-                None,
-                false,
-                false,
-                false,
-            ),
-            Job::EditFile(_) => unreachable!(),
-        };
+    let (title, touched, batch, yes): (String, Option<Vec<String>>, bool, bool) = match &job {
+        Job::Install(spec) => (format!("Installing {spec}"), None, false, false),
+        Job::InstallEntry(entry) => (format!("Installing {}", entry.title), None, false, false),
+        Job::Update(ids) if ids.len() == 1 => (
+            format!("Updating {}", ids[0]),
+            Some(ids.clone()),
+            false,
+            false,
+        ),
+        Job::Update(ids) => (
+            format!("Updating {} plugins", ids.len()),
+            Some(ids.clone()),
+            true,
+            false,
+        ),
+        Job::Uninstall(id, true) => (format!("Deleting {id}"), None, false, true),
+        Job::Uninstall(id, false) => (format!("Removing {id}"), None, false, true),
+        Job::Rollback(id) => (format!("Rolling back {id}"), one(id), false, false),
+        Job::PinTo(id, commit) => (
+            format!("Pinning {id} at {}", util::short_sha(commit)),
+            one(id),
+            false,
+            false,
+        ),
+        Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false, false),
+        Job::Switch(id, r) => (format!("Switching {id} to {r}"), one(id), false, false),
+        Job::Clean(ids) => (
+            format!("Cleaning leftovers of {}", ids.join(", ")),
+            None,
+            false,
+            false,
+        ),
+        Job::EditFile(_) => unreachable!(),
+    };
     let run: Operation = match job {
         Job::Install(spec) => Box::new(move |ctx| {
             let request = parse_install(&spec, &ctx.config.aliases)?;
@@ -846,16 +825,9 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
         Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
         Job::Clean(ids) => Box::new(move |ctx| ops::clean(ctx, &ids)),
-        Job::Logs(id) => Box::new(move |ctx| {
-            let status = ctx.herdr.logs(&id, &|line| ctx.report.line(line))?;
-            if !status.success() {
-                anyhow::bail!("herdr plugin log list failed ({status})");
-            }
-            Ok(())
-        }),
         Job::EditFile(_) => unreachable!(),
     };
-    start_task(app, title, touched, batch, yes, hold, run);
+    start_task(app, title, touched, batch, yes, run);
     Ok(())
 }
 
@@ -932,7 +904,6 @@ fn start_task(
     touched: Option<Vec<String>>,
     batch: bool,
     yes: bool,
-    hold: bool,
     run: Operation,
 ) {
     let accept_all = Arc::new(AtomicBool::new(false));
@@ -959,8 +930,7 @@ fn start_task(
         log: Vec::new(),
         progress: None,
         review: None,
-        show_log: hold,
-        hold,
+        show_log: false,
         done: None,
         batch,
         accept_all,
@@ -985,7 +955,7 @@ fn task_event(app: &mut App, event: TaskEvent) {
         }
         TaskEvent::Review(review) => task.review = Some(review),
         TaskEvent::Progress(done, total) => task.progress = Some((done, total)),
-        TaskEvent::Done(Ok(())) if !task.hold => finish_task(app),
+        TaskEvent::Done(Ok(())) => finish_task(app),
         TaskEvent::Done(result) => {
             task.show_log = true;
             task.done = Some(result);
@@ -1422,7 +1392,6 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         }
         KeyCode::Char('c') => return Some(Job::EditFile(paths::herdr_plugins_json())),
         KeyCode::Char('C') => return Some(Job::EditFile(paths::pm_config_file())),
-        KeyCode::Char('L') => return Some(Job::Logs(id?)),
         KeyCode::Char('X') => {
             open_cleaner(app);
             return None;
@@ -1862,9 +1831,12 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Width of the labels in the detail panels (`description`, `auto-update`).
+const LABEL: usize = 11;
+
 fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:<8} "), muted()),
+        Span::styled(format!("{key:<LABEL$} "), muted()),
         Span::raw(util::sanitize(&value.into())),
     ])
 }
@@ -1909,23 +1881,32 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             lines.push(kv("ref", text));
+            let strategy = app
+                .ctx
+                .config
+                .auto_update
+                .strategy_for(&row.plugin.plugin_id);
             lines.push(kv(
-                "auto",
+                "auto-update",
                 if row.auto_update {
-                    "on: updated when Herdr starts (A turns it off)"
+                    format!(
+                        "on · {}: {} when Herdr starts (A turns it off)",
+                        strategy.label(),
+                        strategy.describe()
+                    )
                 } else {
-                    "off (A updates it when Herdr starts, enabled or not)"
+                    "off (A turns it on)".to_string()
                 },
             ));
         }
     }
     match app.checks.get(&row.plugin.plugin_id) {
         Some(Check::Done(Status::Error { message })) => lines.push(Line::from(vec![
-            Span::styled("check    ", muted()),
+            Span::styled(format!("{:<LABEL$} ", "check"), muted()),
             Span::styled(util::sanitize(message), Style::default().fg(BAD)),
         ])),
         Some(Check::Done(Status::Available { commit, version })) => lines.push(Line::from(vec![
-            Span::styled("update   ", muted()),
+            Span::styled(format!("{:<LABEL$} ", "update"), muted()),
             Span::styled(
                 format!(
                     "{} → {} ({}) — press u",
@@ -1938,8 +1919,13 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
         ])),
         _ => {}
     }
-    if let Some(d) = &row.plugin.description {
-        lines.push(Line::styled(util::sanitize(d), muted()));
+    if let Some(d) = row
+        .plugin
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+    {
+        lines.push(kv("description", d));
     }
     for w in &row.plugin.warnings {
         lines.push(Line::styled(
@@ -2091,6 +2077,9 @@ fn draw_market_detail(f: &mut Frame, app: &App, area: Rect) {
             head.push(Span::styled(format!("  ({})", util::sanitize(id)), muted()));
         }
         lines.push(Line::from(head));
+        if !entry.description.trim().is_empty() {
+            lines.push(kv("description", entry.description.clone()));
+        }
         lines.push(kv(
             "install",
             format!("herdr-pm install {}", entry.install_spec()),
@@ -2109,19 +2098,17 @@ fn draw_market_detail(f: &mut Frame, app: &App, area: Rect) {
             lines.push(kv("info", meta.join(" · ")));
         }
         if let Some(row) = app.entry_installed(entry) {
-            lines.push(Line::styled(
-                format!(
-                    "installed as {} {}",
-                    util::sanitize(&row.plugin.plugin_id),
-                    util::sanitize(&row.plugin.version)
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<LABEL$} ", "installed"), muted()),
+                Span::styled(
+                    format!(
+                        "{} {}",
+                        util::sanitize(&row.plugin.plugin_id),
+                        util::sanitize(&row.plugin.version)
+                    ),
+                    Style::default().fg(OK),
                 ),
-                Style::default().fg(OK),
-            ));
-        } else {
-            lines.push(Line::styled(
-                "Enter installs after a preview of everything it runs. Listings are not reviewed.",
-                muted(),
-            ));
+            ]));
         }
     }
     f.render_widget(
@@ -2175,11 +2162,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         View::Installed => &[
             ("u", "update"),
             ("U", "update all"),
-            ("e", "toggle"),
+            ("e", "enable/disable"),
             ("A", "auto-update"),
             ("x", "remove"),
             ("i", "install"),
-            ("m", "market"),
+            ("m", "marketplace"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -2338,7 +2325,6 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         key("s", "switch to another branch, tag or commit"),
         key("z", "roll back to the previous installation"),
         key("o", "open the source in a browser"),
-        key("L", "recent commands herdr ran for the plugin"),
         key("c", "edit plugins.json"),
         key("C", "edit this manager's config"),
         key("/", "filter the list"),

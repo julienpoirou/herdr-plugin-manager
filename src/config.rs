@@ -111,6 +111,70 @@ fn default_concurrency() -> usize {
     6
 }
 
+/// Where an auto-update moves a plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Strategy {
+    /// Newest commit of the branch or tag the plugin follows.
+    #[default]
+    Latest,
+    /// Newest version tag.
+    Release,
+    /// Newest version tag with the same major version.
+    Minor,
+    /// Newest version tag with the same major and minor version.
+    Patch,
+}
+
+impl Strategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Strategy::Latest => "latest",
+            Strategy::Release => "release",
+            Strategy::Minor => "minor",
+            Strategy::Patch => "patch",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Strategy::Latest => "newest commit",
+            Strategy::Release => "newest version tag",
+            Strategy::Minor => "newest tag of the same major version",
+            Strategy::Patch => "newest tag of the same minor version",
+        }
+    }
+
+    /// How many leading version numbers must stay the same (tag strategies).
+    pub fn same(self) -> Option<usize> {
+        match self {
+            Strategy::Latest => None,
+            Strategy::Release => Some(0),
+            Strategy::Minor => Some(1),
+            Strategy::Patch => Some(2),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoUpdate {
+    #[serde(default)]
+    pub strategy: Strategy,
+    /// Per-plugin strategies, by plugin id.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, Strategy>,
+}
+
+impl AutoUpdate {
+    pub fn strategy_for(&self, plugin_id: &str) -> Strategy {
+        self.plugins
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(self.strategy)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -134,15 +198,19 @@ pub struct Config {
     /// Editor for the `c` key (falls back to VISUAL, EDITOR, then vi/notepad).
     #[serde(default)]
     pub editor: Option<String>,
-    #[serde(default = "default_markets")]
+    #[serde(default)]
+    pub auto_update: AutoUpdate,
+    /// Sources added to the built-in ones (`builtin_markets`); one with the
+    /// name of a built-in source replaces it.
+    #[serde(default)]
     pub marketplace: Vec<MarketSource>,
 }
 
-fn default_markets() -> Vec<MarketSource> {
-    vec![MarketSource {
-        name: "herdr.dev".into(),
-        kind: MarketKind::Herdr,
-        url: None,
+fn market(name: &str, kind: MarketKind, url: Option<&str>) -> MarketSource {
+    MarketSource {
+        name: name.into(),
+        kind,
+        url: url.map(str::to_string),
         topic: default_topic(),
         path: None,
         git_ref: None,
@@ -152,7 +220,21 @@ fn default_markets() -> Vec<MarketSource> {
         clone: CloneProtocol::Https,
         max: default_max(),
         enabled: true,
-    }]
+    }
+}
+
+/// herdr.dev, gitlab.com and codeberg.org, searched by the `herdr-plugin`
+/// topic.
+pub fn builtin_markets() -> Vec<MarketSource> {
+    vec![
+        market("herdr.dev", MarketKind::Herdr, None),
+        market("gitlab.com", MarketKind::Gitlab, Some("https://gitlab.com")),
+        market(
+            "codeberg.org",
+            MarketKind::Gitea,
+            Some("https://codeberg.org"),
+        ),
+    ]
 }
 
 impl Default for Config {
@@ -164,75 +246,48 @@ impl Default for Config {
             check_concurrency: default_concurrency(),
             use_gh_cli: true,
             editor: None,
-            marketplace: default_markets(),
+            auto_update: AutoUpdate::default(),
+            marketplace: Vec::new(),
         }
+        .with_builtin_markets()
     }
 }
 
-pub const EXAMPLE: &str = r#"# Herdr Plugin Manager configuration.
-# Location: `herdr plugin config-dir herdr-plugin-manager`/config.toml
+pub const EXAMPLE: &str = r#"keep_installs = 3   # versions kept for rollback
+market_ttl = 600    # seconds
 
-# Previous installations kept per plugin, for `herdr-pm rollback`.
-keep_installs = 3
+[auto_update]
+strategy = "latest" # latest, release, minor or patch
 
-# Seconds a marketplace listing counts as fresh. The popup shows the cached
-# listing at any age and refreshes it in the background once it is older;
-# r forces a refresh.
-market_ttl = 600
+[auto_update.plugins]
+# "examples.agent-telegram-notify" = "patch"
 
-# Short names for your git servers. With these,
-#   herdr-pm install corp:tools/herdr-notify
-# clones ssh://git@git.corp.local/tools/herdr-notify
 [aliases]
 # corp = "ssh://git@git.corp.local/"
-# lab  = "https://gitlab.lab.local/{path}.git"
 
-# Marketplace sources, shown together in the popup (m) and `herdr-pm search`.
-# Remove the herdr.dev block to browse only your own servers.
-
-[[marketplace]]
-name = "herdr.dev"
-kind = "herdr"             # the official index behind herdr.dev/plugins
-
-# GitHub topic search: GitHub Enterprise (url = the API root) or another topic.
-# The search API returns at most 1000 repositories.
-# [[marketplace]]
-# name = "ghe"
-# kind = "github"
-# url = "https://ghe.corp.local/api/v3"
-# topic = "herdr-plugin"
-
-# Gitea / Forgejo: repositories tagged with the topic.
+# herdr.dev, gitlab.com and codeberg.org are built in.
 # [[marketplace]]
 # name = "corp"
-# kind = "gitea"
+# kind = "gitea"    # github, gitea, gitlab, index or git-index
 # url = "https://git.corp.local"
-# token_env = "CORP_GITEA_TOKEN"   # only needed for private repositories
-# clone = "ssh"                    # install over ssh instead of https
-
-# GitLab (self-managed or gitlab.com).
-# [[marketplace]]
-# name = "lab"
-# kind = "gitlab"
-# url = "https://gitlab.lab.local"
-# token_cmd = ["pass", "show", "gitlab/token"]
-
-# Plain git server, no web API: point at a repository holding an index file
-# produced by `herdr-pm index build` (run it from cron or CI).
-# [[marketplace]]
-# name = "internal"
-# kind = "git-index"
-# url = "ssh://git@git.internal/herdr/index.git"
-# path = "herdr-index.json"
-
-# Static index over http(s) or from a shared folder.
-# [[marketplace]]
-# name = "team"
-# kind = "index"
-# url = "https://intranet.example/herdr-index.json"
+# token_env = "CORP_TOKEN"
 "#;
 
 impl Config {
+    /// Built-in sources first, replaced by user sources of the same name,
+    /// then the user's other sources.
+    fn with_builtin_markets(mut self) -> Self {
+        let mut user = std::mem::take(&mut self.marketplace);
+        for builtin in builtin_markets() {
+            match user.iter().position(|s| s.name == builtin.name) {
+                Some(i) => self.marketplace.push(user.remove(i)),
+                None => self.marketplace.push(builtin),
+            }
+        }
+        self.marketplace.append(&mut user);
+        self
+    }
+
     pub fn path() -> PathBuf {
         paths::pm_config_file()
     }
@@ -246,8 +301,12 @@ impl Config {
                 return Err(err).with_context(|| format!("could not read {}", path.display()))
             }
         };
-        let config: Config =
-            toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
+        Config::parse(&text).with_context(|| format!("invalid config {}", path.display()))
+    }
+
+    /// Parses and checks a config file's text, built-in sources included.
+    pub fn parse(text: &str) -> Result<Config> {
+        let config = toml::from_str::<Config>(text)?.with_builtin_markets();
         config.check()?;
         Ok(config)
     }
@@ -344,10 +403,34 @@ mod tests {
 
     #[test]
     fn example_config_parses() {
-        let config: Config = toml::from_str(EXAMPLE).unwrap();
-        config.check().unwrap();
-        assert_eq!(config.marketplace.len(), 1);
+        let config = Config::parse(EXAMPLE).unwrap();
+        let names: Vec<&str> = config.marketplace.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["herdr.dev", "gitlab.com", "codeberg.org"]);
         assert_eq!(config.keep_installs, 3);
+        assert_eq!(config.auto_update.strategy, Strategy::Latest);
+    }
+
+    #[test]
+    fn user_sources_replace_builtins_by_name() {
+        let config = Config::parse(
+            "[[marketplace]]\nname = \"corp\"\nkind = \"gitea\"\nurl = \"https://git.corp\"\n\n\
+             [[marketplace]]\nname = \"codeberg.org\"\nenabled = false\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = config.marketplace.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["herdr.dev", "gitlab.com", "codeberg.org", "corp"]);
+        assert!(!config.marketplace[2].enabled);
+    }
+
+    #[test]
+    fn per_plugin_strategy_overrides_the_default() {
+        let config = Config::parse(
+            "[auto_update]\nstrategy = \"release\"\n[auto_update.plugins]\n\"a.b\" = \"patch\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.auto_update.strategy_for("a.b"), Strategy::Patch);
+        assert_eq!(config.auto_update.strategy_for("c.d"), Strategy::Release);
+        assert!(Config::parse("[auto_update]\nstrategy = \"nightly\"\n").is_err());
     }
 
     #[test]

@@ -410,16 +410,6 @@ impl Herdr {
     ) -> Result<ExitStatus> {
         self.quiet(&["plugin", "update", plugin_id, "--yes"], on_line)
     }
-
-    /// Recent commands Herdr ran for a plugin.
-    pub fn logs(&self, plugin_id: &str, on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
-        let mut command = self.command();
-        command.args([
-            "plugin", "log", "list", "--plugin", plugin_id, "--limit", "20",
-        ]);
-        util::stream_command(&mut command, on_line)
-            .with_context(|| format!("could not run {}", self.bin.display()))
-    }
 }
 
 #[cfg(unix)]

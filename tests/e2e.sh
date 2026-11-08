@@ -234,8 +234,23 @@ srv = "$SRV/"
 name = "e2e"
 kind = "git-index"
 url = "$SRV/team/index.git"
+
+[[marketplace]]
+name = "herdr.dev"
+enabled = false
+
+[[marketplace]]
+name = "gitlab.com"
+enabled = false
+
+[[marketplace]]
+name = "codeberg.org"
+enabled = false
 EOF
+out="$("$HPM" sources)"
+contains "$out" "e2e"
 out="$("$HPM" search)"
+if printf '%s' "$out" | grep -q "herdr.dev\|gitlab.com\|codeberg.org"; then fail "a disabled built-in source was searched"; fi
 contains "$out" "herdr-pm install file://$SRV/team/mono.git//plugins/b"
 ok "git-index marketplace lists monorepo plugins with subdirs"
 out="$("$HPM" search B --json)"

@@ -196,6 +196,10 @@ pub fn history_file() -> PathBuf {
     pm_home().join("history.jsonl")
 }
 
+pub fn history_ecs_file() -> PathBuf {
+    pm_home().join("history.ecs.ndjson")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

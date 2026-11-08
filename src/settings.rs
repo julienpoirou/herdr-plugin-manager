@@ -4,7 +4,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
-use crate::config::{builtin_markets, Config, Strategy, Trigger};
+use crate::config::{builtin_markets, Config, HistoryFormat, Strategy, Trigger};
+
+const HISTORY: [HistoryFormat; 3] = [HistoryFormat::Jsonl, HistoryFormat::Ecs, HistoryFormat::Off];
 
 const STRATEGIES: [Strategy; 4] = [
     Strategy::Latest,
@@ -28,6 +30,8 @@ pub enum Field {
     UseGhCli,
     GithubViaGit,
     Logos,
+    /// Format of the change log.
+    History,
     Editor,
     Strategy,
     Trigger,
@@ -65,7 +69,9 @@ impl Field {
             | Field::Market(_)
             | Field::CliOnPath
             | Field::AgentSkill => Kind::Toggle,
-            Field::Strategy | Field::Trigger | Field::PluginStrategy(_) => Kind::Choice,
+            Field::Strategy | Field::Trigger | Field::History | Field::PluginStrategy(_) => {
+                Kind::Choice
+            }
             Field::Editor | Field::MinInterval => Kind::Text,
             Field::Alias(_) => Kind::Alias,
             Field::AddAlias => Kind::AddAlias,
@@ -170,6 +176,16 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
                 "off".to_string()
             },
             Field::Logos,
+        ),
+        row(
+            "General",
+            "history",
+            match config.history {
+                HistoryFormat::Jsonl => "jsonl: history.jsonl".to_string(),
+                HistoryFormat::Ecs => "ecs: history.ecs.ndjson (Elastic Common Schema)".to_string(),
+                HistoryFormat::Off => "off: changes are not logged".to_string(),
+            },
+            Field::History,
         ),
         row(
             "General",
@@ -427,6 +443,10 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
         Field::UseGhCli => put(&mut doc["use_gh_cli"], !config.use_gh_cli),
         Field::GithubViaGit => put(&mut doc["github_via_git"], !config.github_via_git),
         Field::Logos => put(&mut doc["logos"], flag(action, config.logos)),
+        Field::History => put(
+            &mut doc["history"],
+            cycle(&HISTORY, config.history, action).label(),
+        ),
         Field::Trigger => {
             let next = cycle(&TRIGGERS, config.auto_update.trigger, action);
             put(
@@ -530,6 +550,19 @@ mod tests {
 
     fn apply(text: &str, field: Field, action: Action) -> String {
         change(text, &field, &action).unwrap()
+    }
+
+    #[test]
+    fn history_cycles_formats_and_can_be_disabled() {
+        let text = apply("", Field::History, Action::Next);
+        assert_eq!(Config::parse(&text).unwrap().history, HistoryFormat::Ecs);
+        let text = apply(&text, Field::History, Action::Next);
+        assert_eq!(Config::parse(&text).unwrap().history, HistoryFormat::Off);
+        let text = apply(&text, Field::History, Action::Next);
+        assert_eq!(Config::parse(&text).unwrap().history, HistoryFormat::Jsonl);
+        let text = apply(&text, Field::History, Action::Prev);
+        assert_eq!(Config::parse(&text).unwrap().history, HistoryFormat::Off);
+        assert!(Config::parse("history = \"unknown\"").is_err());
     }
 
     #[test]

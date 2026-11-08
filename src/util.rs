@@ -184,6 +184,18 @@ pub fn format_unix(ts: u64) -> String {
     )
 }
 
+/// `2026-10-25T14:03:09Z`
+pub fn format_iso8601(ts: u64) -> String {
+    let (y, m, d) = civil_from_days((ts / 86_400) as i64);
+    let secs = ts % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Parses the ISO 8601 timestamps forges return (`2026-10-08T12:34:56Z`,
 /// `2026-10-08T12:34:56.123+02:00`). Returns unix seconds.
 pub fn parse_iso8601(value: &str) -> Option<u64> {
@@ -539,6 +551,8 @@ mod tests {
     fn iso_dates_roundtrip() {
         let ts = parse_iso8601("2026-10-08T12:34:56Z").unwrap();
         assert_eq!(format_unix(ts), "2026-10-08 12:34 UTC");
+        assert_eq!(format_iso8601(ts), "2026-10-08T12:34:56Z");
+        assert_eq!(parse_iso8601(&format_iso8601(ts)), Some(ts));
         let with_offset = parse_iso8601("2026-10-08T14:34:56.123+02:00").unwrap();
         assert_eq!(with_offset, ts);
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));

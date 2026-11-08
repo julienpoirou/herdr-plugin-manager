@@ -30,9 +30,14 @@ to Herdr itself. If `herdr-pm` is not found, tell the user to turn on
 | One plugin | `herdr-pm info <id> --json` |
 | Find plugins | `herdr-pm search <words> --json` (`--source herdr.dev\|gitlab.com\|codeberg.org`, `--sort stars\|updated\|name`) |
 | Marketplaces | `herdr-pm sources` |
-| Past changes | `herdr-pm history [id]` |
+| Past changes | `herdr-pm logs [id] --format jsonl [--limit N]` (`history` is an alias) |
+| Live changes | `herdr-pm logs [id] -f --format jsonl` (`--follow`; stop when finished) |
 | Health | `herdr-pm doctor` |
 | Config | `herdr-pm config show`, `herdr-pm config path` |
+
+`logs --format ecs` emits Elastic Common Schema documents. Settings (`C`)
+or `history = "jsonl" | "ecs" | "off"` in config select how new changes
+are recorded, not the stdout format. Off preserves existing records.
 
 ## Change (preview with `--dry-run --yes` first)
 

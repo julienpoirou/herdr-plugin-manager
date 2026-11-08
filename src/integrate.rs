@@ -355,8 +355,8 @@ fn strip_block(text: &str) -> String {
 // ---------------------------------------------------------------- plans
 
 /// What enabling (or disabling) `herdr-pm` on PATH does, for the
-/// confirmation dialog.
-pub fn cli_plan(on: bool) -> Result<Vec<String>> {
+/// confirmation dialog. `skill_on`: the agent skill, which needs it.
+pub fn cli_plan(on: bool, skill_on: bool) -> Result<Vec<String>> {
     let link = cli_link()?;
     let dir = cli_dir()?;
     Ok(if on {
@@ -368,10 +368,19 @@ pub fn cli_plan(on: bool) -> Result<Vec<String>> {
             "New terminals find herdr-pm; open ones keep their PATH.".into(),
         ]
     } else {
-        vec![
+        let mut lines = vec![
             format!("Remove {}", link.display()),
             format!("and take {} out of your user PATH.", dir.display()),
-        ]
+        ];
+        if skill_on {
+            lines.push("Agents need herdr-pm, so the agent skill goes off too:".into());
+            lines.extend(
+                skill_plan(false, true)?
+                    .into_iter()
+                    .map(|l| format!("  {l}")),
+            );
+        }
+        lines
     })
 }
 
@@ -399,7 +408,7 @@ pub fn skill_plan(on: bool, cli_on: bool) -> Result<Vec<String>> {
     }
     if on && !cli_on {
         lines.push("Agents run herdr-pm, so it also goes on your PATH:".into());
-        lines.extend(cli_plan(true)?.into_iter().map(|l| format!("  {l}")));
+        lines.extend(cli_plan(true, false)?.into_iter().map(|l| format!("  {l}")));
     }
     Ok(lines)
 }

@@ -2416,11 +2416,13 @@ impl crate::integrate::Steps for ReportSteps<'_> {
 }
 
 /// Puts `herdr-pm` on the user's PATH (a link to the current installation,
-/// moved after updates) or takes it off, and records `cli_on_path`.
+/// moved after updates) or takes it off, and records `cli_on_path`. Taking
+/// it off also turns the agent skill off, since agents run `herdr-pm`.
 pub fn set_cli_on_path(ctx: &Ctx, on: bool) -> Result<()> {
     use crate::settings::{self, Action, Field};
+    let skill_on = ctx.config.agent_skill;
     if ctx.dry_run {
-        for line in crate::integrate::cli_plan(on)? {
+        for line in crate::integrate::cli_plan(on, skill_on)? {
             ctx.line(format!("[dry-run] {line}"));
         }
         return Ok(());
@@ -2429,6 +2431,11 @@ pub fn set_cli_on_path(ctx: &Ctx, on: bool) -> Result<()> {
     if on {
         crate::integrate::enable_cli(&ctx.herdr, &steps)?;
     } else {
+        if skill_on {
+            crate::integrate::disable_skill(&steps)?;
+            settings::write(&Field::AgentSkill, &Action::Set("false".into()))?;
+            ctx.line("The agent skill is unlinked: agents need herdr-pm on PATH.");
+        }
         crate::integrate::disable_cli(&steps)?;
     }
     settings::write(&Field::CliOnPath, &Action::Set(on.to_string()))?;

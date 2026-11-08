@@ -316,7 +316,8 @@ herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
 herdr-pm clean [ids…] [-y]     delete leftovers of removed plugins
 herdr-pm auto-update [enable|disable <id>] [--hook startup|event]
 herdr-pm take-over <id> [-y]   move a Herdr GitHub install to the Git pipeline
-herdr-pm info <id> [--json]    herdr-pm history [id]
+herdr-pm info <id> [--json]
+herdr-pm logs [id] [--limit N] [--format text|jsonl|ecs] [-f|--follow]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]
 herdr-pm unpin <id> [ref]      herdr-pm switch <id> <ref>
 herdr-pm search [words…] [--source S] [--sort stars|updated|name] [--refresh] [--json]
@@ -332,6 +333,43 @@ herdr-pm --skill               print the agent skill
 Global `--dry-run` (or `HERDR_PM_DRY_RUN=1`) reports changes without applying
 them.
 
+### Logs
+
+`herdr-pm logs` shows the last 30 manager changes, oldest first. `history`
+remains an alias. These are install/update/pin/removal records, not the
+command-output logs from `herdr plugin log`.
+
+```sh
+herdr-pm logs
+herdr-pm logs demo.plugin --limit 100
+herdr-pm logs -f                       # or --follow; Ctrl+C stops it
+herdr-pm logs --format jsonl           # one native JSON object per line
+herdr-pm logs --format ecs --follow    # one ECS JSON document per line
+herdr-pm logs -f --limit 0             # only new changes
+```
+
+In `C` → Settings → General → `history`, use Enter or left/right to select
+`jsonl` (default), `ecs`, or `off`. This controls **new records on disk**:
+`history.jsonl` for native fields, `history.ecs.ndjson` for Elastic Common
+Schema 8.11.0, or no writes. Turning it off does not delete old records.
+Changing formats keeps both files readable; `logs` merges their history and
+follows appends to either file, including a format change while it runs.
+The `--format` option controls stdout independently of this setting.
+
+ECS records contain `@timestamp` in UTC, `event.action`, `event.outcome`,
+`event.category: ["package"]`, `package.name`, and `package.reference` when
+a destination commit is known. Original source, before/after commits and
+details live under `herdr_plugin_manager`; failed records also have
+`error.message`. Host/user names come from the emitting process's environment
+when available; converting old native records cannot recover their original
+host or user.
+
+Point an Elastic Agent/Filebeat NDJSON input or a Wazuh agent JSON
+`localfile` input at the selected file. Collection configuration and Wazuh
+alert rules remain external; these integrations are not installed by the
+manager.
+
+
 ## Configuration
 
 `herdr-pm config init` creates `config.toml` in the plugin's Herdr config
@@ -345,6 +383,7 @@ check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
 github_via_git = true   # owner/repo through the Git pipeline, not Herdr's installer
 logos = true            # pictures where the terminal draws images
+history = "jsonl"       # jsonl (default), ecs or off
 cli_on_path = false     # herdr-pm on your PATH (asks in C)
 agent_skill = false     # the herdr-pm skill for coding agents (asks in C)
 editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
@@ -459,7 +498,8 @@ herdr-plugin-manager stores its data under Herdr's state directory:
 ├── installs/           # independent checkouts
 ├── cache/              # bare mirrors and marketplace responses
 ├── trash/              # deferred cleanup
-└── history.jsonl
+├── history.jsonl       # native records (default)
+└── history.ecs.ndjson  # records written while history = "ecs"
 ```
 
 On Windows the default root is `%LOCALAPPDATA%\herdr`. `HERDR_PM_HOME` and

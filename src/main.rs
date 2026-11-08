@@ -220,11 +220,20 @@ enum Cmd {
         #[command(flatten)]
         yes: YesFlag,
     },
-    /// Recent changes made by this manager.
-    History {
+    /// Changes made by this manager, newest last; `-f` keeps printing new
+    /// ones as they happen.
+    #[command(alias = "history")]
+    Logs {
         id: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// text (a table), jsonl (this manager's fields) or ecs (Elastic
+        /// Common Schema).
+        #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+        format: LogFormat,
+        /// Keep running and print changes as they are logged.
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
     /// Check herdr, git, config, plugins, key bindings and marketplaces.
     Doctor,
@@ -470,7 +479,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 serde_json::from_str(&text).context("not a valid export file")?;
             Ok(code(ops::import(&ctx(dry, yes.yes)?, &parsed, &ids)?))
         }
-        Cmd::History { id, limit } => history(id.as_deref(), limit),
+        Cmd::Logs {
+            id,
+            limit,
+            format,
+            follow,
+        } => logs(id.as_deref(), limit, format, follow),
         Cmd::Doctor => Ok(code(ops::doctor(&ctx(dry, false)?))),
         Cmd::Config { command } => config_cmd(command),
         Cmd::Open => {
@@ -910,35 +924,107 @@ fn export(herdr: &Herdr, output: Option<PathBuf>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn history(id: Option<&str>, limit: usize) -> Result<ExitCode> {
-    let events = registry::read_events(id, limit);
-    if events.is_empty() {
-        println!("No recorded changes.");
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Jsonl,
+    Ecs,
+}
+
+fn log_line(e: &registry::Event, format: LogFormat) -> String {
+    match format {
+        LogFormat::Jsonl => serde_json::to_string(e).unwrap_or_default(),
+        LogFormat::Ecs => registry::to_ecs(e).to_string(),
+        LogFormat::Text => {
+            let change = match (&e.from, &e.to) {
+                (Some(f), Some(t)) => format!("{} → {}", util::short_sha(f), util::short_sha(t)),
+                (None, Some(t)) => util::short_sha(t).to_string(),
+                (Some(f), None) => format!("{} → -", util::short_sha(f)),
+                _ => String::new(),
+            };
+            format!(
+                "{} {} {:<10} {:<28} {}{}",
+                ops::dim(&util::format_unix(e.unix)),
+                if e.ok {
+                    ops::green("✓")
+                } else {
+                    ops::red("✗")
+                },
+                e.action,
+                e.plugin_id,
+                change,
+                e.detail
+                    .as_ref()
+                    .map(|d| ops::dim(&format!("  {}", util::truncate(&util::sanitize(d), 80))))
+                    .unwrap_or_default()
+            )
+        }
     }
-    for e in events {
-        let change = match (&e.from, &e.to) {
-            (Some(f), Some(t)) => format!("{} → {}", util::short_sha(f), util::short_sha(t)),
-            (None, Some(t)) => util::short_sha(t).to_string(),
-            (Some(f), None) => format!("{} → -", util::short_sha(f)),
-            _ => String::new(),
+}
+
+/// Prints the last `limit` changes (oldest first, like a log), then with
+/// `follow` new ones as they are written. A closed pipe (`| head`) ends it
+/// quietly.
+fn logs(id: Option<&str>, limit: usize, format: LogFormat, follow: bool) -> Result<ExitCode> {
+    let mut out = std::io::stdout().lock();
+    let mut reader = registry::EventReader::default();
+    let mut events = reader.read_new()?;
+    events.retain(|e| id.is_none_or(|id| e.plugin_id == id));
+    let keep = events.len().saturating_sub(limit);
+    events.drain(..keep);
+    if events.is_empty() && !follow && matches!(format, LogFormat::Text) {
+        let off = Config::load().is_ok_and(|c| c.history == config::HistoryFormat::Off);
+        let note = if off {
+            "No recorded changes (history = \"off\" in config.toml)."
+        } else {
+            "No recorded changes."
         };
-        println!(
-            "{} {} {:<10} {:<28} {}{}",
-            ops::dim(&util::format_unix(e.unix)),
-            if e.ok {
-                ops::green("✓")
-            } else {
-                ops::red("✗")
-            },
-            e.action,
-            e.plugin_id,
-            change,
-            e.detail
-                .map(|d| ops::dim(&format!("  {}", util::truncate(&util::sanitize(&d), 80))))
-                .unwrap_or_default()
-        );
+        if !write_log(&mut out, note)? {
+            return Ok(ExitCode::SUCCESS);
+        }
     }
-    Ok(ExitCode::SUCCESS)
+    for e in &events {
+        if !write_log(&mut out, &log_line(e, format))? {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    if !flush_log(&mut out)? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let fresh = reader.read_new()?;
+        for e in fresh
+            .iter()
+            .filter(|e| id.is_none_or(|id| e.plugin_id == id))
+        {
+            if !write_log(&mut out, &log_line(e, format))? {
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+        if !flush_log(&mut out)? {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+}
+
+fn write_log(out: &mut impl std::io::Write, line: &str) -> std::io::Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn flush_log(out: &mut impl std::io::Write) -> std::io::Result<bool> {
+    match out.flush() {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn config_cmd(command: Option<ConfigCmd>) -> Result<ExitCode> {

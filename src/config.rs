@@ -192,6 +192,29 @@ impl Trigger {
     }
 }
 
+/// The format of the change log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryFormat {
+    /// `history.jsonl`, this manager's own fields.
+    #[default]
+    Jsonl,
+    /// `history.ecs.ndjson`, Elastic Common Schema (Elastic, Wazuh…).
+    Ecs,
+    /// Nothing is logged.
+    Off,
+}
+
+impl HistoryFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            HistoryFormat::Jsonl => "jsonl",
+            HistoryFormat::Ecs => "ecs",
+            HistoryFormat::Off => "off",
+        }
+    }
+}
+
 /// What asks whether an auto-update is due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hook {
@@ -295,6 +318,9 @@ pub struct Config {
     /// images.
     #[serde(default = "default_true")]
     pub logos: bool,
+    /// How changes are logged for `herdr-pm logs` (and log shippers).
+    #[serde(default)]
+    pub history: HistoryFormat,
     #[serde(default)]
     pub auto_update: AutoUpdate,
     /// Sources added to the built-in ones (`builtin_markets`); one with the
@@ -347,6 +373,7 @@ impl Default for Config {
             cli_on_path: false,
             agent_skill: false,
             logos: true,
+            history: HistoryFormat::default(),
             auto_update: AutoUpdate::default(),
             marketplace: Vec::new(),
         }

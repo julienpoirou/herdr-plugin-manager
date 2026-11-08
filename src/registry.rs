@@ -7,12 +7,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::config::HistoryFormat;
+use crate::{paths, util};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Installation {
@@ -157,28 +158,240 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
+/// Appends `event` to the change log in the configured format
+/// (`history` in config.toml), or nowhere when it is off.
 pub fn log_event(event: Event) {
-    let path = paths::history_file();
+    let format = crate::config::Config::load()
+        .map(|c| c.history)
+        .unwrap_or_default();
+    let (path, line) = match format {
+        HistoryFormat::Off => return,
+        HistoryFormat::Jsonl => (paths::history_file(), serde_json::to_string(&event)),
+        HistoryFormat::Ecs => (
+            paths::history_ecs_file(),
+            serde_json::to_string(&to_ecs(&event)),
+        ),
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = writeln!(file, "{line}");
-        }
+    if let (Ok(mut file), Ok(line)) = (
+        OpenOptions::new().create(true).append(true).open(&path),
+        line,
+    ) {
+        let _ = writeln!(file, "{line}");
     }
 }
 
-pub fn read_events(plugin_id: Option<&str>, limit: usize) -> Vec<Event> {
-    let Ok(text) = std::fs::read_to_string(paths::history_file()) else {
-        return Vec::new();
+/// Version of the Elastic Common Schema the ECS log follows.
+pub const ECS_VERSION: &str = "8.11.0";
+
+fn env_first(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .find(|v| !v.trim().is_empty())
+}
+
+/// One change as an Elastic Common Schema document for JSON log shippers.
+pub fn to_ecs(event: &Event) -> serde_json::Value {
+    let kind = match event.action.as_str() {
+        "install" | "import" => "installation",
+        "uninstall" | "purge" => "deletion",
+        _ => "change",
     };
-    let mut events: Vec<Event> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-        .filter(|e| plugin_id.is_none_or(|id| e.plugin_id == id))
-        .collect();
-    events.reverse();
-    events.truncate(limit);
-    events
+    let change = match (&event.from, &event.to) {
+        (Some(f), Some(t)) => format!(" {} → {}", util::short_sha(f), util::short_sha(t)),
+        (None, Some(t)) => format!(" {}", util::short_sha(t)),
+        _ => String::new(),
+    };
+    let mut doc = serde_json::json!({
+        "@timestamp": util::format_iso8601(event.unix),
+        "ecs": { "version": ECS_VERSION },
+        "message": format!("{} {}{change}", event.action, event.plugin_id),
+        "event": {
+            "kind": "event",
+            "category": ["package"],
+            "type": [kind],
+            "action": event.action,
+            "outcome": if event.ok { "success" } else { "failure" },
+            "provider": paths::PLUGIN_ID,
+            "dataset": "herdr_plugin_manager.history",
+        },
+        "package": { "name": event.plugin_id },
+        "host": { "name": env_first(&["COMPUTERNAME", "HOSTNAME"]) },
+        "user": { "name": env_first(&["USERNAME", "USER", "LOGNAME"]) },
+        "herdr_plugin_manager": {
+            "source": event.source,
+            "from": event.from,
+            "to": event.to,
+            "detail": event.detail,
+        },
+    });
+    if let Some(to) = &event.to {
+        doc["package"]["reference"] = to.clone().into();
+    }
+    if let Some(detail) = event.detail.as_ref().filter(|_| !event.ok) {
+        doc["error"] = serde_json::json!({ "message": detail });
+    }
+    doc
+}
+
+/// The change an ECS document describes, when it is one of ours.
+pub fn from_ecs(doc: &serde_json::Value) -> Option<Event> {
+    let custom = &doc["herdr_plugin_manager"];
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    Some(Event {
+        unix: util::parse_iso8601(doc["@timestamp"].as_str()?)?,
+        action: text(&doc["event"]["action"])?,
+        plugin_id: text(&doc["package"]["name"])?,
+        source: text(&custom["source"]),
+        from: text(&custom["from"]),
+        to: text(&custom["to"]),
+        ok: doc["event"]["outcome"].as_str() == Some("success"),
+        detail: text(&custom["detail"]),
+    })
+}
+
+/// Independent byte cursors keep format switches and equal timestamps from
+/// skipping changes. Incomplete final lines are retried on the next read.
+#[derive(Default)]
+pub struct EventReader {
+    offsets: [u64; 2],
+}
+
+impl EventReader {
+    pub fn read_new(&mut self) -> std::io::Result<Vec<Event>> {
+        self.read_files([paths::history_file(), paths::history_ecs_file()])
+    }
+
+    fn read_files(&mut self, files: [std::path::PathBuf; 2]) -> std::io::Result<Vec<Event>> {
+        let mut events = Vec::new();
+        for (index, path) in files.into_iter().enumerate() {
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    self.offsets[index] = 0;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if file.metadata()?.len() < self.offsets[index] {
+                self.offsets[index] = 0;
+            }
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(self.offsets[index]))?;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let count = reader.read_until(b'\n', &mut line)?;
+                if count == 0 || line.last() != Some(&b'\n') {
+                    break;
+                }
+                self.offsets[index] += count as u64;
+                let event = if index == 0 {
+                    serde_json::from_slice::<Event>(&line).ok()
+                } else {
+                    serde_json::from_slice::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|doc| from_ecs(&doc))
+                };
+                if let Some(event) = event {
+                    events.push(event);
+                }
+            }
+        }
+        events.sort_by_key(|e| e.unix);
+        Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecs_documents_carry_the_change_and_read_back() {
+        let event = Event {
+            unix: 1_794_064_289,
+            action: "update".into(),
+            plugin_id: "demo.tags".into(),
+            source: Some("https://git.example/demo.git".into()),
+            from: Some("a".repeat(40)),
+            to: Some("b".repeat(40)),
+            ok: false,
+            detail: Some("build failed".into()),
+        };
+        let doc = to_ecs(&event);
+        assert_eq!(doc["@timestamp"], "2026-11-07T15:11:29Z");
+        assert_eq!(doc["event"]["type"][0], "change");
+        assert_eq!(doc["event"]["outcome"], "failure");
+        assert_eq!(doc["package"]["name"], "demo.tags");
+        assert_eq!(doc["package"]["reference"], "b".repeat(40));
+        assert_eq!(doc["error"]["message"], "build failed");
+        let back = from_ecs(&doc).unwrap();
+        assert_eq!(
+            (back.unix, &back.action, &back.from, back.ok, &back.detail),
+            (event.unix, &event.action, &event.from, false, &event.detail)
+        );
+        let purge = Event {
+            action: "purge".into(),
+            ok: true,
+            ..back
+        };
+        assert_eq!(to_ecs(&purge)["event"]["type"][0], "deletion");
+        assert!(to_ecs(&purge).get("error").is_none());
+    }
+
+    #[test]
+    fn follow_keeps_partial_lines_and_independent_format_cursors() {
+        let root = std::env::temp_dir().join(format!(
+            "hpm-log-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let files = [root.join("history.jsonl"), root.join("history.ecs.ndjson")];
+        let mut reader = EventReader::default();
+        let event = Event {
+            unix: 200,
+            action: "install".into(),
+            plugin_id: "demo.logs".into(),
+            source: None,
+            from: None,
+            to: None,
+            ok: true,
+            detail: None,
+        };
+        std::fs::write(&files[1], format!("{}\n", to_ecs(&event))).unwrap();
+        assert_eq!(
+            reader.read_files(files.clone()).unwrap()[0].action,
+            "install"
+        );
+        let event = Event {
+            unix: 100,
+            action: "pin".into(),
+            ..event
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        std::fs::write(&files[0], &line[..line.len() / 2]).unwrap();
+        assert!(reader.read_files(files.clone()).unwrap().is_empty());
+        let mut file = OpenOptions::new().append(true).open(&files[0]).unwrap();
+        writeln!(file, "{}", &line[line.len() / 2..]).unwrap();
+        drop(file);
+        let fresh = reader.read_files(files.clone()).unwrap();
+        assert_eq!(
+            fresh.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+            ["pin"]
+        );
+        assert!(reader.read_files(files.clone()).unwrap().is_empty());
+        std::fs::write(&files[0], "").unwrap();
+        assert!(reader.read_files(files.clone()).unwrap().is_empty());
+        std::fs::write(&files[0], format!("{line}\n")).unwrap();
+        assert_eq!(reader.read_files(files).unwrap()[0].action, "pin");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

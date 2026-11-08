@@ -112,6 +112,8 @@ enum Cmd {
     /// Delete what removed plugins left behind: config and state
     /// directories, Herdr's old checkouts, and their settings here.
     Clean {
+        /// Only these removed plugins (all of them when omitted).
+        ids: Vec<String>,
         #[command(flatten)]
         yes: YesFlag,
     },
@@ -334,7 +336,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Uninstall { id, purge, yes } => {
             ops::uninstall(&ctx(dry, yes.yes)?, &id, purge).map(|_| ExitCode::SUCCESS)
         }
-        Cmd::Clean { yes } => ops::clean(&ctx(dry, yes.yes)?).map(|_| ExitCode::SUCCESS),
+        Cmd::Clean { ids, yes } => ops::clean(&ctx(dry, yes.yes)?, &ids).map(|_| ExitCode::SUCCESS),
         Cmd::Enable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, true).map(|_| ExitCode::SUCCESS)
         }

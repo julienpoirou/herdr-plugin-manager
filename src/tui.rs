@@ -28,7 +28,7 @@ use ratatui::{Frame, Terminal};
 use crate::config::Config;
 use crate::git::{Git, RemoteTag};
 use crate::market::{self, Entry, Sort};
-use crate::ops::{self, Ctx, InstallRequest, Origin, Report, Row, Status};
+use crate::ops::{self, Ctx, InstallRequest, Origin, Orphan, Report, Row, Status};
 use crate::{paths, source, util};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -100,6 +100,8 @@ enum Msg {
     Branch(String, String),
     /// Tags for the version picker.
     Versions(String, Result<Vec<RemoteTag>, String>),
+    /// Leftovers of removed plugins, for the `X` dialog.
+    Orphans(Result<Vec<Orphan>, String>),
     /// Progress of the running operation.
     Task(TaskEvent),
 }
@@ -133,6 +135,15 @@ struct Picker {
     id: String,
     name: String,
     picks: Vec<Pick>,
+    sel: usize,
+    loading: bool,
+    error: Option<String>,
+}
+
+/// The `X` dialog: removed plugins whose leftovers can be deleted.
+struct Cleaner {
+    orphans: Vec<Orphan>,
+    chosen: Vec<bool>,
     sel: usize,
     loading: bool,
     error: Option<String>,
@@ -245,6 +256,7 @@ struct App {
     help: bool,
     help_scroll: usize,
     picker: Option<Picker>,
+    cleaner: Option<Cleaner>,
     /// Default branch names, for the `ref` line.
     branches: HashMap<String, String>,
     market: MarketState,
@@ -277,6 +289,7 @@ impl App {
             help: false,
             help_scroll: 0,
             picker: None,
+            cleaner: None,
             branches: HashMap::new(),
             market: MarketState {
                 entries: Vec::new(),
@@ -458,6 +471,7 @@ impl App {
                     self.branches.insert(id, branch);
                 }
                 Msg::Versions(id, result) => fill_picker(self, &id, result),
+                Msg::Orphans(result) => fill_cleaner(self, result),
                 Msg::Task(event) => task_event(self, event),
                 Msg::Market(generation, results) => {
                     if generation != self.market.generation {
@@ -713,8 +727,8 @@ enum Job {
     Switch(String, String),
     EditFile(std::path::PathBuf),
     Logs(String),
-    /// Delete what removed plugins left behind.
-    Clean,
+    /// Delete what these removed plugins left behind.
+    Clean(Vec<String>),
 }
 
 fn editor_command(config: &Config) -> Vec<String> {
@@ -793,8 +807,8 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
                 false,
             ),
             Job::Logs(id) => (format!("Recent commands of {id}"), None, false, false, true),
-            Job::Clean => (
-                "Cleaning leftovers of removed plugins".to_string(),
+            Job::Clean(ids) => (
+                format!("Cleaning leftovers of {}", ids.join(", ")),
                 None,
                 false,
                 false,
@@ -831,7 +845,7 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::PinTo(id, commit) => Box::new(move |ctx| ops::pin(ctx, &id, Some(&commit))),
         Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
         Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
-        Job::Clean => Box::new(ops::clean),
+        Job::Clean(ids) => Box::new(move |ctx| ops::clean(ctx, &ids)),
         Job::Logs(id) => Box::new(move |ctx| {
             let status = ctx.herdr.logs(&id, &|line| ctx.report.line(line))?;
             if !status.success() {
@@ -1075,13 +1089,17 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
                 picker.sel = (picker.sel as isize + delta)
                     .clamp(0, picker.picks.len().saturating_sub(1) as isize)
                     as usize;
+            } else if let Some(cleaner) = &mut app.cleaner {
+                cleaner.sel = (cleaner.sel as isize + delta)
+                    .clamp(0, cleaner.orphans.len().saturating_sub(1) as isize)
+                    as usize;
             } else {
                 move_sel(app, delta);
             }
             true
         }
         MouseEventKind::Down(MouseButton::Left)
-            if app.help || app.picker.is_some() || app.task.is_some() =>
+            if app.help || app.picker.is_some() || app.cleaner.is_some() || app.task.is_some() =>
         {
             false
         }
@@ -1169,6 +1187,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     }
     if app.picker.is_some() {
         return picker_key(app, key);
+    }
+    if app.cleaner.is_some() {
+        return cleaner_key(app, key);
     }
     if let Some(confirm) = app.confirm.take() {
         return answer_confirm(app, confirm, key);
@@ -1402,7 +1423,10 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         KeyCode::Char('c') => return Some(Job::EditFile(paths::herdr_plugins_json())),
         KeyCode::Char('C') => return Some(Job::EditFile(paths::pm_config_file())),
         KeyCode::Char('L') => return Some(Job::Logs(id?)),
-        KeyCode::Char('X') => return Some(Job::Clean),
+        KeyCode::Char('X') => {
+            open_cleaner(app);
+            return None;
+        }
         KeyCode::Char('r') => {
             app.reload();
             app.start_checks(None);
@@ -1634,6 +1658,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.picker.is_some() {
         draw_picker(f, app, area);
+    }
+    if app.cleaner.is_some() {
+        draw_cleaner(f, app, area);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(f, confirm, area);
@@ -2305,7 +2332,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         key("A", "auto-update on/off (when Herdr starts)"),
         key("e", "enable or disable"),
         key("x", "remove, or delete completely"),
-        key("X", "clean leftovers of removed plugins"),
+        key("X", "pick removed plugins whose leftovers to delete"),
         key("i", "install from a URL, owner/repo or alias:path"),
         key("p", "pick a version to pin (or unpin)"),
         key("s", "switch to another branch, tag or commit"),
@@ -2593,6 +2620,163 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             format!(" Pin {} ", util::sanitize(&picker.name)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+// ---------------------------------------------------------------- leftovers
+
+fn open_cleaner(app: &mut App) {
+    app.cleaner = Some(Cleaner {
+        orphans: Vec::new(),
+        chosen: Vec::new(),
+        sel: 0,
+        loading: true,
+        error: None,
+    });
+    let tx = app.tx.clone();
+    let herdr = app.ctx.herdr.clone();
+    std::thread::spawn(move || {
+        let result = ops::orphans(&herdr).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Orphans(result));
+    });
+}
+
+fn fill_cleaner(app: &mut App, result: Result<Vec<Orphan>, String>) {
+    let Some(cleaner) = app.cleaner.as_mut() else {
+        return;
+    };
+    cleaner.loading = false;
+    match result {
+        Ok(orphans) if orphans.is_empty() => {
+            app.cleaner = None;
+            app.say(
+                Level::Ok,
+                "Nothing to clean: no leftovers of removed plugins.",
+            );
+        }
+        Ok(orphans) => {
+            cleaner.chosen = vec![false; orphans.len()];
+            cleaner.orphans = orphans;
+        }
+        Err(err) => cleaner.error = Some(err),
+    }
+}
+
+fn cleaner_key(app: &mut App, key: KeyEvent) -> Option<Job> {
+    let cleaner = app.cleaner.as_mut()?;
+    let last = cleaner.orphans.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('X') => app.cleaner = None,
+        KeyCode::Down | KeyCode::Char('j') => cleaner.sel = (cleaner.sel + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => cleaner.sel = cleaner.sel.saturating_sub(1),
+        KeyCode::PageDown => cleaner.sel = (cleaner.sel + 10).min(last),
+        KeyCode::PageUp => cleaner.sel = cleaner.sel.saturating_sub(10),
+        KeyCode::Home => cleaner.sel = 0,
+        KeyCode::End => cleaner.sel = last,
+        KeyCode::Char(' ') => {
+            if let Some(chosen) = cleaner.chosen.get_mut(cleaner.sel) {
+                *chosen = !*chosen;
+                cleaner.sel = (cleaner.sel + 1).min(last);
+            }
+        }
+        KeyCode::Char('a') => {
+            let all = cleaner.chosen.iter().all(|c| *c);
+            cleaner.chosen.iter_mut().for_each(|c| *c = !all);
+        }
+        KeyCode::Enter => {
+            // The checked plugins, or the highlighted one when none is.
+            let mut ids: Vec<String> = cleaner
+                .orphans
+                .iter()
+                .zip(&cleaner.chosen)
+                .filter(|(_, chosen)| **chosen)
+                .map(|(o, _)| o.id.clone())
+                .collect();
+            if ids.is_empty() {
+                ids.extend(cleaner.orphans.get(cleaner.sel).map(|o| o.id.clone()));
+            }
+            if ids.is_empty() {
+                return None;
+            }
+            app.cleaner = None;
+            return Some(Job::Clean(ids));
+        }
+        _ => {}
+    }
+    None
+}
+
+fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
+    let Some(cleaner) = &app.cleaner else {
+        return;
+    };
+    let key =
+        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let mut lines: Vec<Line> = Vec::new();
+    if cleaner.loading {
+        lines.push(Line::styled(
+            format!("{} looking for leftovers…", spinner()),
+            muted(),
+        ));
+    }
+    if let Some(err) = &cleaner.error {
+        lines.push(Line::styled(
+            util::truncate(&util::sanitize(err), 76),
+            Style::default().fg(BAD),
+        ));
+    }
+    let height = (area.height.saturating_sub(8) as usize).clamp(3, 18);
+    let start = cleaner
+        .sel
+        .saturating_sub(height / 2)
+        .min(cleaner.orphans.len().saturating_sub(height));
+    for (i, orphan) in cleaner.orphans.iter().enumerate().skip(start).take(height) {
+        let chosen = cleaner.chosen.get(i).copied().unwrap_or(false);
+        let style = if i == cleaner.sel {
+            Style::default()
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if chosen { "[x] " } else { "[ ] " },
+                    Style::default().fg(if chosen { OK } else { ACCENT }),
+                ),
+                Span::raw(pad(&util::sanitize(&orphan.id), 34)),
+                Span::styled(format!(" {:>9}  ", util::human_size(orphan.size)), muted()),
+                Span::styled(orphan.kinds(), muted()),
+            ])
+            .style(style),
+        );
+    }
+    let count = cleaner.chosen.iter().filter(|c| **c).count();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        key("Space"),
+        Span::raw(" select   "),
+        key("a"),
+        Span::raw(" all   "),
+        key("↵"),
+        Span::raw(if count == 0 {
+            " clean highlighted   ".to_string()
+        } else {
+            format!(" clean {count} selected   ")
+        }),
+        key("Esc"),
+        Span::raw(" close"),
+    ]));
+    let rect = centered(area, 86, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Leftovers of removed plugins ",
             Style::default().add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Paragraph::new(lines).block(block), rect);

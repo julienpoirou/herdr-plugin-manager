@@ -1483,50 +1483,97 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// What one removed plugin left behind.
+#[derive(Debug, Clone)]
+pub struct Orphan {
+    /// The plugin id as it appears on disk.
+    pub id: String,
+    /// `(kind, path)`: kind is `config`, `data`, `checkout` or `lock`.
+    pub paths: Vec<(&'static str, PathBuf)>,
+    /// Ids with auto-update or pin settings in the registry.
+    pub settings: Vec<String>,
+    /// Bytes on disk.
+    pub size: u64,
+}
+
+impl Orphan {
+    /// `config, data, checkout` and so on, each kind once.
+    pub fn kinds(&self) -> String {
+        let mut kinds: Vec<&str> = Vec::new();
+        for (kind, _) in &self.paths {
+            if !kinds.contains(kind) {
+                kinds.push(kind);
+            }
+        }
+        if !self.settings.is_empty() {
+            kinds.push("settings");
+        }
+        kinds.join(", ")
+    }
+}
+
+fn disk_size(path: &Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(path)
+            .map(|entries| entries.flatten().map(|e| disk_size(&e.path())).sum())
+            .unwrap_or(0),
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    }
+}
+
+/// The id part of Herdr's `<id>-<hash>` checkout names.
+fn checkout_id(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((id, hash)) if !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()) => id,
+        _ => name,
+    }
+}
+
 /// What Herdr and this manager keep for plugins that are no longer
-/// installed: config and state directories, Herdr's GitHub checkouts and
-/// their lock files.
-pub fn leftovers(herdr: &Herdr) -> Result<Vec<PathBuf>> {
+/// installed, one entry per plugin: config and state directories, Herdr's
+/// GitHub checkouts and their lock files, auto-update and pin settings.
+pub fn orphans(herdr: &Herdr) -> Result<Vec<Orphan>> {
     let plugins = herdr.list()?;
-    let mut kept: Vec<String> = plugins
+    let installed: Vec<String> = plugins.iter().map(|p| p.plugin_id.clone()).collect();
+    let mut kept: Vec<String> = installed
         .iter()
-        .map(|p| paths::plugin_path_component(&p.plugin_id))
+        .map(|id| paths::plugin_path_component(id))
         .collect();
     kept.push(paths::plugin_path_component(paths::PLUGIN_ID));
     let roots: Vec<PathBuf> = plugins
         .iter()
         .filter_map(|p| std::fs::canonicalize(&p.plugin_root).ok())
         .collect();
-    let mut found = Vec::new();
+    let mut found: Vec<(String, &'static str, PathBuf)> = Vec::new();
     let plugin_dirs = [
-        paths::herdr_config_dir().join("plugins").join("config"),
-        paths::herdr_state_dir().join("plugins"),
+        (
+            "config",
+            paths::herdr_config_dir().join("plugins").join("config"),
+        ),
+        ("data", paths::herdr_state_dir().join("plugins")),
     ];
-    for base in &plugin_dirs {
+    for (kind, base) in &plugin_dirs {
         for dir in dirs_in(base) {
             let name = file_name(&dir);
             if !name.starts_with('.') && !kept.contains(&name) {
-                found.push(dir);
+                found.push((name, kind, dir));
             }
         }
     }
     // `<id>-<hash>` checkouts. One still in use either holds an installed
     // plugin's root or carries an installed id; both keep it.
-    let installed_name = |name: &str| {
-        kept.iter().any(|id| {
-            name.strip_prefix(id.as_str())
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|hash| hash.chars().all(|c| c.is_ascii_hexdigit()))
-        })
-    };
     let herdr_plugins = paths::herdr_config_dir().join("plugins");
-    for dir in dirs_in(&herdr_plugins.join("github-installations")) {
+    let checkouts = herdr_plugins.join("github-installations");
+    for dir in dirs_in(&checkouts) {
+        let name = file_name(&dir);
+        let id = checkout_id(&name).to_string();
         let in_use = std::fs::canonicalize(&dir)
             .map(|d| roots.iter().any(|r| r.starts_with(&d)))
             .unwrap_or(true)
-            || installed_name(&file_name(&dir));
+            || kept.contains(&id);
         if !in_use {
-            found.push(dir);
+            found.push((id, "checkout", dir));
         }
     }
     // Herdr's per-checkout lock files (`.locks/.<id>-<hash>.lock`).
@@ -1536,40 +1583,91 @@ pub fn leftovers(herdr: &Herdr) -> Result<Vec<PathBuf>> {
             let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".lock")) else {
                 continue;
             };
-            let checkout = herdr_plugins.join("github-installations").join(stem);
-            if !installed_name(stem) && (!checkout.exists() || found.contains(&checkout)) {
-                found.push(lock);
+            let id = checkout_id(stem).to_string();
+            let checkout = checkouts.join(stem);
+            let orphaned = !checkout.exists() || found.iter().any(|(_, _, p)| *p == checkout);
+            if !kept.contains(&id) && orphaned {
+                found.push((id, "lock", lock));
             }
         }
     }
-    Ok(found)
-}
-
-/// Deletes `leftovers` after a review, and forgets this manager's settings
-/// (auto-update, pins) for plugins that are gone.
-pub fn clean(ctx: &Ctx) -> Result<()> {
-    ctx.step("looking for leftovers of removed plugins");
-    let found = leftovers(&ctx.herdr)?;
-    let installed: Vec<String> = ctx.herdr.list()?.into_iter().map(|p| p.plugin_id).collect();
     let registry = Registry::load()?;
-    let stale: Vec<String> = registry
+    let mut stale: Vec<&String> = registry
         .auto_update
         .iter()
         .chain(registry.pins.keys())
         .filter(|id| !installed.contains(id))
-        .cloned()
         .collect();
-    if found.is_empty() && stale.is_empty() {
+    stale.sort();
+    stale.dedup();
+
+    let mut orphans: Vec<Orphan> = Vec::new();
+    let entry = |orphans: &mut Vec<Orphan>, id: String| -> usize {
+        match orphans.iter().position(|o| o.id == id) {
+            Some(i) => i,
+            None => {
+                orphans.push(Orphan {
+                    id,
+                    paths: Vec::new(),
+                    settings: Vec::new(),
+                    size: 0,
+                });
+                orphans.len() - 1
+            }
+        }
+    };
+    for (id, kind, path) in found {
+        let i = entry(&mut orphans, id);
+        orphans[i].size += disk_size(&path);
+        orphans[i].paths.push((kind, path));
+    }
+    for id in stale {
+        let i = entry(&mut orphans, paths::plugin_path_component(id));
+        orphans[i].settings.push(id.clone());
+    }
+    orphans.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(orphans)
+}
+
+/// Deletes what the given removed plugins left behind (all of them when
+/// `ids` is empty), after a review.
+pub fn clean(ctx: &Ctx, ids: &[String]) -> Result<()> {
+    ctx.step("looking for leftovers of removed plugins");
+    let mut orphans = orphans(&ctx.herdr)?;
+    if !ids.is_empty() {
+        if let Some(missing) = ids.iter().find(|id| {
+            !orphans
+                .iter()
+                .any(|o| o.id == **id || o.id == paths::plugin_path_component(id))
+        }) {
+            bail!("no leftovers of a removed plugin named {missing}");
+        }
+        orphans.retain(|o| {
+            ids.iter()
+                .any(|id| o.id == *id || o.id == paths::plugin_path_component(id))
+        });
+    }
+    if orphans.is_empty() {
         ctx.line(format!("{} Nothing to clean.", green("✓")));
         return Ok(());
     }
-    let mut review: Vec<String> = found.iter().map(|p| format!("  {}", p.display())).collect();
-    if !stale.is_empty() {
-        review.push(format!("  settings of {}", stale.join(", ")));
+    let mut review = Vec::new();
+    for orphan in &orphans {
+        review.push(format!(
+            "  {}  {}",
+            bold(&orphan.id),
+            dim(&util::human_size(orphan.size))
+        ));
+        for (kind, path) in &orphan.paths {
+            review.push(format!("    {:<9}{}", kind, path.display()));
+        }
+        if !orphan.settings.is_empty() {
+            review.push(format!("    {:<9}auto-update and pin", "settings"));
+        }
     }
     let question = "Delete them?";
     if !ctx.report.review(
-        &format!("Leftovers of removed plugins ({})", review.len()),
+        &format!("Leftovers of {} removed plugin(s)", orphans.len()),
         &review,
         (!ctx.yes).then_some(question),
     )? {
@@ -1581,19 +1679,20 @@ pub fn clean(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let mut failures = Vec::new();
-    for path in &found {
+    for (_, path) in orphans.iter().flat_map(|o| &o.paths) {
         match delete_path(path) {
             Ok(()) => ctx.line(format!("  {} deleted {}", dim("•"), path.display())),
             Err(err) => failures.push(format!("{err:#}")),
         }
     }
-    if !stale.is_empty() {
+    let settings: Vec<&String> = orphans.iter().flat_map(|o| &o.settings).collect();
+    if !settings.is_empty() {
         let mut locked = Registry::lock()?;
         locked
             .registry
             .auto_update
-            .retain(|id| installed.contains(id));
-        locked.registry.pins.retain(|id, _| installed.contains(id));
+            .retain(|id| !settings.contains(&id));
+        locked.registry.pins.retain(|id, _| !settings.contains(&id));
         locked.save()?;
     }
     if !failures.is_empty() {
@@ -1602,10 +1701,11 @@ pub fn clean(ctx: &Ctx) -> Result<()> {
             failures.join("; ")
         );
     }
+    let names: Vec<&str> = orphans.iter().map(|o| o.id.as_str()).collect();
     ctx.line(format!(
-        "{} Cleaned {} leftover(s) of removed plugins.",
+        "{} Cleaned the leftovers of {}.",
         green("✓"),
-        review.len()
+        names.join(", ")
     ));
     Ok(())
 }

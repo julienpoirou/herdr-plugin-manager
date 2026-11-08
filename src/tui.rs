@@ -1105,7 +1105,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         let plan = if skill {
             crate::integrate::skill_plan(on, config.cli_on_path)
         } else {
-            crate::integrate::cli_plan(on)
+            crate::integrate::cli_plan(on, config.agent_skill)
         };
         match plan {
             Ok(plan) => app.confirm = Some(Confirm::Integration { skill, on, plan }),

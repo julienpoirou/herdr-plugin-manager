@@ -883,6 +883,17 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
         None,
     );
     cleanup_installs(&id);
+    if id == paths::PLUGIN_ID && !ctx.dry_run {
+        let config = &ctx.config;
+        if let Err(err) =
+            crate::integrate::refresh(&ctx.herdr, config.cli_on_path, config.agent_skill)
+        {
+            ctx.line(format!(
+                "  {} the PATH link or the skill still points at the old installation: {err:#}",
+                yellow("warning:")
+            ));
+        }
+    }
 
     ctx.line(format!(
         "{} {} {id} {} ({}) from {}.",
@@ -2387,6 +2398,84 @@ pub fn take_over(ctx: &Ctx, id: &str) -> Result<()> {
     if took {
         forget_pin(&id)?;
     }
+    Ok(())
+}
+
+struct ReportSteps<'a>(&'a Ctx);
+
+impl crate::integrate::Steps for ReportSteps<'_> {
+    fn step(&self, text: &str) {
+        self.0.step(text);
+    }
+    fn line(&self, text: &str) {
+        self.0.line(text);
+    }
+    fn progress(&self, done: usize, total: usize) {
+        self.0.report.progress(done, total);
+    }
+}
+
+/// Puts `herdr-pm` on the user's PATH (a link to the current installation,
+/// moved after updates) or takes it off, and records `cli_on_path`.
+pub fn set_cli_on_path(ctx: &Ctx, on: bool) -> Result<()> {
+    use crate::settings::{self, Action, Field};
+    if ctx.dry_run {
+        for line in crate::integrate::cli_plan(on)? {
+            ctx.line(format!("[dry-run] {line}"));
+        }
+        return Ok(());
+    }
+    let steps = ReportSteps(ctx);
+    if on {
+        crate::integrate::enable_cli(&ctx.herdr, &steps)?;
+    } else {
+        crate::integrate::disable_cli(&steps)?;
+    }
+    settings::write(&Field::CliOnPath, &Action::Set(on.to_string()))?;
+    ctx.line(if on {
+        format!(
+            "{} herdr-pm is on your PATH ({}); open a new terminal to use it.",
+            green("✓"),
+            crate::integrate::cli_dir()?.display()
+        )
+    } else {
+        format!("{} herdr-pm is off your PATH.", green("✓"))
+    });
+    Ok(())
+}
+
+/// Links the `herdr-pm` agent skill for the coding agents found (putting
+/// `herdr-pm` on PATH too, since agents run it) or unlinks it, and records
+/// `agent_skill`.
+pub fn set_agent_skill(ctx: &Ctx, on: bool) -> Result<()> {
+    use crate::settings::{self, Action, Field};
+    if ctx.dry_run {
+        for line in crate::integrate::skill_plan(on, ctx.config.cli_on_path)? {
+            ctx.line(format!("[dry-run] {line}"));
+        }
+        return Ok(());
+    }
+    let steps = ReportSteps(ctx);
+    if on {
+        if !ctx.config.cli_on_path {
+            crate::integrate::enable_cli(&ctx.herdr, &steps)?;
+            settings::write(&Field::CliOnPath, &Action::Set("true".into()))?;
+        }
+        crate::integrate::enable_skill(&ctx.herdr, &steps)?;
+    } else {
+        crate::integrate::disable_skill(&steps)?;
+    }
+    settings::write(&Field::AgentSkill, &Action::Set(on.to_string()))?;
+    ctx.line(if on {
+        let agents = crate::integrate::detected_agents()?;
+        format!(
+            "{} The herdr-pm skill is linked for {} agent(s) and ~/.agents/skills.",
+            green("✓"),
+            agents.len()
+        )
+    } else {
+        format!("{} The herdr-pm skill is unlinked.", green("✓"))
+    });
     Ok(())
 }
 

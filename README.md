@@ -136,7 +136,9 @@ history apply. With `github_via_git = false` they go to Herdr's own installer,
 which cannot replace a local link, so `--replace` then needs `--git`.
 `herdr-pm take-over <id>` (`t` in the popup) moves a plugin Herdr installed
 earlier to the Git pipeline, at the commit it runs now and following the same
-ref.
+ref. That includes the manager itself (`herdr-pm take-over
+herdr-plugin-manager`): it then updates itself with `u`, `U` or auto-update,
+and `herdr plugin update` no longer touches it.
 
 ## Trust and build model
 

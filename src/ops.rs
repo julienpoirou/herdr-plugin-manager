@@ -190,6 +190,16 @@ impl Row {
         }
     }
 
+    /// Short form for lists: a GitHub remote reads `owner/repo/subdir`
+    /// however it was installed; anything else as `source_display`.
+    pub fn source_label(&self) -> String {
+        self.record
+            .as_ref()
+            .filter(|_| self.origin == Origin::Git)
+            .and_then(|r| source::github_label(&r.url, r.subdir.as_deref()))
+            .unwrap_or_else(|| self.source_display())
+    }
+
     pub fn commit(&self) -> Option<&str> {
         match self.origin {
             Origin::Git => self.record.as_ref().map(|r| r.current.commit.as_str()),
@@ -1322,7 +1332,10 @@ fn purge_trash() {
 pub fn find_row<'a>(rows: &'a [Row], target: &str) -> Option<&'a Row> {
     rows.iter()
         .find(|r| r.plugin.plugin_id == target)
-        .or_else(|| rows.iter().find(|r| r.source_display() == target))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| r.source_display() == target || r.source_label() == target)
+        })
 }
 
 /// Updates the named plugins (all GitHub- and git-managed ones when empty).
@@ -2342,9 +2355,6 @@ pub fn take_over(ctx: &Ctx, id: &str) -> Result<()> {
     let id = row.plugin.plugin_id.clone();
     if row.origin != Origin::Github {
         bail!("{id} is not a plugin Herdr installed from GitHub");
-    }
-    if id == paths::PLUGIN_ID {
-        bail!("the manager stays a Herdr GitHub install so `herdr plugin update` can update it");
     }
     let spec = row
         .plugin

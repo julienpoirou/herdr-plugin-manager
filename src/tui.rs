@@ -358,10 +358,11 @@ impl App {
         self.items.clear();
         for (i, row) in self.rows.iter().enumerate() {
             let hay = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 row.plugin.plugin_id,
                 row.plugin.name,
                 row.source_display(),
+                row.source_label(),
                 row.origin.label()
             )
             .to_lowercase();
@@ -1669,11 +1670,6 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     Level::Info,
                     format!("{} is already managed here, not by herdr", row.plugin.name),
                 );
-            } else if row.plugin.plugin_id == paths::PLUGIN_ID {
-                app.say(
-                    Level::Info,
-                    "the manager stays a Herdr GitHub install so herdr can update it",
-                );
             } else {
                 return Some(Job::TakeOver(row.plugin.plugin_id.clone()));
             }
@@ -2114,7 +2110,7 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(origin_color),
             ),
             Span::raw(" "),
-            Span::styled(pad(&row.source_display(), src_w), muted()),
+            Span::styled(pad(&row.source_label(), src_w), muted()),
             Span::raw(" "),
             badge(row.auto_update, "⟳ ", Style::default().fg(ACCENT)),
             badge(row.pinned(), "📌", Style::default()),
@@ -2163,7 +2159,15 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
     match row.origin {
         Origin::Local => lines.push(kv("path", row.plugin.plugin_root.clone())),
         _ => {
-            lines.push(kv("source", row.source_display()));
+            match &row.record {
+                Some(r) => {
+                    lines.push(kv("source", r.url.clone()));
+                    if let Some(subdir) = &r.subdir {
+                        lines.push(kv("subdir", subdir.clone()));
+                    }
+                }
+                None => lines.push(kv("source", row.source_display())),
+            }
             let branch = app.branches.get(&row.plugin.plugin_id).map(String::as_str);
             let mut text = row.ref_label(branch);
             if let Some(r) = &row.record {

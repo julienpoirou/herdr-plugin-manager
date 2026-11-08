@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.10.0...v0.11.0) (2026-11-08)
+
+
+### Features
+
+* **tui:** Edit config.toml in a settings dialog ([#35](https://github.com/julienpoirou/herdr-plugin-manager/issues/35)) ([913c860](https://github.com/julienpoirou/herdr-plugin-manager/commit/913c8600462bb1090711f52a63dd6ea9b7266a12))
+
 ## [0.10.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.9.0...v0.10.0) (2026-11-08)
 
 

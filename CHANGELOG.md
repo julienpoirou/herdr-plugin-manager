@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.13.0...v0.14.0) (2026-11-08)
+
+
+### Features
+
+* Herdr-pm on PATH, an agent skill, and project pictures ([#41](https://github.com/julienpoirou/herdr-plugin-manager/issues/41)) ([73822d3](https://github.com/julienpoirou/herdr-plugin-manager/commit/73822d38e1e61bc6320619301a5057004c2fe044))
+
 ## [0.13.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.12.0...v0.13.0) (2026-11-08)
 
 

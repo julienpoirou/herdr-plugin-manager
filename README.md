@@ -201,6 +201,34 @@ to `config.toml` at once, comments kept; a refused value shows why and leaves
 the file alone. Adding a marketplace source or a token is done in the file
 (`E`).
 
+Two settings change the system and are off by default; turning either on or
+off asks first, then runs behind the progress dialog:
+
+- `cli_on_path` puts `herdr-pm` on your PATH: a link in
+  `%LOCALAPPDATA%\herdr-plugin-manager\bin` (Windows) or `~/.local/bin`
+  pointing at the manager's current installation (a symbolic link when the
+  system allows it, otherwise a hard link or a copy), and that directory in
+  the user PATH (`~/.profile` when `~/.local/bin` is not on it already). The
+  link moves after every update of the manager, at Herdr startup and when the
+  popup opens. `herdr-pm path enable|disable` does the same from a shell.
+- `agent_skill` links the `herdr-pm` [agent skill](skills/herdr-pm/SKILL.md)
+  into `~/.agents/skills` (Codex, Pi, Cline, Zed…) and into the skills
+  directory of each coding agent found (Claude Code, OMP, Cursor, Gemini CLI,
+  GitHub Copilot, OpenCode, Droid, Windsurf, Kiro…), and turns `cli_on_path`
+  on, since agents run `herdr-pm`. The links follow updates the same way.
+  `herdr-pm skill enable|disable` from a shell; `herdr-pm --skill` prints the
+  skill of the installed version; `npx skills add julienpoirou/herdr-plugin-manager
+  --skill herdr-pm -g` installs it without the manager.
+
+The skill tells agents to show the `--dry-run --yes` preview and wait for
+your approval before any `--yes` change.
+
+`logos` (on by default) shows the project or owner picture next to the
+details in Installed and Marketplace, only in terminals that draw images:
+Kitty, Ghostty, WezTerm, iTerm2, foot, Konsole…, and inside Herdr when its
+outer terminal speaks the Kitty protocol (Herdr's `terminal.kitty_graphics`).
+Pictures come from GitHub, GitLab and Gitea/Forgejo and are cached for a week.
+
 The detail panel shows the installed version as `branch@commit`
 (`main@8cda521`, `v1.4.0@8cda521`), or `@8cda521 (pinned)`.
 
@@ -297,6 +325,8 @@ herdr-pm index build (--repo URL… | --repos-file F | --scan-dir DIR [--url-bas
 herdr-pm index check <file>
 herdr-pm export [-o file]      herdr-pm import <file> [ids…]
 herdr-pm doctor                herdr-pm config path|init|show
+herdr-pm path enable|disable   herdr-pm skill enable|disable
+herdr-pm --skill               print the agent skill
 ```
 
 Global `--dry-run` (or `HERDR_PM_DRY_RUN=1`) reports changes without applying
@@ -314,6 +344,9 @@ market_ttl = 600        # seconds before the marketplace is refreshed
 check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
 github_via_git = true   # owner/repo through the Git pipeline, not Herdr's installer
+logos = true            # pictures where the terminal draws images
+cli_on_path = false     # herdr-pm on your PATH (asks in C)
+agent_skill = false     # the herdr-pm skill for coding agents (asks in C)
 editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
 
 [auto_update]

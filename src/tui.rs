@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::git::{Git, RemoteTag};
 use crate::market::{self, Entry, Sort};
 use crate::ops::{self, Ctx, InstallRequest, Origin, Orphan, Report, Row, Status};
-use crate::{paths, settings, source, util};
+use crate::{logos, paths, settings, source, util};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -85,6 +85,12 @@ enum Confirm {
         id: String,
         name: String,
     },
+    /// Turning `cli_on_path` (or `agent_skill` when `skill`) on or off.
+    Integration {
+        skill: bool,
+        on: bool,
+        plan: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +110,8 @@ enum Msg {
     Versions(String, Result<Vec<RemoteTag>, String>),
     /// Leftovers of removed plugins, for the `X` dialog.
     Orphans(Result<Vec<Orphan>, String>),
+    /// A picture for the detail panels, ready to draw (or why not).
+    Logo(String, Result<ratatui_image::protocol::Protocol, String>),
     /// Progress of the running operation.
     Task(TaskEvent),
 }
@@ -258,6 +266,10 @@ struct App {
     picker: Option<Picker>,
     cleaner: Option<Cleaner>,
     settings: Option<SettingsDialog>,
+    /// The terminal's image protocol; None where it has none.
+    graphics: Option<ratatui_image::picker::Picker>,
+    /// Pictures by URL: None while loading or when unavailable.
+    logos: HashMap<String, Option<ratatui_image::protocol::Protocol>>,
     /// Default branch names, for the `ref` line.
     branches: HashMap<String, String>,
     market: MarketState,
@@ -292,6 +304,8 @@ impl App {
             picker: None,
             cleaner: None,
             settings: None,
+            graphics: None,
+            logos: HashMap::new(),
             branches: HashMap::new(),
             market: MarketState {
                 entries: Vec::new(),
@@ -475,6 +489,9 @@ impl App {
                 }
                 Msg::Versions(id, result) => fill_picker(self, &id, result),
                 Msg::Orphans(result) => fill_cleaner(self, result),
+                Msg::Logo(url, result) => {
+                    self.logos.insert(url, result.ok());
+                }
                 Msg::Task(event) => task_event(self, event),
                 Msg::Market(generation, results) => {
                     if generation != self.market.generation {
@@ -656,6 +673,14 @@ pub fn run(ctx: Ctx) -> Result<()> {
         app.say(Level::Warn, "dry run: changes are printed, not made");
     }
 
+    let config = &app.ctx.config;
+    if !app.ctx.dry_run && (config.cli_on_path || config.agent_skill) {
+        let herdr = app.ctx.herdr.clone();
+        let (cli, skill) = (config.cli_on_path, config.agent_skill);
+        std::thread::spawn(move || {
+            let _ = crate::integrate::refresh(&herdr, cli, skill);
+        });
+    }
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -663,6 +688,9 @@ pub fn run(ctx: Ctx) -> Result<()> {
         default_hook(info);
     }));
     ops::set_plain();
+    if app.ctx.config.logos {
+        app.graphics = detect_graphics();
+    }
     enter(&mut term)?;
     match ops::claim_auto_update(
         &app.ctx.config,
@@ -682,6 +710,7 @@ fn event_loop(app: &mut App, term: &mut Term) -> Result<()> {
     let mut dirty = true;
     let mut last_tick = Instant::now();
     loop {
+        request_logo(app);
         if app.drain() {
             dirty = true;
         }
@@ -739,6 +768,11 @@ enum Job {
     TakeOver(String),
     /// What `[auto_update] trigger = "popup"` (or a due min-interval) runs.
     AutoUpdate,
+    /// Turn `cli_on_path` (or `agent_skill` when `skill`) on or off.
+    Integrate {
+        skill: bool,
+        on: bool,
+    },
     Unpin(String),
     Switch(String, String),
     /// Open config.toml in the external editor.
@@ -808,6 +842,18 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Switch(id, r) => (format!("Switching {id} to {r}"), one(id), false, false),
         Job::TakeOver(id) => (format!("Taking over {id}"), one(id), false, false),
         Job::AutoUpdate => ("Auto-updating plugins".to_string(), None, true, true),
+        Job::Integrate { skill, on } => (
+            match (skill, on) {
+                (false, true) => "Putting herdr-pm on your PATH",
+                (false, false) => "Taking herdr-pm off your PATH",
+                (true, true) => "Linking the agent skill",
+                (true, false) => "Unlinking the agent skill",
+            }
+            .to_string(),
+            None,
+            false,
+            true,
+        ),
         Job::Clean(ids) => (
             format!("Cleaning leftovers of {}", ids.join(", ")),
             None,
@@ -844,6 +890,8 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Rollback(id) => Box::new(move |ctx| ops::rollback(ctx, &id)),
         Job::PinTo(id, commit) => Box::new(move |ctx| ops::pin(ctx, &id, Some(&commit))),
         Job::TakeOver(id) => Box::new(move |ctx| ops::take_over(ctx, &id)),
+        Job::Integrate { skill: false, on } => Box::new(move |ctx| ops::set_cli_on_path(ctx, on)),
+        Job::Integrate { skill: true, on } => Box::new(move |ctx| ops::set_agent_skill(ctx, on)),
         Job::AutoUpdate => Box::new(|ctx| match ops::auto_update(ctx)? {
             0 => Ok(()),
             failures => anyhow::bail!("{failures} auto-update(s) failed"),
@@ -953,6 +1001,9 @@ fn apply_setting(app: &mut App, field: &settings::Field, action: settings::Actio
     })();
     let error = match result {
         Ok(config) => {
+            if !config.logos {
+                app.graphics = None;
+            }
             app.ctx.config = config;
             if matches!(field, settings::Field::Market(_)) {
                 app.market.source = None;
@@ -1037,6 +1088,33 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         _ => return None,
     };
     if kind == Kind::AddAlias {
+        return None;
+    }
+    if matches!(
+        field,
+        settings::Field::CliOnPath | settings::Field::AgentSkill
+    ) {
+        // These change the system, not only config.toml: confirm, then run.
+        let skill = field == settings::Field::AgentSkill;
+        let config = &app.ctx.config;
+        let on = !if skill {
+            config.agent_skill
+        } else {
+            config.cli_on_path
+        };
+        let plan = if skill {
+            crate::integrate::skill_plan(on, config.cli_on_path)
+        } else {
+            crate::integrate::cli_plan(on)
+        };
+        match plan {
+            Ok(plan) => app.confirm = Some(Confirm::Integration { skill, on, plan }),
+            Err(err) => {
+                if let Some(dialog) = app.settings.as_mut() {
+                    dialog.error = Some(format!("{err:#}"));
+                }
+            }
+        }
         return None;
     }
     apply_setting(app, &field, action);
@@ -1222,6 +1300,10 @@ fn finish_task(app: &mut App) {
         return;
     };
     app.reload();
+    // Some tasks write config.toml (integrations).
+    if let Ok(config) = Config::load() {
+        app.ctx.config = config;
+    }
     match &task.touched {
         Some(ids) => app.start_checks(Some(ids)),
         None => app.start_checks(None),
@@ -1834,6 +1916,7 @@ fn answer_confirm(app: &mut App, confirm: Confirm, key: KeyEvent) -> Option<Job>
             _ => None,
         },
         Confirm::UpdateAll(ids) if yes => Some(Job::Update(ids)),
+        Confirm::Integration { skill, on, .. } if yes => Some(Job::Integrate { skill, on }),
         Confirm::AutoUpdateOn { id, name } if yes => {
             match ops::set_auto_update(&app.ctx, &id, true) {
                 Ok(()) => {
@@ -2248,10 +2331,7 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(WARN),
         ));
     }
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }),
-        pad_rect(area),
-    );
+    render_detail(f, app, area, lines, logos::for_row(row));
 }
 
 fn pad_rect(area: Rect) -> Rect {
@@ -2426,10 +2506,119 @@ fn draw_market_detail(f: &mut Frame, app: &App, area: Rect) {
             ]));
         }
     }
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }),
-        pad_rect(area),
-    );
+    let logo = app
+        .market
+        .entries
+        .get(app.market.sel)
+        .and_then(logos::for_entry);
+    render_detail(f, app, area, lines, logo);
+}
+
+/// Width and height of the picture in the detail panels, in cells (about
+/// square on usual fonts).
+const LOGO: (u16, u16) = (10, 5);
+
+/// The detail text, with the picture at its right when there is one.
+fn render_detail(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    logo: Option<String>,
+) {
+    let area = pad_rect(area);
+    let picture = logo
+        .and_then(|url| app.logos.get(&url))
+        .and_then(Option::as_ref)
+        .filter(|_| area.width > LOGO.0 * 3);
+    let text_area = match picture {
+        Some(protocol) => {
+            let rect = Rect {
+                x: area.right() - LOGO.0,
+                y: area.y,
+                width: LOGO.0,
+                height: LOGO.1.min(area.height),
+            };
+            f.render_widget(ratatui_image::Image::new(protocol), rect);
+            Rect {
+                width: area.width - LOGO.0 - 1,
+                ..area
+            }
+        }
+        None => area,
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
+}
+
+/// The terminal's image protocol (Kitty, Sixel, iTerm2), or None.
+///
+/// Only terminals known to draw images are asked: the capability query
+/// leaves a thread reading stdin when nothing answers, which would eat
+/// keystrokes. Inside Herdr, which draws Kitty images itself in compatible
+/// outer terminals and does not answer the query, Kitty is used directly.
+fn detect_graphics() -> Option<ratatui_image::picker::Picker> {
+    use ratatui_image::picker::{cap_parser::QueryStdioOptions, Picker, ProtocolType};
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    let (term, program) = (var("TERM"), var("TERM_PROGRAM"));
+    let kitty_outer = !var("KITTY_WINDOW_ID").is_empty()
+        || term == "xterm-kitty"
+        || term == "xterm-ghostty"
+        || program.eq_ignore_ascii_case("ghostty");
+    let other = matches!(program.as_str(), "WezTerm" | "iTerm.app" | "rio")
+        || var("LC_TERMINAL").contains("iTerm")
+        || !var("KONSOLE_VERSION").is_empty()
+        || ["foot", "mlterm", "contour"]
+            .iter()
+            .any(|t| term.contains(t));
+    if var("HERDR_ENV") == "1" {
+        if !kitty_outer {
+            return None;
+        }
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        return Some(picker);
+    }
+    if !kitty_outer && !other {
+        return None;
+    }
+    let options = QueryStdioOptions {
+        timeout: Duration::from_millis(500),
+        ..QueryStdioOptions::default()
+    };
+    Picker::from_query_stdio_with_options(options)
+        .ok()
+        .filter(|p| p.protocol_type() != ProtocolType::Halfblocks)
+}
+
+/// Starts loading the picture the detail panel shows, once per URL.
+fn request_logo(app: &mut App) {
+    let Some(graphics) = app.graphics.clone() else {
+        return;
+    };
+    let url = match app.view {
+        View::Installed => app.selected_row().and_then(logos::for_row),
+        View::Market => app
+            .market
+            .entries
+            .get(app.market.sel)
+            .and_then(logos::for_entry),
+    };
+    let Some(url) = url.filter(|u| !app.logos.contains_key(u)) else {
+        return;
+    };
+    app.logos.insert(url.clone(), None);
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        let result = logos::load(&url)
+            .and_then(|image| {
+                let size = ratatui::layout::Size::new(LOGO.0, LOGO.1);
+                graphics
+                    .new_protocol(image, size, ratatui_image::Resize::Fit(None))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(Msg::Logo(url, result));
+    });
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -2570,6 +2759,20 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
             ],
             yes_no(),
         ),
+        Confirm::Integration { skill, on, plan } => {
+            let mut b = plan.clone();
+            b.push(String::new());
+            b.push(if *on { "Turn it on?" } else { "Turn it off?" }.to_string());
+            (
+                if *skill {
+                    "Agent skill"
+                } else {
+                    "herdr-pm on PATH"
+                },
+                b,
+                yes_no(),
+            )
+        }
         Confirm::UpdateAll(ids) => {
             let mut b = vec![format!("Update {} plugin(s)?", ids.len())];
             b.extend(ids.iter().take(8).map(|i| format!("  • {i}")));

@@ -27,10 +27,15 @@ pub enum Field {
     CheckConcurrency,
     UseGhCli,
     GithubViaGit,
+    Logos,
     Editor,
     Strategy,
     Trigger,
     MinInterval,
+    /// `herdr-pm` on the user's PATH.
+    CliOnPath,
+    /// The `herdr-pm` agent skill.
+    AgentSkill,
     /// Strategy of one plugin (`[auto_update.plugins]`).
     PluginStrategy(String),
     /// A marketplace source, turned on or off.
@@ -54,7 +59,12 @@ impl Field {
     pub fn kind(&self) -> Kind {
         match self {
             Field::KeepInstalls | Field::MarketTtl | Field::CheckConcurrency => Kind::Number,
-            Field::UseGhCli | Field::GithubViaGit | Field::Market(_) => Kind::Toggle,
+            Field::UseGhCli
+            | Field::GithubViaGit
+            | Field::Logos
+            | Field::Market(_)
+            | Field::CliOnPath
+            | Field::AgentSkill => Kind::Toggle,
             Field::Strategy | Field::Trigger | Field::PluginStrategy(_) => Kind::Choice,
             Field::Editor | Field::MinInterval => Kind::Text,
             Field::Alias(_) => Kind::Alias,
@@ -153,6 +163,16 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
         ),
         row(
             "General",
+            "logos",
+            if config.logos {
+                "on: pictures where the terminal draws images".to_string()
+            } else {
+                "off".to_string()
+            },
+            Field::Logos,
+        ),
+        row(
+            "General",
             "editor",
             config
                 .editor
@@ -237,6 +257,26 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
         "+ add an alias",
         String::new(),
         Field::AddAlias,
+    ));
+    rows.push(row(
+        "Integrations",
+        "cli_on_path",
+        if config.cli_on_path {
+            "on: herdr-pm is on your PATH, following updates".to_string()
+        } else {
+            "off".to_string()
+        },
+        Field::CliOnPath,
+    ));
+    rows.push(row(
+        "Integrations",
+        "agent_skill",
+        if config.agent_skill {
+            "on: coding agents know herdr-pm".to_string()
+        } else {
+            "off".to_string()
+        },
+        Field::AgentSkill,
     ));
     rows
 }
@@ -333,12 +373,45 @@ fn put(slot: &mut Item, new: impl Into<toml_edit::Value>) {
     *slot = Item::Value(new);
 }
 
+/// `Set("true"|"false")` sets a switch; any other action flips it.
+fn flag(action: &Action, current: bool) -> bool {
+    match action {
+        Action::Set(text) => text == "true",
+        _ => !current,
+    }
+}
+
+/// Applies one change to `config.toml` on disk (the example when it does
+/// not exist yet) and returns the resulting configuration.
+pub fn write(field: &Field, action: &Action) -> Result<Config> {
+    let path = crate::paths::pm_config_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            crate::config::EXAMPLE.to_string()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let updated = change(&text, field, action)?;
+    let config = Config::parse(&updated)?;
+    if updated != text {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, updated)
+            .with_context(|| format!("could not write {}", path.display()))?;
+    }
+    Ok(config)
+}
+
 /// Applies one change to the text of `config.toml` and returns the new
 /// text, refused unless `Config::parse` accepts it.
 pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
     let config = Config::parse(text)?;
     let mut doc: DocumentMut = text.parse()?;
     match field {
+        Field::CliOnPath => put(&mut doc["cli_on_path"], flag(action, config.cli_on_path)),
+        Field::AgentSkill => put(&mut doc["agent_skill"], flag(action, config.agent_skill)),
         Field::KeepInstalls => put(
             &mut doc["keep_installs"],
             step(config.keep_installs as u64, action, 1, 0)?,
@@ -353,6 +426,7 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
         ),
         Field::UseGhCli => put(&mut doc["use_gh_cli"], !config.use_gh_cli),
         Field::GithubViaGit => put(&mut doc["github_via_git"], !config.github_via_git),
+        Field::Logos => put(&mut doc["logos"], flag(action, config.logos)),
         Field::Trigger => {
             let next = cycle(&TRIGGERS, config.auto_update.trigger, action);
             put(

@@ -56,6 +56,9 @@ pub struct Entry {
     pub platforms: Option<Vec<String>>,
     #[serde(default)]
     pub min_herdr_version: Option<String>,
+    /// Project or owner picture, shown where the terminal draws images.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 impl Entry {
@@ -272,6 +275,14 @@ pub fn http_get_text(url: &str, token: Option<&str>, timeout: Duration) -> Resul
     Ok(text)
 }
 
+/// A small binary download (pictures), at most `limit` bytes.
+pub fn http_get_bytes(url: &str, timeout: Duration, limit: u64) -> Result<Vec<u8>> {
+    let response = http_get(url, &[], timeout)?;
+    let mut bytes = Vec::new();
+    response.into_reader().take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn http_get_json(
     url: &str,
     headers: &[(&str, String)],
@@ -447,6 +458,7 @@ fn fetch_github(source: &MarketSource, query: &str, config: &Config) -> Result<L
                 web_url: repo["html_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(&repo, &["/owner/avatar_url"], None),
             });
         }
         // The search API stops at 1000 results.
@@ -462,6 +474,31 @@ fn fetch_github(source: &MarketSource, query: &str, config: &Config) -> Result<L
         fetched_unix: util::now_unix(),
         ..Listing::default()
     })
+}
+
+/// GitHub serves every account's picture at a stable address.
+pub fn github_avatar(owner: &str) -> String {
+    format!("https://github.com/{owner}.png?size=96")
+}
+
+/// The first non-empty picture URL among `pointers` (JSON pointers),
+/// made absolute against `base` when the forge returns a path.
+fn image_at(value: &serde_json::Value, pointers: &[&str], base: Option<&str>) -> Option<String> {
+    let url = pointers
+        .iter()
+        .filter_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+        .find(|s| !s.trim().is_empty())?;
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_string())
+    } else {
+        base.map(|b| {
+            format!(
+                "{}/{}",
+                b.trim_end_matches('/'),
+                url.trim_start_matches('/')
+            )
+        })
+    }
 }
 
 fn clone_url(
@@ -532,6 +569,7 @@ fn fetch_gitea(source: &MarketSource) -> Result<Listing> {
                 web_url: repo["html_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(&repo, &["/avatar_url", "/owner/avatar_url"], Some(base)),
             });
         }
         if count < limit {
@@ -601,6 +639,11 @@ fn fetch_gitlab(source: &MarketSource) -> Result<Listing> {
                 web_url: project["web_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(
+                    &project,
+                    &["/avatar_url", "/namespace/avatar_url", "/owner/avatar_url"],
+                    Some(base),
+                ),
             });
         }
         if count < per_page {
@@ -634,6 +677,7 @@ fn index_entries(source: &MarketSource, index: Index) -> Vec<Entry> {
             updated_unix: p.updated_unix,
             platforms: p.platforms,
             min_herdr_version: p.min_herdr_version,
+            image: None,
         })
         .collect()
 }
@@ -784,6 +828,7 @@ fn herdr_entries(source: &MarketSource, text: &str) -> Result<(Vec<Entry>, Optio
                 web_url: Some(web_url),
                 platforms: manifest.platforms,
                 min_herdr_version: manifest.min_herdr_version,
+                image: repo.full_name.split('/').next().map(github_avatar),
             });
         }
     }
@@ -993,6 +1038,35 @@ pub fn changes(old: &[Entry], new: &[Entry]) -> Changes {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pictures_come_from_the_first_listed_field_made_absolute() {
+        let gitlab = serde_json::json!({
+            "avatar_url": null,
+            "namespace": { "avatar_url": "/uploads/-/system/group/avatar/1/a.png" }
+        });
+        assert_eq!(
+            image_at(
+                &gitlab,
+                &["/avatar_url", "/namespace/avatar_url"],
+                Some("https://gitlab.com/")
+            ),
+            Some("https://gitlab.com/uploads/-/system/group/avatar/1/a.png".into())
+        );
+        let gitea = serde_json::json!({
+            "avatar_url": "",
+            "owner": { "avatar_url": "https://codeberg.org/avatars/abc" }
+        });
+        assert_eq!(
+            image_at(
+                &gitea,
+                &["/avatar_url", "/owner/avatar_url"],
+                Some("https://codeberg.org")
+            ),
+            Some("https://codeberg.org/avatars/abc".into())
+        );
+        assert_eq!(image_at(&gitea, &["/missing"], None), None);
+    }
+
     fn entry(title: &str, stars: u64, updated: u64) -> Entry {
         Entry {
             market: "m".into(),
@@ -1008,6 +1082,7 @@ mod tests {
             web_url: None,
             platforms: None,
             min_herdr_version: None,
+            image: None,
         }
     }
 

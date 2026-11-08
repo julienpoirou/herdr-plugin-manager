@@ -284,6 +284,17 @@ pub struct Config {
     /// than Herdr's installer, so `herdr plugin update` leaves them alone.
     #[serde(default = "default_true")]
     pub github_via_git: bool,
+    /// Keep a `herdr-pm` link to the current installation on the user's
+    /// PATH (`integrate`).
+    #[serde(default)]
+    pub cli_on_path: bool,
+    /// Keep the `herdr-pm` agent skill linked for the coding agents found.
+    #[serde(default)]
+    pub agent_skill: bool,
+    /// Project and owner pictures in the popup, where the terminal draws
+    /// images.
+    #[serde(default = "default_true")]
+    pub logos: bool,
     #[serde(default)]
     pub auto_update: AutoUpdate,
     /// Sources added to the built-in ones (`builtin_markets`); one with the
@@ -333,6 +344,9 @@ impl Default for Config {
             use_gh_cli: true,
             editor: None,
             github_via_git: true,
+            cli_on_path: false,
+            agent_skill: false,
+            logos: true,
             auto_update: AutoUpdate::default(),
             marketplace: Vec::new(),
         }

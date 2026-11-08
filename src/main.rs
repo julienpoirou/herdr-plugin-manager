@@ -5,6 +5,8 @@ mod config;
 mod git;
 mod herdr;
 mod index;
+mod integrate;
+mod logos;
 mod manifest;
 mod market;
 mod ops;
@@ -42,6 +44,10 @@ struct Cli {
     /// Print what would change without changing anything.
     #[arg(long, global = true, env = "HERDR_PM_DRY_RUN")]
     dry_run: bool,
+
+    /// Print the agent skill shipped with this version (SKILL.md).
+    #[arg(long)]
+    skill: bool,
 }
 
 #[derive(Args, Clone)]
@@ -229,6 +235,23 @@ enum Cmd {
     },
     /// Open the manager as a Herdr popup (what the `open` action runs).
     Open,
+    /// Keep `herdr-pm` on your PATH, following updates, or stop.
+    Path {
+        #[command(subcommand)]
+        command: Toggle,
+    },
+    /// Link the `herdr-pm` agent skill for the coding agents found (and put
+    /// `herdr-pm` on PATH), or unlink it.
+    Skill {
+        #[command(subcommand)]
+        command: Toggle,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum Toggle {
+    Enable,
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -317,6 +340,10 @@ fn code(failures: usize) -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode> {
     let dry = cli.dry_run;
     let Some(command) = cli.command else {
+        if cli.skill {
+            print!("{}", integrate::SKILL);
+            return Ok(ExitCode::SUCCESS);
+        }
         return tui::run(ctx(dry, false)?).map(|_| ExitCode::SUCCESS);
     };
     match command {
@@ -371,10 +398,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 HookArg::Startup => config::Hook::Startup,
                 HookArg::Event => config::Hook::Event,
             });
-            if !ops::claim_auto_update(&Config::load()?, hook, dry)? {
+            let config = Config::load()?;
+            if matches!(hook, Some(config::Hook::Startup)) && !dry {
+                // An update may have moved the installation since.
+                let _ = integrate::refresh(
+                    &Herdr::detect(false),
+                    config.cli_on_path,
+                    config.agent_skill,
+                );
+            }
+            if !ops::claim_auto_update(&config, hook, dry)? {
                 return Ok(ExitCode::SUCCESS);
             }
             Ok(code(ops::auto_update(&ctx(dry, true)?)?))
+        }
+        Cmd::Path { command } => {
+            ops::set_cli_on_path(&ctx(dry, false)?, matches!(command, Toggle::Enable))
+                .map(|_| ExitCode::SUCCESS)
+        }
+        Cmd::Skill { command } => {
+            ops::set_agent_skill(&ctx(dry, false)?, matches!(command, Toggle::Enable))
+                .map(|_| ExitCode::SUCCESS)
         }
         Cmd::AutoUpdate {
             command: Some(AutoUpdateCmd::Enable { id }),

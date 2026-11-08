@@ -174,7 +174,7 @@ action.
 | State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
-| Other | `o` open homepage, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
+| Other | `o` open homepage, `C` settings, `E` config.toml in your editor, `r` refresh, `?` help (scrolls), `q` quit |
 
 Install, update (one or all), removal, rollback, pinning another version and
 switching run inside the popup. The trust preview appears as a dialog (`y`
@@ -183,7 +183,15 @@ then runs in the background behind a progress dialog: the current step, a bar
 (`plugin k/n` for update-all), and the command output on `l`. It closes by
 itself on success; on failure it stays open with the output. GitHub
 shorthands get the same preview from a mirror of the repository before Herdr
-installs them. Only the editor (`c`/`C`) takes over the terminal.
+installs them. Only the external editor (`E`) takes over the terminal.
+
+`C` opens the settings: the general values, the auto-update strategy and one
+per plugin, the marketplace sources (on/off) and the aliases. `↵` types a value
+or switches it, `←`/`→` steps through numbers and strategies, `d` deletes an
+alias or puts a value back to its default. Each change is checked and written
+to `config.toml` at once, comments kept; a refused value shows why and leaves
+the file alone. Adding a marketplace source or a token is done in the file
+(`E`).
 
 The detail panel shows the installed version as `branch@commit`
 (`main@8cda521`, `v1.4.0@8cda521`), or `@8cda521 (pinned)`.
@@ -270,14 +278,15 @@ them.
 ## Configuration
 
 `herdr-pm config init` creates `config.toml` in the plugin's Herdr config
-directory; `C` opens it. Every key is optional:
+directory; `C` edits it in the popup and `E` opens it in your editor. Every
+key is optional:
 
 ```toml
 keep_installs = 3       # versions kept for rollback
 market_ttl = 600        # seconds before the marketplace is refreshed
 check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
-editor = "code --wait"  # for c/C (VISUAL, EDITOR, then vi/notepad otherwise)
+editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
 
 [auto_update]
 strategy = "latest"     # latest, release, minor or patch
@@ -291,8 +300,8 @@ lab = "https://gitlab.corp.example/{path}.git"
 ```
 
 herdr.dev, gitlab.com and codeberg.org are built in. A `[[marketplace]]`
-block adds a source; one named like a built-in replaces it, so
-`name = "codeberg.org"` with `enabled = false` hides it.
+block adds a source; one named like a built-in overrides the fields it sets,
+so `name = "codeberg.org"` with `enabled = false` hides it.
 
 ```toml
 [[marketplace]]
@@ -425,7 +434,8 @@ herdr-pm install /srv/git/mono.git//plugins/foo --ref v1.4.0
 Raccourci conseillé : `prefix+m` avec la commande
 `herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
 fonctionne aussi : molette, clic sur une ligne ou sur un onglet. `herdr-pm config
-init` crée la configuration et `?` affiche l'aide du popup.
+init` crée la configuration, `C` la modifie dans le popup (réglages, stratégies,
+sources, alias), `E` l'ouvre dans votre éditeur et `?` affiche l'aide du popup.
 
 **Mise à jour automatique** : `A` dans « Installed » l'active ou la désactive
 pour un plugin, qu'il soit activé ou non (`⟳` dans la liste). Au démarrage de

@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::git::{Git, RemoteTag};
 use crate::market::{self, Entry, Sort};
 use crate::ops::{self, Ctx, InstallRequest, Origin, Orphan, Report, Row, Status};
-use crate::{paths, source, util};
+use crate::{paths, settings, source, util};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -68,6 +68,8 @@ enum Prompt {
     Search,
     /// Typing the id confirms deleting a local link's directory.
     Purge(String),
+    /// A value typed in the settings dialog.
+    Setting(settings::Field),
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +257,7 @@ struct App {
     help_scroll: usize,
     picker: Option<Picker>,
     cleaner: Option<Cleaner>,
+    settings: Option<SettingsDialog>,
     /// Default branch names, for the `ref` line.
     branches: HashMap<String, String>,
     market: MarketState,
@@ -288,6 +291,7 @@ impl App {
             help_scroll: 0,
             picker: None,
             cleaner: None,
+            settings: None,
             branches: HashMap::new(),
             market: MarketState {
                 entries: Vec::new(),
@@ -723,7 +727,8 @@ enum Job {
     PinTo(String, String),
     Unpin(String),
     Switch(String, String),
-    EditFile(std::path::PathBuf),
+    /// Open config.toml in the external editor.
+    EditConfig,
     /// Delete what these removed plugins left behind.
     Clean(Vec<String>),
 }
@@ -749,9 +754,9 @@ fn editor_command(config: &Config) -> Vec<String> {
 /// Runs a job: the editor takes over the terminal; everything else runs as
 /// a background task behind a progress dialog.
 fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
-    if let Job::EditFile(path) = job {
+    if let Job::EditConfig = job {
         leave()?;
-        let result = edit_file(app, &path);
+        let result = edit_config(app);
         enter(term)?;
         app.reload();
         match result {
@@ -793,7 +798,7 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
             false,
             false,
         ),
-        Job::EditFile(_) => unreachable!(),
+        Job::EditConfig => unreachable!(),
     };
     let run: Operation = match job {
         Job::Install(spec) => Box::new(move |ctx| {
@@ -825,7 +830,7 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
         Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
         Job::Clean(ids) => Box::new(move |ctx| ops::clean(ctx, &ids)),
-        Job::EditFile(_) => unreachable!(),
+        Job::EditConfig => unreachable!(),
     };
     start_task(app, title, touched, batch, yes, run);
     Ok(())
@@ -868,31 +873,257 @@ fn parse_install(
     })
 }
 
-fn edit_file(app: &mut App, path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if !path.exists() && path.ends_with("config.toml") {
-        crate::config::Config::init()?;
-    }
+fn edit_config(app: &mut App) -> Result<()> {
+    let (path, _) = Config::init()?;
     let argv = editor_command(&app.ctx.config);
     if app.ctx.dry_run {
         return Ok(());
     }
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .arg(path)
+        .arg(&path)
         .status()?;
     if !status.success() {
         anyhow::bail!("editor exited with {status}");
     }
-    if path.ends_with("config.toml") {
-        match Config::load() {
-            Ok(c) => app.ctx.config = c,
-            Err(err) => anyhow::bail!("config not reloaded: {err:#}"),
-        }
+    match Config::load() {
+        Ok(c) => app.ctx.config = c,
+        Err(err) => anyhow::bail!("config not reloaded: {err:#}"),
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- settings
+
+/// The `C` dialog over `config.toml`.
+struct SettingsDialog {
+    sel: usize,
+    error: Option<String>,
+}
+
+fn settings_rows(app: &App) -> Vec<settings::Row> {
+    let plugins: Vec<String> = app
+        .rows
+        .iter()
+        .filter(|r| r.origin != Origin::Local)
+        .map(|r| r.plugin.plugin_id.clone())
+        .collect();
+    settings::rows(&app.ctx.config, &plugins)
+}
+
+/// Applies one change to `config.toml`, or shows why it was refused.
+fn apply_setting(app: &mut App, field: &settings::Field, action: settings::Action) {
+    let path = paths::pm_config_file();
+    let result = (|| -> Result<Config> {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => crate::config::EXAMPLE.into(),
+            Err(err) => return Err(err.into()),
+        };
+        let updated = settings::change(&text, field, &action)?;
+        let config = Config::parse(&updated)?;
+        if updated != text && !app.ctx.dry_run {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, updated)?;
+        }
+        Ok(config)
+    })();
+    let error = match result {
+        Ok(config) => {
+            app.ctx.config = config;
+            if matches!(field, settings::Field::Market(_)) {
+                app.market.source = None;
+                if app.market.loaded || app.market.loading {
+                    app.load_market(false);
+                }
+            }
+            None
+        }
+        Err(err) => Some(format!("{err:#}")),
+    };
+    if let Some(dialog) = app.settings.as_mut() {
+        dialog.error = error;
+    }
+}
+
+fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
+    use settings::{Action, Kind};
+    let rows = settings_rows(app);
+    let dialog = app.settings.as_mut()?;
+    let last = rows.len().saturating_sub(1);
+    dialog.sel = dialog.sel.min(last);
+    let field = rows.get(dialog.sel).map(|r| r.field.clone())?;
+    let kind = field.kind();
+    let action = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => {
+            app.settings = None;
+            return None;
+        }
+        KeyCode::Char('E') => {
+            app.settings = None;
+            return Some(Job::EditConfig);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            dialog.sel = (dialog.sel + 1).min(last);
+            return None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            dialog.sel = dialog.sel.saturating_sub(1);
+            return None;
+        }
+        KeyCode::PageDown => {
+            dialog.sel = (dialog.sel + 10).min(last);
+            return None;
+        }
+        KeyCode::PageUp => {
+            dialog.sel = dialog.sel.saturating_sub(10);
+            return None;
+        }
+        KeyCode::Home => {
+            dialog.sel = 0;
+            return None;
+        }
+        KeyCode::End => {
+            dialog.sel = last;
+            return None;
+        }
+        KeyCode::Enter if matches!(kind, Kind::Toggle | Kind::Choice) => Action::Next,
+        KeyCode::Enter => {
+            let (_, initial) = field.prompt(&app.ctx.config)?;
+            app.prompt = Some((Prompt::Setting(field), initial));
+            return None;
+        }
+        KeyCode::Char(' ') if matches!(kind, Kind::Toggle | Kind::Choice) => Action::Next,
+        KeyCode::Right | KeyCode::Char('l') if kind != Kind::Text && kind != Kind::Alias => {
+            Action::Next
+        }
+        KeyCode::Left | KeyCode::Char('h') if kind != Kind::Text && kind != Kind::Alias => {
+            Action::Prev
+        }
+        KeyCode::Char('d') | KeyCode::Delete
+            if matches!(
+                field,
+                settings::Field::Alias(_)
+                    | settings::Field::PluginStrategy(_)
+                    | settings::Field::Editor
+            ) =>
+        {
+            Action::Delete
+        }
+        _ => return None,
+    };
+    if kind == Kind::AddAlias {
+        return None;
+    }
+    apply_setting(app, &field, action);
+    None
+}
+
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    use settings::Kind;
+    let Some(dialog) = &app.settings else {
+        return;
+    };
+    let rows = settings_rows(app);
+    let sel = dialog.sel.min(rows.len().saturating_sub(1));
+    let key =
+        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let mut body: Vec<Line> = Vec::new();
+    let mut sel_line = 0;
+    let mut section = "";
+    for (i, row) in rows.iter().enumerate() {
+        if row.section != section {
+            if !section.is_empty() {
+                body.push(Line::raw(""));
+            }
+            section = row.section;
+            body.push(Line::styled(
+                section,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if i == sel {
+            sel_line = body.len();
+        }
+        let style = if i == sel {
+            Style::default()
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        body.push(
+            Line::from(vec![
+                Span::raw(format!("  {}", pad(&util::sanitize(&row.label), 34))),
+                Span::styled(util::sanitize(&row.value), muted()),
+            ])
+            .style(style),
+        );
+    }
+    let height = (area.height.saturating_sub(10) as usize).clamp(5, 30);
+    let start = sel_line
+        .saturating_sub(height / 2)
+        .min(body.len().saturating_sub(height));
+    let mut lines: Vec<Line> = body.into_iter().skip(start).take(height).collect();
+    lines.push(Line::raw(""));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::styled(
+            util::truncate(&util::sanitize(err), 84),
+            Style::default().fg(BAD),
+        ));
+    }
+    let mut hint = match rows.get(sel).map(|r| r.field.kind()) {
+        Some(Kind::Number) => vec![
+            key("↵"),
+            Span::raw(" type   "),
+            key("←→"),
+            Span::raw(" change   "),
+        ],
+        Some(Kind::Toggle) => vec![key("↵"), Span::raw(" on/off   ")],
+        Some(Kind::Choice) => vec![key("↵ ←→"), Span::raw(" change   ")],
+        Some(Kind::Text) => vec![
+            key("↵"),
+            Span::raw(" type   "),
+            key("d"),
+            Span::raw(" default   "),
+        ],
+        Some(Kind::Alias) => vec![
+            key("↵"),
+            Span::raw(" edit   "),
+            key("d"),
+            Span::raw(" delete   "),
+        ],
+        Some(Kind::AddAlias) | None => vec![key("↵"), Span::raw(" add   ")],
+    };
+    if matches!(
+        rows.get(sel).map(|r| &r.field),
+        Some(settings::Field::PluginStrategy(_))
+    ) {
+        hint.extend([key("d"), Span::raw(" default   ")]);
+    }
+    hint.extend([
+        key("E"),
+        Span::raw(" editor   "),
+        key("Esc"),
+        Span::raw(" close"),
+    ]);
+    lines.push(Line::from(hint));
+    lines.push(Line::styled(
+        util::truncate(&paths::pm_config_file().display().to_string(), 84),
+        muted(),
+    ));
+    let rect = centered(area, 90, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Settings ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// The work of a task, run on its worker thread.
@@ -1059,6 +1290,11 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
                 picker.sel = (picker.sel as isize + delta)
                     .clamp(0, picker.picks.len().saturating_sub(1) as isize)
                     as usize;
+            } else if app.settings.is_some() {
+                let last = settings_rows(app).len().saturating_sub(1);
+                if let Some(dialog) = app.settings.as_mut() {
+                    dialog.sel = (dialog.sel as isize + delta).clamp(0, last as isize) as usize;
+                }
             } else if let Some(cleaner) = &mut app.cleaner {
                 cleaner.sel = (cleaner.sel as isize + delta)
                     .clamp(0, cleaner.orphans.len().saturating_sub(1) as isize)
@@ -1069,7 +1305,11 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
             true
         }
         MouseEventKind::Down(MouseButton::Left)
-            if app.help || app.picker.is_some() || app.cleaner.is_some() || app.task.is_some() =>
+            if app.help
+                || app.picker.is_some()
+                || app.cleaner.is_some()
+                || app.settings.is_some()
+                || app.task.is_some() =>
         {
             false
         }
@@ -1195,6 +1435,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         app.prompt = Some((kind, buffer));
         return None;
     }
+    if app.settings.is_some() {
+        return settings_key(app, key);
+    }
     app.message = None;
     match key.code {
         KeyCode::Char('?') => {
@@ -1231,6 +1474,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             switch_view(app, next);
             return None;
         }
+        KeyCode::Char('C') => {
+            app.settings = Some(SettingsDialog {
+                sel: 0,
+                error: None,
+            });
+            return None;
+        }
+        KeyCode::Char('E') => return Some(Job::EditConfig),
         KeyCode::Down | KeyCode::Char('j') => move_sel(app, 1),
         KeyCode::Up | KeyCode::Char('k') => move_sel(app, -1),
         KeyCode::PageDown => move_sel(app, 10),
@@ -1390,8 +1641,6 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 ),
             }
         }
-        KeyCode::Char('c') => return Some(Job::EditFile(paths::herdr_plugins_json())),
-        KeyCode::Char('C') => return Some(Job::EditFile(paths::pm_config_file())),
         KeyCode::Char('X') => {
             open_cleaner(app);
             return None;
@@ -1524,6 +1773,10 @@ fn submit_prompt(app: &mut App, kind: Prompt, buffer: String) -> Option<Job> {
                 Some(Job::Switch(id, text))
             }
         }
+        Prompt::Setting(field) => {
+            apply_setting(app, &field, settings::Action::Set(text));
+            None
+        }
         Prompt::Purge(id) => {
             if text == id {
                 Some(Job::Uninstall(id, true))
@@ -1630,6 +1883,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.cleaner.is_some() {
         draw_cleaner(f, app, area);
+    }
+    if app.settings.is_some() {
+        draw_settings(f, app, area);
     }
     if let Some(confirm) = &app.confirm {
         draw_confirm(f, confirm, area);
@@ -2125,6 +2381,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             }
             Prompt::Switch(id) => format!("switch {id} to branch/tag/commit: "),
             Prompt::Purge(id) => format!("type {id} to delete it and its directory: "),
+            Prompt::Setting(field) => field
+                .prompt(&app.ctx.config)
+                .map(|(label, _)| label)
+                .unwrap_or_default(),
             Prompt::Filter => "filter: ".to_string(),
             Prompt::Search => "search marketplace: ".to_string(),
         };
@@ -2325,8 +2585,8 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         key("s", "switch to another branch, tag or commit"),
         key("z", "roll back to the previous installation"),
         key("o", "open the source in a browser"),
-        key("c", "edit plugins.json"),
-        key("C", "edit this manager's config"),
+        key("C", "settings: this manager's config.toml"),
+        key("E", "open config.toml in your editor"),
         key("/", "filter the list"),
         key("r", "refresh and re-check updates"),
         Line::raw(""),

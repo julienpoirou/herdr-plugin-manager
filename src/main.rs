@@ -10,6 +10,7 @@ mod market;
 mod ops;
 mod paths;
 mod registry;
+mod settings;
 mod source;
 mod tui;
 mod util;

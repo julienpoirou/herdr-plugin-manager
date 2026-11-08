@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.2...v0.15.0) (2026-11-08)
+
+
+### Features
+
+* Add followable logs and configurable JSONL or ECS history ([#47](https://github.com/julienpoirou/herdr-plugin-manager/issues/47)) ([3bcf7bb](https://github.com/julienpoirou/herdr-plugin-manager/commit/3bcf7bb815764dbc1f07e5febd0ec927ed6a9f45))
+
 ## [0.14.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.1...v0.14.2) (2026-11-08)
 
 

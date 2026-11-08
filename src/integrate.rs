@@ -3,6 +3,7 @@
 //! moved after every update.
 
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};

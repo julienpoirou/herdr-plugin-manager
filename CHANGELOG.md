@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.11.0...v0.12.0) (2026-11-08)
+
+
+### Features
+
+* Choose when auto-update runs and keep plugins out of herdr plugin update ([#37](https://github.com/julienpoirou/herdr-plugin-manager/issues/37)) ([92fbbb3](https://github.com/julienpoirou/herdr-plugin-manager/commit/92fbbb367e35968c495ae6546e5df90dc83451d5))
+
 ## [0.11.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.10.0...v0.11.0) (2026-11-08)
 
 

@@ -521,7 +521,7 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
             row.plugin.plugin_id,
             util::truncate(&util::sanitize(&row.plugin.version), 9),
             row.origin.label(),
-            ops::dim(&util::truncate(&util::sanitize(&row.source_display()), 60)),
+            ops::dim(&util::truncate(&util::sanitize(&row.source_label()), 60)),
             status_text,
         );
     }

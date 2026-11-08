@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.1...v0.14.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* A copied config.toml with cli_on_path on puts the link directory on PATH at the next refresh ([a35b912](https://github.com/julienpoirou/herdr-plugin-manager/commit/a35b9122294f3dbb1ca47b1b19231da39cb926a5))
+* Exports carry auto-update and GitHub entries import following their branch ([#45](https://github.com/julienpoirou/herdr-plugin-manager/issues/45)) ([a35b912](https://github.com/julienpoirou/herdr-plugin-manager/commit/a35b9122294f3dbb1ca47b1b19231da39cb926a5))
+
 ## [0.14.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.0...v0.14.1) (2026-11-08)
 
 

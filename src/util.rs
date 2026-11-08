@@ -282,6 +282,33 @@ pub fn ask_line(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// `90s`, `30m`, `6h`, `1d`, `1h30m` in seconds; None when malformed.
+pub fn parse_duration(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut number = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let unit = match ch {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        let n: u64 = number.parse().ok()?;
+        total = total.checked_add(n.checked_mul(unit)?)?;
+        number.clear();
+    }
+    number.is_empty().then_some(total)
+}
+
 /// `512 B`, `4.0 KB`, `12.3 MB`: one decimal from a kilobyte up.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
@@ -532,6 +559,18 @@ mod tests {
             ]
         );
         assert!(split_words("   ").is_empty());
+    }
+
+    #[test]
+    fn durations_parse_with_units_only() {
+        assert_eq!(parse_duration("90s"), Some(90));
+        assert_eq!(parse_duration("6h"), Some(21_600));
+        assert_eq!(parse_duration("1h30m"), Some(5_400));
+        assert_eq!(parse_duration(" 1d "), Some(86_400));
+        assert_eq!(parse_duration("6"), None);
+        assert_eq!(parse_duration("h"), None);
+        assert_eq!(parse_duration("6x"), None);
+        assert_eq!(parse_duration(""), None);
     }
 
     #[test]

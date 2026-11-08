@@ -338,6 +338,11 @@ pub enum Status {
         version: Option<String>,
     },
     Pinned,
+    /// Held at `pin` by an older version of this manager, but Herdr moved
+    /// it (`herdr plugin update`); `update` puts it back.
+    Moved {
+        pin: String,
+    },
     Local,
     Error {
         message: String,
@@ -348,6 +353,11 @@ pub enum Status {
 pub fn check(row: &Row, git: Git) -> Status {
     if row.origin == Origin::Local {
         return Status::Local;
+    }
+    if let (Some(pin), Some(commit)) = (&row.pin, row.commit()) {
+        if !pin.eq_ignore_ascii_case(commit) {
+            return Status::Moved { pin: pin.clone() };
+        }
     }
     if row.pinned() {
         return Status::Pinned;
@@ -448,9 +458,13 @@ pub struct InstallRequest {
     pub replace: bool,
 }
 
-/// Entry point for `install`: GitHub shorthands go to Herdr's own
-/// installer, everything else through the git pipeline.
-pub fn install(ctx: &Ctx, request: InstallRequest) -> Result<bool> {
+/// Entry point for `install`: GitHub shorthands go through the git pipeline
+/// like everything else (`github_via_git`, the default), or to Herdr's own
+/// installer.
+pub fn install(ctx: &Ctx, mut request: InstallRequest) -> Result<bool> {
+    if ctx.config.github_via_git && matches!(request.source, Source::Github { .. }) {
+        request.source = request.source.into_git();
+    }
     if request.replace && matches!(&request.source, Source::Github { .. }) {
         bail!("--replace with a GitHub shorthand needs Herdr replacement support; rerun with --git to replace it through the safe git pipeline");
     }
@@ -1351,6 +1365,21 @@ pub fn update(ctx: &Ctx, targets: &[String]) -> Result<usize> {
                 row.plugin.plugin_root
             )),
             Status::Unknown => ctx.line(format!("{} {id}: no source recorded", dim("•"))),
+            Status::Moved { pin: held } => {
+                ctx.line(format!(
+                    "{} {id} was pinned at {} but herdr moved it to {}; restoring the pin",
+                    yellow("⚠"),
+                    util::short_sha(&held),
+                    util::short_sha(row.commit().unwrap_or(""))
+                ));
+                if ctx.dry_run {
+                    continue;
+                }
+                if let Err(err) = pin(ctx, id, Some(&held)) {
+                    failures += 1;
+                    ctx.line(format!("{} {id}: {err:#}", red("✗")));
+                }
+            }
             Status::Error { message } => {
                 failures += 1;
                 ctx.line(format!("{} {id}: {message}", red("✗")));
@@ -1908,7 +1937,33 @@ pub fn set_auto_update(ctx: &Ctx, id: &str, on: bool) -> Result<()> {
     Ok(())
 }
 
-/// Updates every plugin with auto-update on (what Herdr runs at startup).
+/// Whether an auto-update should start now, and if so records its start
+/// (under the registry lock, so hooks firing together run it once).
+/// `hook` is None for an explicit `herdr-pm auto-update`.
+pub fn claim_auto_update(
+    config: &Config,
+    hook: Option<crate::config::Hook>,
+    dry_run: bool,
+) -> Result<bool> {
+    let now = util::now_unix();
+    let mut locked = Registry::lock()?;
+    if let Some(hook) = hook {
+        if locked.registry.auto_update.is_empty()
+            || !config
+                .auto_update
+                .due(hook, now, locked.registry.last_auto_update)
+        {
+            return Ok(false);
+        }
+    }
+    if !dry_run {
+        locked.registry.last_auto_update = now;
+        locked.save()?;
+    }
+    Ok(true)
+}
+
+/// Updates every plugin with auto-update on, each by its strategy.
 /// Callers pass a `ctx` with `yes`: nobody is there to review a preview.
 /// Pinned plugins stay where they are. Returns the number of failures.
 pub fn auto_update(ctx: &Ctx) -> Result<usize> {
@@ -1947,6 +2002,13 @@ pub fn auto_update(ctx: &Ctx) -> Result<usize> {
 /// tag, which Herdr then follows.
 fn update_to_release(ctx: &Ctx, row: &Row, strategy: crate::config::Strategy) -> Result<()> {
     let id = &row.plugin.plugin_id;
+    if let Status::Moved { pin: held } = check(row, ctx.git()) {
+        ctx.line(format!(
+            "{} {id} was moved off its pin by herdr; restoring it",
+            yellow("⚠")
+        ));
+        return pin(ctx, id, Some(&held));
+    }
     if row.pinned() {
         ctx.line(format!("{} {id} is pinned (skipped)", dim("•")));
         return Ok(());
@@ -2115,13 +2177,15 @@ fn log_pin_change(row: &Row, action: &str, commit: Option<&str>) {
     });
 }
 
-/// Holds a plugin at the commit it runs now, without reinstalling it.
+/// Holds a git-managed plugin at the commit it runs now, without
+/// reinstalling it. A plugin Herdr installed only stays put at a commit it
+/// installed itself, so `pin` reinstalls those.
 /// Prints nothing, so the popup can call it. Returns the short commit.
 pub fn pin_current(ctx: &Ctx, id: &str) -> Result<String> {
     let row = require_row(ctx, id)?;
     let id = row.plugin.plugin_id.clone();
-    if row.origin == Origin::Local {
-        bail!("{id} is a local link; there is nothing to pin");
+    if row.origin != Origin::Git {
+        bail!("{id} is not managed by this manager's git pipeline; `herdr-pm pin {id}` reinstalls it at its commit");
     }
     let commit = row
         .commit()
@@ -2129,13 +2193,9 @@ pub fn pin_current(ctx: &Ctx, id: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("{id} has no recorded commit"))?;
     if !ctx.dry_run {
         let mut locked = Registry::lock()?;
-        if row.origin == Origin::Git {
-            if let Some(rec) = locked.registry.plugins.get_mut(&id) {
-                rec.requested_ref = Some(commit.clone());
-                rec.current.requested_ref = rec.requested_ref.clone();
-            }
-        } else {
-            locked.registry.pins.insert(id.clone(), commit.clone());
+        if let Some(rec) = locked.registry.plugins.get_mut(&id) {
+            rec.requested_ref = Some(commit.clone());
+            rec.current.requested_ref = rec.requested_ref.clone();
         }
         locked.save()?;
         drop(locked);
@@ -2197,9 +2257,11 @@ pub fn default_branch(row: &Row) -> Option<String> {
     Git::BACKGROUND.default_branch(&url).ok().flatten()
 }
 
-/// Holds a plugin at its current commit, or at `reference`. Pinning the
-/// commit already installed only records it; another commit is installed
-/// (with its preview) and held there.
+/// Holds a plugin at its current commit, or at `reference`. A git-managed
+/// plugin already at that commit only records it; anything else is
+/// installed at the commit (with its preview). For a plugin Herdr installed
+/// that is always a reinstall: Herdr keeps a commit only when it installed
+/// it, and `herdr plugin update` would move it otherwise.
 pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
     let row = require_row(ctx, id)?;
     if row.origin == Origin::Local {
@@ -2218,14 +2280,30 @@ pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
             Some(ctx.git().ls_remote(&url, Some(r))?)
         }
     };
-    let sha = match target {
-        Some(sha) if row.commit().is_none_or(|c| !c.eq_ignore_ascii_case(&sha)) => sha,
-        _ => {
-            let short = pin_current(ctx, id)?;
-            ctx.line(format!("{} Pinned {id} at {short}.", green("✓")));
-            return Ok(());
-        }
-    };
+    let current = row.commit().map(str::to_string);
+    let sha = target
+        .or_else(|| current.clone())
+        .ok_or_else(|| anyhow!("{id} has no recorded commit"))?;
+    let same = current
+        .as_deref()
+        .is_some_and(|c| c.eq_ignore_ascii_case(&sha));
+    if same && row.origin == Origin::Git {
+        let short = pin_current(ctx, id)?;
+        ctx.line(format!("{} Pinned {id} at {short}.", green("✓")));
+        return Ok(());
+    }
+    let held_by_herdr = row
+        .requested_ref()
+        .is_some_and(|r| r.eq_ignore_ascii_case(&sha));
+    if same && held_by_herdr {
+        forget_pin(id)?;
+        ctx.line(format!(
+            "{} {id} is already pinned at {}.",
+            green("✓"),
+            util::short_sha(&sha)
+        ));
+        return Ok(());
+    }
     match row.origin {
         Origin::Git => {
             let record = row.record.unwrap();
@@ -2253,6 +2331,53 @@ pub fn pin(ctx: &Ctx, id: &str, reference: Option<&str>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Moves a plugin Herdr installed from GitHub to this manager's git
+/// pipeline (with the usual preview), at the commit it runs now and
+/// following the same ref, enabled or not as before. `herdr plugin update`
+/// leaves it alone afterwards; rollback and history apply.
+pub fn take_over(ctx: &Ctx, id: &str) -> Result<()> {
+    let row = require_row(ctx, id)?;
+    let id = row.plugin.plugin_id.clone();
+    if row.origin != Origin::Github {
+        bail!("{id} is not a plugin Herdr installed from GitHub");
+    }
+    if id == paths::PLUGIN_ID {
+        bail!("the manager stays a Herdr GitHub install so `herdr plugin update` can update it");
+    }
+    let spec = row
+        .plugin
+        .source
+        .github_spec()
+        .ok_or_else(|| anyhow!("{id} has no GitHub source"))?;
+    let Source::Git { url, subdir } =
+        source::parse(&format!("github:{spec}"), &ctx.config.aliases)?.into_git()
+    else {
+        bail!("{spec} is not a GitHub shorthand");
+    };
+    // An older pin of this manager, or the ref Herdr recorded.
+    let follow = row
+        .pin
+        .clone()
+        .or_else(|| row.requested_ref().map(str::to_string));
+    let took = install_git(
+        ctx,
+        GitRequest {
+            url,
+            subdir,
+            checkout_ref: row.pin.clone().or_else(|| row.commit().map(str::to_string)),
+            follow_ref: Some(follow),
+            mode: Mode::Install,
+            enabled: Some(row.plugin.enabled),
+            replace: true,
+            expect_id: Some(id.clone()),
+        },
+    )?;
+    if took {
+        forget_pin(&id)?;
+    }
+    Ok(())
 }
 
 /// Follows a branch or tag again (the default branch when None).

@@ -156,14 +156,81 @@ impl Strategy {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// What starts an auto-update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Trigger {
+    /// When the Herdr server starts.
+    #[default]
+    Startup,
+    /// When the popup opens.
+    Popup,
+    /// At most once per `min_interval`, checked at server start, when the
+    /// popup opens and when a tab or pane is created.
+    MinInterval,
+    /// Only `herdr-pm auto-update`.
+    Manual,
+}
+
+impl Trigger {
+    pub fn label(self) -> &'static str {
+        match self {
+            Trigger::Startup => "startup",
+            Trigger::Popup => "popup",
+            Trigger::MinInterval => "min-interval",
+            Trigger::Manual => "manual",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Trigger::Startup => "when the Herdr server starts",
+            Trigger::Popup => "when the popup opens",
+            Trigger::MinInterval => "at most once per min_interval",
+            Trigger::Manual => "only with herdr-pm auto-update",
+        }
+    }
+}
+
+/// What asks whether an auto-update is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hook {
+    /// The `[[startup]]` hook.
+    Startup,
+    /// The `[[events]]` hooks (a tab or pane was created).
+    Event,
+    /// The popup opened.
+    Popup,
+}
+
+fn default_min_interval() -> String {
+    "6h".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoUpdate {
     #[serde(default)]
     pub strategy: Strategy,
+    #[serde(default)]
+    pub trigger: Trigger,
+    /// For `trigger = "min-interval"`: `30m`, `6h`, `1d`, `1h30m`.
+    #[serde(default = "default_min_interval")]
+    pub min_interval: String,
     /// Per-plugin strategies, by plugin id.
     #[serde(default)]
     pub plugins: BTreeMap<String, Strategy>,
+}
+
+impl Default for AutoUpdate {
+    fn default() -> Self {
+        AutoUpdate {
+            strategy: Strategy::default(),
+            trigger: Trigger::default(),
+            min_interval: default_min_interval(),
+            plugins: BTreeMap::new(),
+        }
+    }
 }
 
 impl AutoUpdate {
@@ -172,6 +239,21 @@ impl AutoUpdate {
             .get(plugin_id)
             .copied()
             .unwrap_or(self.strategy)
+    }
+
+    /// `min_interval` in seconds (checked by `Config::check`).
+    pub fn min_interval_secs(&self) -> u64 {
+        crate::util::parse_duration(&self.min_interval).unwrap_or(6 * 3600)
+    }
+
+    /// Whether `hook` starts an auto-update now; `last` is when one last
+    /// started.
+    pub fn due(&self, hook: Hook, now: u64, last: u64) -> bool {
+        match (self.trigger, hook) {
+            (Trigger::Startup, Hook::Startup) | (Trigger::Popup, Hook::Popup) => true,
+            (Trigger::MinInterval, _) => now.saturating_sub(last) >= self.min_interval_secs(),
+            _ => false,
+        }
     }
 }
 
@@ -198,6 +280,10 @@ pub struct Config {
     /// Editor for the `E` key (falls back to VISUAL, EDITOR, then vi/notepad).
     #[serde(default)]
     pub editor: Option<String>,
+    /// Install GitHub shorthands through this manager's git pipeline rather
+    /// than Herdr's installer, so `herdr plugin update` leaves them alone.
+    #[serde(default = "default_true")]
+    pub github_via_git: bool,
     #[serde(default)]
     pub auto_update: AutoUpdate,
     /// Sources added to the built-in ones (`builtin_markets`); one with the
@@ -246,6 +332,7 @@ impl Default for Config {
             check_concurrency: default_concurrency(),
             use_gh_cli: true,
             editor: None,
+            github_via_git: true,
             auto_update: AutoUpdate::default(),
             marketplace: Vec::new(),
         }
@@ -261,6 +348,7 @@ market_ttl = 600    # seconds
 
 [auto_update]
 strategy = "latest" # latest, release, minor or patch
+trigger = "startup" # startup, popup, min-interval or manual
 "#;
 
 impl Config {
@@ -326,6 +414,14 @@ impl Config {
     }
 
     pub fn check(&self) -> Result<()> {
+        match crate::util::parse_duration(&self.auto_update.min_interval) {
+            Some(secs) if secs >= 60 => {}
+            Some(_) => bail!("auto_update.min_interval must be at least 1m"),
+            None => bail!(
+                "auto_update.min_interval {:?} is not a duration such as 30m, 6h or 1d",
+                self.auto_update.min_interval
+            ),
+        }
         let mut names = std::collections::BTreeSet::new();
         for source in &self.marketplace {
             if source.name.trim().is_empty() {
@@ -441,6 +537,34 @@ mod tests {
         let gitlab = &config.marketplace[1];
         assert_eq!(gitlab.kind, MarketKind::Gitlab);
         assert_eq!(gitlab.url.as_deref(), Some("https://gitlab.example"));
+    }
+
+    #[test]
+    fn triggers_decide_which_hooks_update() {
+        let auto = |trigger: &str| {
+            Config::parse(&format!(
+                "[auto_update]\ntrigger = \"{trigger}\"\nmin_interval = \"1h\"\n"
+            ))
+            .unwrap()
+            .auto_update
+        };
+        let now = 100_000;
+        let startup = auto("startup");
+        assert!(startup.due(Hook::Startup, now, now));
+        assert!(!startup.due(Hook::Event, now, 0));
+        assert!(!startup.due(Hook::Popup, now, 0));
+        let popup = auto("popup");
+        assert!(popup.due(Hook::Popup, now, now));
+        assert!(!popup.due(Hook::Startup, now, 0));
+        let interval = auto("min-interval");
+        assert!(interval.due(Hook::Event, now, now - 3600));
+        assert!(!interval.due(Hook::Startup, now, now - 3599));
+        let manual = auto("manual");
+        assert!([Hook::Startup, Hook::Event, Hook::Popup]
+            .iter()
+            .all(|h| !manual.due(*h, now, 0)));
+        assert!(Config::parse("[auto_update]\nmin_interval = \"30s\"\n").is_err());
+        assert!(Config::parse("[auto_update]\nmin_interval = \"soon\"\n").is_err());
     }
 
     #[test]

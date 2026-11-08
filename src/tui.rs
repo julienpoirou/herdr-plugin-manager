@@ -555,7 +555,7 @@ impl App {
             .filter(|r| {
                 matches!(
                     self.checks.get(&r.plugin.plugin_id),
-                    Some(Check::Done(Status::Available { .. }))
+                    Some(Check::Done(Status::Available { .. } | Status::Moved { .. }))
                 )
             })
             .map(|r| r.plugin.plugin_id.clone())
@@ -663,6 +663,15 @@ pub fn run(ctx: Ctx) -> Result<()> {
     }));
     ops::set_plain();
     enter(&mut term)?;
+    match ops::claim_auto_update(
+        &app.ctx.config,
+        Some(crate::config::Hook::Popup),
+        app.ctx.dry_run,
+    ) {
+        Ok(true) => run_job(&mut app, &mut term, Job::AutoUpdate)?,
+        Ok(false) => {}
+        Err(err) => app.say(Level::Error, format!("auto-update: {err:#}")),
+    }
     let result = event_loop(&mut app, &mut term);
     leave()?;
     result
@@ -725,6 +734,10 @@ enum Job {
     Rollback(String),
     /// Install this commit and hold the plugin there.
     PinTo(String, String),
+    /// Move a plugin Herdr installed from GitHub to the git pipeline.
+    TakeOver(String),
+    /// What `[auto_update] trigger = "popup"` (or a due min-interval) runs.
+    AutoUpdate,
     Unpin(String),
     Switch(String, String),
     /// Open config.toml in the external editor.
@@ -792,6 +805,8 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         ),
         Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false, false),
         Job::Switch(id, r) => (format!("Switching {id} to {r}"), one(id), false, false),
+        Job::TakeOver(id) => (format!("Taking over {id}"), one(id), false, false),
+        Job::AutoUpdate => ("Auto-updating plugins".to_string(), None, true, true),
         Job::Clean(ids) => (
             format!("Cleaning leftovers of {}", ids.join(", ")),
             None,
@@ -827,6 +842,11 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Uninstall(id, purge) => Box::new(move |ctx| ops::uninstall(ctx, &id, purge)),
         Job::Rollback(id) => Box::new(move |ctx| ops::rollback(ctx, &id)),
         Job::PinTo(id, commit) => Box::new(move |ctx| ops::pin(ctx, &id, Some(&commit))),
+        Job::TakeOver(id) => Box::new(move |ctx| ops::take_over(ctx, &id)),
+        Job::AutoUpdate => Box::new(|ctx| match ops::auto_update(ctx)? {
+            0 => Ok(()),
+            failures => anyhow::bail!("{failures} auto-update(s) failed"),
+        }),
         Job::Unpin(id) => Box::new(move |ctx| ops::unpin(ctx, &id, None)),
         Job::Switch(id, reference) => Box::new(move |ctx| ops::switch(ctx, &id, &reference)),
         Job::Clean(ids) => Box::new(move |ctx| ops::clean(ctx, &ids)),
@@ -1008,6 +1028,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 settings::Field::Alias(_)
                     | settings::Field::PluginStrategy(_)
                     | settings::Field::Editor
+                    | settings::Field::MinInterval
             ) =>
         {
             Action::Delete
@@ -1641,6 +1662,22 @@ fn installed_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 ),
             }
         }
+        KeyCode::Char('t') => {
+            let row = row?;
+            if row.origin != Origin::Github {
+                app.say(
+                    Level::Info,
+                    format!("{} is already managed here, not by herdr", row.plugin.name),
+                );
+            } else if row.plugin.plugin_id == paths::PLUGIN_ID {
+                app.say(
+                    Level::Info,
+                    "the manager stays a Herdr GitHub install so herdr can update it",
+                );
+            } else {
+                return Some(Job::TakeOver(row.plugin.plugin_id.clone()));
+            }
+        }
         KeyCode::Char('X') => {
             open_cleaner(app);
             return None;
@@ -1974,6 +2011,10 @@ fn status_span(app: &App, row: &Row) -> Span<'static> {
                 Style::default().fg(WARN).add_modifier(Modifier::BOLD),
             ),
             Status::Pinned => Span::raw(""),
+            Status::Moved { .. } => Span::styled(
+                "⚠ moved by herdr",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ),
             Status::Local => Span::styled("local", muted()),
             Status::Unknown => Span::styled("?", muted()),
             Status::Error { .. } => Span::styled("! check failed", Style::default().fg(BAD)),
@@ -2137,16 +2178,19 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             lines.push(kv("ref", text));
-            let strategy = app
-                .ctx
-                .config
-                .auto_update
-                .strategy_for(&row.plugin.plugin_id);
+            let auto = &app.ctx.config.auto_update;
+            let strategy = auto.strategy_for(&row.plugin.plugin_id);
+            let when = match auto.trigger {
+                crate::config::Trigger::MinInterval => {
+                    format!("at most every {}", auto.min_interval)
+                }
+                trigger => trigger.describe().to_string(),
+            };
             lines.push(kv(
                 "auto-update",
                 if row.auto_update {
                     format!(
-                        "on · {}: {} when Herdr starts (A turns it off)",
+                        "on · {}: {}, {when} (A turns it off)",
                         strategy.label(),
                         strategy.describe()
                     )
@@ -2157,6 +2201,17 @@ fn draw_installed_detail(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     match app.checks.get(&row.plugin.plugin_id) {
+        Some(Check::Done(Status::Moved { pin })) => lines.push(Line::from(vec![
+            Span::styled(format!("{:<LABEL$} ", "pin"), muted()),
+            Span::styled(
+                format!(
+                    "pinned at {} but `herdr plugin update` moved it to {} — u restores the pin",
+                    util::short_sha(pin),
+                    util::short_sha(row.commit().unwrap_or(""))
+                ),
+                Style::default().fg(WARN),
+            ),
+        ])),
         Some(Check::Done(Status::Error { message })) => lines.push(Line::from(vec![
             Span::styled(format!("{:<LABEL$} ", "check"), muted()),
             Span::styled(util::sanitize(message), Style::default().fg(BAD)),
@@ -2582,6 +2637,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         key("X", "pick removed plugins whose leftovers to delete"),
         key("i", "install from a URL, owner/repo or alias:path"),
         key("p", "pick a version to pin (or unpin)"),
+        key("t", "take a GitHub plugin over from herdr (git-managed)"),
         key("s", "switch to another branch, tag or commit"),
         key("z", "roll back to the previous installation"),
         key("o", "open the source in a browser"),
@@ -2755,7 +2811,12 @@ fn apply_pick(app: &mut App, id: &str, name: &str, pick: Pick) -> Option<Job> {
         Pick::Current(commit) => commit,
         Pick::Tag(tag) => tag.commit,
     };
-    if !commit.eq_ignore_ascii_case(&current) {
+    // Herdr keeps a plugin at a commit only when it installed it there, so
+    // pinning a plugin Herdr manages reinstalls it, even at the same commit.
+    let held_by_herdr = row
+        .requested_ref()
+        .is_some_and(|r| r.eq_ignore_ascii_case(&commit));
+    if !commit.eq_ignore_ascii_case(&current) || (row.origin == Origin::Github && !held_by_herdr) {
         return Some(Job::PinTo(id.to_string(), commit));
     }
     if row.pinned() {

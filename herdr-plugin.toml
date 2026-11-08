@@ -31,7 +31,15 @@ title = "Open plugin manager"
 contexts = ["workspace"]
 command = ["./bin/herdr-pm", "open"]
 
-# Updates the plugins whose auto-update is on (A in the popup) when Herdr
-# starts. Without any, it exits after reading the plugin list.
+# Auto-update (A in the popup). `[auto_update] trigger` in config.toml decides
+# which of these updates; the others exit right after reading it.
 [[startup]]
-command = ["./bin/herdr-pm", "auto-update"]
+command = ["./bin/herdr-pm", "auto-update", "--hook", "startup"]
+
+[[events]]
+on = "tab.created"
+command = ["./bin/herdr-pm", "auto-update", "--hook", "event"]
+
+[[events]]
+on = "pane.created"
+command = ["./bin/herdr-pm", "auto-update", "--hook", "event"]

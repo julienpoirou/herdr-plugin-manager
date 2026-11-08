@@ -122,11 +122,14 @@ enum Cmd {
     Enable { id: String },
     /// Disable a plugin.
     Disable { id: String },
-    /// Update the plugins with auto-update on, without previews (Herdr runs
-    /// this at startup), or turn auto-update on or off for one plugin.
+    /// Update the plugins with auto-update on, without previews, or turn
+    /// auto-update on or off for one plugin. `--hook` is what Herdr runs:
+    /// it updates only when `[auto_update] trigger` says so.
     AutoUpdate {
         #[command(subcommand)]
         command: Option<AutoUpdateCmd>,
+        #[arg(long, value_enum)]
+        hook: Option<HookArg>,
     },
     /// Show everything known about a plugin.
     Info {
@@ -153,6 +156,14 @@ enum Cmd {
         id: String,
         #[arg(value_name = "REF")]
         reference: Option<String>,
+        #[command(flatten)]
+        yes: YesFlag,
+    },
+    /// Move a plugin Herdr installed from GitHub to this manager's git
+    /// pipeline, at its current commit, so `herdr plugin update` leaves it
+    /// alone.
+    TakeOver {
+        id: String,
         #[command(flatten)]
         yes: YesFlag,
     },
@@ -226,6 +237,14 @@ enum AutoUpdateCmd {
     Enable { id: String },
     /// Stop updating this plugin automatically.
     Disable { id: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HookArg {
+    /// The Herdr server started.
+    Startup,
+    /// A tab or pane was created.
+    Event,
 }
 
 #[derive(Subcommand)]
@@ -344,12 +363,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Disable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, false).map(|_| ExitCode::SUCCESS)
         }
-        Cmd::AutoUpdate { command: None } => Ok(code(ops::auto_update(&ctx(dry, true)?)?)),
+        Cmd::AutoUpdate {
+            command: None,
+            hook,
+        } => {
+            let hook = hook.map(|h| match h {
+                HookArg::Startup => config::Hook::Startup,
+                HookArg::Event => config::Hook::Event,
+            });
+            if !ops::claim_auto_update(&Config::load()?, hook, dry)? {
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(code(ops::auto_update(&ctx(dry, true)?)?))
+        }
         Cmd::AutoUpdate {
             command: Some(AutoUpdateCmd::Enable { id }),
+            ..
         } => auto_update_setting(&ctx(dry, false)?, &id, true),
         Cmd::AutoUpdate {
             command: Some(AutoUpdateCmd::Disable { id }),
+            ..
         } => auto_update_setting(&ctx(dry, false)?, &id, false),
         Cmd::Info { id, json } => info(&ctx(dry, false)?, &id, json),
         Cmd::Rollback { id, yes } => {
@@ -360,6 +393,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Unpin { id, reference, yes } => {
             ops::unpin(&ctx(dry, yes.yes)?, &id, reference.as_deref()).map(|_| ExitCode::SUCCESS)
+        }
+        Cmd::TakeOver { id, yes } => {
+            ops::take_over(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
         }
         Cmd::Switch { id, reference, yes } => {
             ops::switch(&ctx(dry, yes.yes)?, &id, &reference).map(|_| ExitCode::SUCCESS)
@@ -461,6 +497,11 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
         let status_text = match status {
             None => String::new(),
             Some(Status::Current) => ops::green("up to date"),
+            Some(Status::Moved { pin }) => ops::yellow(&format!(
+                "⚠ moved off pin {} (herdr-pm update {} restores it)",
+                util::short_sha(pin),
+                row.plugin.plugin_id
+            )),
             Some(Status::Available { commit, version }) => ops::yellow(&format!(
                 "↑ {}",
                 util::sanitize(
@@ -528,6 +569,8 @@ fn outdated(ctx: &Ctx, json: bool) -> Result<ExitCode> {
     for (row, status) in rows.iter().zip(statuses) {
         match status {
             Some(Status::Available { commit, version }) => found.push((row, commit, version)),
+            // Restoring the pin is the pending change.
+            Some(Status::Moved { pin }) => found.push((row, pin, Some("pinned".into()))),
             Some(Status::Error { message }) => {
                 errors += 1;
                 eprintln!("{} {}: {message}", ops::red("✗"), row.plugin.plugin_id);
@@ -594,6 +637,11 @@ fn info(ctx: &Ctx, id: &str, json: bool) -> Result<ExitCode> {
                 ops::yellow(&format!("update available ({})", util::short_sha(&commit)))
             }
             Status::Pinned => "pinned".into(),
+            Status::Moved { pin } => ops::yellow(&format!(
+                "moved off its pin {} by herdr; `herdr-pm update {}` restores it",
+                util::short_sha(&pin),
+                row.plugin.plugin_id
+            )),
             Status::Error { message } => ops::red(&message),
             _ => "-".into(),
         };

@@ -103,8 +103,8 @@ with that tag.
 ## Install sources
 
 ```sh
-herdr-pm install owner/repo[/subdir]                       # native Herdr/GitHub
-herdr-pm install owner/repo --git                          # same repo through the Git pipeline
+herdr-pm install owner/repo[/subdir]                       # GitHub, through the Git pipeline
+herdr-pm take-over <id>                                    # same for a plugin Herdr installed
 herdr-pm install https://gitlab.corp.example/tools/notify.git
 herdr-pm install git@git.corp.example:tools/notify.git
 herdr-pm install ssh://git@host:2222/srv/git/mono.git//plugins/foo
@@ -127,10 +127,16 @@ herdr-pm install <git-source> --replace
 ```
 
 It replaces an existing local link or a GitHub-owned registration after the
-new build succeeds. Herdr 0.7.4's native GitHub installer has no equivalent
-replacement operation for an existing local link. Therefore
-`herdr-pm install owner/repo --replace` fails explicitly; use
-`herdr-pm install owner/repo --git --replace` when that behavior is wanted.
+new build succeeds.
+
+GitHub shorthands go through the same Git pipeline as every other source
+(`github_via_git = true`, the default): Herdr sees a linked plugin, so a
+`herdr plugin update` run outside the manager leaves it alone, and rollback and
+history apply. With `github_via_git = false` they go to Herdr's own installer,
+which cannot replace a local link, so `--replace` then needs `--git`.
+`herdr-pm take-over <id>` (`t` in the popup) moves a plugin Herdr installed
+earlier to the Git pipeline, at the commit it runs now and following the same
+ref.
 
 ## Trust and build model
 
@@ -172,7 +178,7 @@ action.
 | Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
 | State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
-| Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
+| Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback, `t` take a GitHub plugin over from Herdr |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
 | Other | `o` open homepage, `C` settings, `E` config.toml in your editor, `r` refresh, `?` help (scrolls), `q` quit |
 
@@ -200,12 +206,15 @@ The detail panel shows the installed version as `branch@commit`
 `git ls-remote`), newest version first:
 
 - `latest (unpin)` follows the default branch again;
-- the installed version pins it **without reinstalling**;
+- the installed version pins it;
 - another version is installed first, with its preview, then pinned.
 
-GitHub-installed plugins are pinned in the manager's `registry.json`, because
-Herdr only changes the ref it follows by reinstalling. `u`, `U` and auto-update
-respect the pin; a `herdr plugin update` run outside the manager does not.
+A git-managed plugin is pinned without reinstalling. A plugin Herdr installed
+is reinstalled at the commit (with its preview), even the one it runs now:
+Herdr only keeps a commit it installed itself, and `herdr plugin update` would
+move anything else. Pins recorded in `registry.json` by older versions are
+still read; when Herdr moved such a plugin the popup shows `⚠ moved by herdr`
+and `u` (or `herdr-pm update`) reinstalls it at the pin.
 
 `x` asks what to do: `u` removes the plugin (a local link is only unlinked)
 and keeps its config and data for a reinstall; `d` deletes it completely:
@@ -223,12 +232,27 @@ deletes them after `y`. `herdr-pm clean [ids…]` does the same from the shell,
 for every removed plugin when no id is given. Installed plugins and the
 manager's own data are never touched.
 
-Auto-update is a per-plugin switch, independent of enable/disable. When Herdr
-starts, the manager's `[[startup]]` hook runs `herdr-pm auto-update`, which
-updates every GitHub- or git-installed plugin with the switch on, **without the
-trust preview**, disabled plugins included. Pinned plugins stay where they are;
-local links cannot use it. Turn it on only for repositories you trust to run new
+Auto-update is a per-plugin switch, independent of enable/disable. It updates
+every GitHub- or git-installed plugin with the switch on, **without the trust
+preview**, disabled plugins included. Pinned plugins stay where they are; local
+links cannot use it. Turn it on only for repositories you trust to run new
 commands unattended.
+
+When it runs depends on `[auto_update] trigger`:
+
+| Trigger | Runs |
+|---|---|
+| `startup` (default) | when the Herdr server starts (also when a new server takes over during a Herdr update; not when a client attaches or config reloads) |
+| `popup` | when the popup opens, behind the progress dialog |
+| `min-interval` | at most once per `min_interval` (`30m`, `6h`, `1d`, `1h30m`; default `6h`), checked when the server starts, when the popup opens and when a tab or pane is created |
+| `manual` | only `herdr-pm auto-update` |
+
+Herdr runs the manager's `[[startup]]` hook and its `tab.created` /
+`pane.created` event hooks; each calls `herdr-pm auto-update --hook …`, which
+exits at once unless the trigger says an update is due. Herdr has no timers
+for plugins and asks startup hooks not to stay running, hence the checks on
+activity rather than a clock. `herdr-pm auto-update` without `--hook` always
+runs.
 
 Where it moves a plugin depends on the strategy:
 
@@ -260,7 +284,8 @@ herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
 herdr-pm clean [ids…] [-y]     delete leftovers of removed plugins
-herdr-pm auto-update [enable|disable <id>]
+herdr-pm auto-update [enable|disable <id>] [--hook startup|event]
+herdr-pm take-over <id> [-y]   move a Herdr GitHub install to the Git pipeline
 herdr-pm info <id> [--json]    herdr-pm history [id]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]
 herdr-pm unpin <id> [ref]      herdr-pm switch <id> <ref>
@@ -286,10 +311,13 @@ keep_installs = 3       # versions kept for rollback
 market_ttl = 600        # seconds before the marketplace is refreshed
 check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
+github_via_git = true   # owner/repo through the Git pipeline, not Herdr's installer
 editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
 
 [auto_update]
 strategy = "latest"     # latest, release, minor or patch
+trigger = "startup"     # startup, popup, min-interval or manual
+min_interval = "6h"     # for min-interval
 
 [auto_update.plugins]
 "some.plugin" = "patch"
@@ -439,12 +467,17 @@ sources, alias), `E` l'ouvre dans votre éditeur et `?` affiche l'aide du popup.
 
 **Mise à jour automatique** : `A` dans « Installed » l'active ou la désactive
 pour un plugin, qu'il soit activé ou non (`⟳` dans la liste). Au démarrage de
-Herdr, `herdr-pm auto-update` met ces plugins à jour **sans aperçu** ; les
+Herdr (ou à l'ouverture du popup, ou au plus une fois par intervalle, selon
+`trigger`), `herdr-pm auto-update` met ces plugins à jour **sans aperçu** ; les
 plugins épinglés ne bougent pas et les liens locaux ne sont pas concernés.
 La stratégie choisit la cible : `latest` (défaut, dernier commit), `release`
 (dernier tag de version), `minor` (même version majeure) ou `patch` (même
 version mineure), globalement dans `[auto_update]` ou par plugin dans
 `[auto_update.plugins]`.
+
+Les raccourcis `owner/repo` passent par le pipeline Git (`github_via_git`) :
+`herdr plugin update` ne les touche pas. `t` (ou `herdr-pm take-over <id>`)
+convertit un plugin installé auparavant par Herdr.
 
 **Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
 `..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build

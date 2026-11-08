@@ -63,11 +63,14 @@ pub struct Registry {
     /// the plugin is enabled or not (GitHub- and git-installed plugins).
     #[serde(default)]
     pub auto_update: BTreeSet<String>,
-    /// GitHub-installed plugins this manager holds at a commit (Herdr keeps
-    /// the ref it installed). Git-managed plugins record their pin as
-    /// `requested_ref` instead.
+    /// Commits GitHub-installed plugins were held at by versions before
+    /// pins went through a reinstall. `herdr plugin update` ignores them,
+    /// so a moved plugin is reported and restored on request.
     #[serde(default)]
     pub pins: BTreeMap<String, String>,
+    /// When `herdr-pm auto-update` last started (unix seconds).
+    #[serde(default)]
+    pub last_auto_update: u64,
 }
 
 fn format_version() -> u32 {
@@ -109,6 +112,7 @@ impl Registry {
                 plugins: BTreeMap::new(),
                 auto_update: BTreeSet::new(),
                 pins: BTreeMap::new(),
+                last_auto_update: 0,
             },
             Err(err) => {
                 return Err(err).with_context(|| format!("could not read {}", path.display()))

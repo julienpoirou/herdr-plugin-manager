@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
-use crate::config::{builtin_markets, Config, Strategy};
+use crate::config::{builtin_markets, Config, Strategy, Trigger};
 
 const STRATEGIES: [Strategy; 4] = [
     Strategy::Latest,
@@ -13,14 +13,24 @@ const STRATEGIES: [Strategy; 4] = [
     Strategy::Patch,
 ];
 
+const TRIGGERS: [Trigger; 4] = [
+    Trigger::Startup,
+    Trigger::Popup,
+    Trigger::MinInterval,
+    Trigger::Manual,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field {
     KeepInstalls,
     MarketTtl,
     CheckConcurrency,
     UseGhCli,
+    GithubViaGit,
     Editor,
     Strategy,
+    Trigger,
+    MinInterval,
     /// Strategy of one plugin (`[auto_update.plugins]`).
     PluginStrategy(String),
     /// A marketplace source, turned on or off.
@@ -44,9 +54,9 @@ impl Field {
     pub fn kind(&self) -> Kind {
         match self {
             Field::KeepInstalls | Field::MarketTtl | Field::CheckConcurrency => Kind::Number,
-            Field::UseGhCli | Field::Market(_) => Kind::Toggle,
-            Field::Strategy | Field::PluginStrategy(_) => Kind::Choice,
-            Field::Editor => Kind::Text,
+            Field::UseGhCli | Field::GithubViaGit | Field::Market(_) => Kind::Toggle,
+            Field::Strategy | Field::Trigger | Field::PluginStrategy(_) => Kind::Choice,
+            Field::Editor | Field::MinInterval => Kind::Text,
             Field::Alias(_) => Kind::Alias,
             Field::AddAlias => Kind::AddAlias,
         }
@@ -56,6 +66,10 @@ impl Field {
     /// typing.
     pub fn prompt(&self, config: &Config) -> Option<(String, String)> {
         Some(match self {
+            Field::MinInterval => (
+                "minimum time between auto-updates (30m, 6h, 1d): ".into(),
+                config.auto_update.min_interval.clone(),
+            ),
             Field::KeepInstalls => (
                 "versions kept for rollback: ".into(),
                 config.keep_installs.to_string(),
@@ -129,6 +143,16 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
         ),
         row(
             "General",
+            "github_via_git",
+            if config.github_via_git {
+                "on: owner/repo installs through git".to_string()
+            } else {
+                "off: owner/repo installs through herdr".to_string()
+            },
+            Field::GithubViaGit,
+        ),
+        row(
+            "General",
             "editor",
             config
                 .editor
@@ -145,6 +169,26 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
                 config.auto_update.strategy.describe()
             ),
             Field::Strategy,
+        ),
+        row(
+            "Auto-update",
+            "trigger",
+            format!(
+                "{}: {}",
+                config.auto_update.trigger.label(),
+                config.auto_update.trigger.describe()
+            ),
+            Field::Trigger,
+        ),
+        row(
+            "Auto-update",
+            "min_interval",
+            if config.auto_update.trigger == Trigger::MinInterval {
+                config.auto_update.min_interval.clone()
+            } else {
+                format!("{} (used by min-interval)", config.auto_update.min_interval)
+            },
+            Field::MinInterval,
         ),
     ];
     let mut ids: Vec<&String> = plugins
@@ -308,6 +352,24 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
             step(config.check_concurrency as u64, action, 1, 1)?,
         ),
         Field::UseGhCli => put(&mut doc["use_gh_cli"], !config.use_gh_cli),
+        Field::GithubViaGit => put(&mut doc["github_via_git"], !config.github_via_git),
+        Field::Trigger => {
+            let next = cycle(&TRIGGERS, config.auto_update.trigger, action);
+            put(
+                &mut table(&mut doc, "auto_update")?["trigger"],
+                next.label(),
+            );
+        }
+        Field::MinInterval => match action {
+            Action::Set(text) if !text.trim().is_empty() => put(
+                &mut table(&mut doc, "auto_update")?["min_interval"],
+                text.trim(),
+            ),
+            Action::Set(_) | Action::Delete => {
+                table(&mut doc, "auto_update")?.remove("min_interval");
+            }
+            _ => {}
+        },
         Field::Editor => match action {
             Action::Set(text) if !text.trim().is_empty() => put(&mut doc["editor"], text.trim()),
             Action::Set(_) | Action::Delete => {
@@ -405,6 +467,27 @@ mod tests {
         assert!(change(EXAMPLE, &Field::CheckConcurrency, &Action::Set("0".into())).is_err());
         assert!(change(EXAMPLE, &Field::KeepInstalls, &Action::Set("x".into())).is_err());
         assert!(change(EXAMPLE, &Field::AddAlias, &Action::Set("https x".into())).is_err());
+    }
+
+    #[test]
+    fn trigger_cycles_and_min_interval_is_checked() {
+        let text = apply(EXAMPLE, Field::Trigger, Action::Prev);
+        assert_eq!(
+            Config::parse(&text).unwrap().auto_update.trigger,
+            Trigger::Manual
+        );
+        assert!(text.contains("# startup, popup, min-interval or manual"));
+        let text = apply(&text, Field::MinInterval, Action::Set("2h".into()));
+        assert_eq!(
+            Config::parse(&text)
+                .unwrap()
+                .auto_update
+                .min_interval_secs(),
+            7200
+        );
+        assert!(change(&text, &Field::MinInterval, &Action::Set("10s".into())).is_err());
+        let text = apply(&text, Field::MinInterval, Action::Delete);
+        assert_eq!(Config::parse(&text).unwrap().auto_update.min_interval, "6h");
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.8.0...v0.9.0) (2026-11-08)
+
+
+### Features
+
+* Choose which removed plugins to clean ([#31](https://github.com/julienpoirou/herdr-plugin-manager/issues/31)) ([13f2864](https://github.com/julienpoirou/herdr-plugin-manager/commit/13f2864bc1b8358429add4f6c96c257a404c16d7))
+
 ## [0.8.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.7.0...v0.8.0) (2026-11-07)
 
 

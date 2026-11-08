@@ -2578,6 +2578,15 @@ pub struct ExportEntry {
     pub commit: Option<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_update: bool,
+}
+
+impl ExportEntry {
+    /// The git remote of a `github` entry.
+    fn github_url(&self) -> String {
+        format!("https://github.com/{}.git", self.source)
+    }
 }
 
 fn yes() -> bool {
@@ -2610,6 +2619,7 @@ pub fn export(herdr: &Herdr) -> Result<(ExportFile, Vec<String>)> {
                 follow_ref: row.plugin.source.requested_ref.clone(),
                 commit: row.plugin.source.resolved_commit.clone(),
                 enabled: row.plugin.enabled,
+                auto_update: row.auto_update,
             }),
             Origin::Git => {
                 let r = row.record.as_ref().unwrap();
@@ -2621,6 +2631,7 @@ pub fn export(herdr: &Herdr) -> Result<(ExportFile, Vec<String>)> {
                     follow_ref: r.requested_ref.clone(),
                     commit: Some(r.current.commit.clone()),
                     enabled: row.plugin.enabled,
+                    auto_update: row.auto_update,
                 })
             }
         }
@@ -2654,9 +2665,14 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
         }
         let current = rows.iter().find(|r| r.plugin.plugin_id == entry.id);
         let same = current.is_some_and(|row| match (row.origin, entry.kind.as_str()) {
-            (Origin::Git, "git") => {
+            (Origin::Git, "git" | "github") => {
                 let r = row.record.as_ref().unwrap();
-                r.url == entry.source
+                let url = if entry.kind == "github" {
+                    entry.github_url()
+                } else {
+                    entry.source.clone()
+                };
+                r.url == url
                     && r.subdir == entry.subdir
                     && Some(&r.current.commit) == entry.commit.as_ref()
             }
@@ -2680,6 +2696,7 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
             } else {
                 ctx.line(format!("{} {} unchanged", dim("•"), entry.id));
             }
+            import_auto_update(ctx, entry, row.auto_update);
             continue;
         }
         let result = match entry.kind.as_str() {
@@ -2707,6 +2724,22 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
                 )
                 .map(|_| ())
             })(),
+            // Through the git pipeline (`github_via_git`): at the exported
+            // commit, then following the exported ref like a git entry.
+            "github" if ctx.config.github_via_git => install_git(
+                ctx,
+                GitRequest {
+                    url: entry.github_url(),
+                    subdir: entry.subdir.clone(),
+                    checkout_ref: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
+                    follow_ref: Some(entry.follow_ref.clone()),
+                    mode: Mode::Import,
+                    enabled: Some(entry.enabled),
+                    replace: false,
+                    expect_id: Some(entry.id.clone()),
+                },
+            )
+            .map(|_| ()),
             "github" => (|| -> Result<()> {
                 let spec = match &entry.subdir {
                     Some(s) => format!("{}/{s}", entry.source),
@@ -2727,12 +2760,26 @@ pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
             })(),
             other => Err(anyhow!("unknown kind {other:?}")),
         };
-        if let Err(err) = result {
-            failures += 1;
-            ctx.line(format!("{} {}: {err:#}", red("✗"), entry.id));
+        match result {
+            Ok(()) => import_auto_update(ctx, entry, false),
+            Err(err) => {
+                failures += 1;
+                ctx.line(format!("{} {}: {err:#}", red("✗"), entry.id));
+            }
         }
     }
     Ok(failures)
+}
+
+/// Turns auto-update on for an imported plugin when the export had it.
+fn import_auto_update(ctx: &Ctx, entry: &ExportEntry, already: bool) {
+    if !entry.auto_update || already || ctx.dry_run {
+        return;
+    }
+    match set_auto_update(ctx, &entry.id, true) {
+        Ok(()) => ctx.line(format!("{} {}: auto-update on", green("✓"), entry.id)),
+        Err(err) => ctx.line(format!("{} {}: {err:#}", yellow("!"), entry.id)),
+    }
 }
 
 // ---------------------------------------------------------------- doctor

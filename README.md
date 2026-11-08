@@ -417,6 +417,25 @@ GitHub authentication uses an explicit source token, `GH_TOKEN`,
 GitHub API version is `2022-11-28`, which remains valid and is also understood
 by GHES versions supported by this configuration.
 
+## Same setup on every machine
+
+`config.toml` holds preferences, not the plugins. The plugin set lives in an
+export, which is plain JSON and fits in a dotfiles repository next to
+`config.toml`:
+
+```sh
+herdr-pm export -o herdr-plugins.json    # on the machine you like
+herdr-pm import herdr-plugins.json       # elsewhere: previews, then installs
+herdr-pm import herdr-plugins.json --yes # unattended
+```
+
+Each plugin comes back at its exported commit, following the same branch or
+tag (or pinned, when it was), enabled or disabled, with its auto-update
+switch. Importing again changes nothing on a machine that matches. Local links
+are not exported. Copy `config.toml` (`herdr-pm config path`) for the
+preferences; with `cli_on_path` or `agent_skill` on, the next Herdr start (or
+popup) creates the PATH link and the skill links on the new machine.
+
 ## A marketplace without a forge API
 
 Build an index from bare repositories and publish it in Git:

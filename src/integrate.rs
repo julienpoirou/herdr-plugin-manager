@@ -502,8 +502,9 @@ pub fn disable_skill(out: &dyn Steps) -> Result<()> {
 }
 
 /// Moves the PATH link and the skill to the manager's current installation
-/// when an update changed it, and links the skill for agents installed
-/// since. Does nothing for integrations that are off.
+/// when an update changed it, links the skill for agents installed since,
+/// and puts the link directory on PATH when it is missing (a config.toml
+/// copied from another machine). Does nothing for integrations that are off.
 pub fn refresh(herdr: &Herdr, cli_on: bool, skill_on: bool) -> Result<()> {
     if !cli_on && !skill_on {
         return Ok(());
@@ -514,6 +515,12 @@ pub fn refresh(herdr: &Herdr, cli_on: bool, skill_on: bool) -> Result<()> {
         let link = cli_link()?;
         if !up_to_date(&binary, &link) {
             link_file(&binary, &link)?;
+        }
+        let dir = cli_dir()?;
+        let on_path = std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| same_file(&d, &dir)));
+        if !on_path {
+            set_user_path(&dir, true)?;
         }
     }
     if skill_on {

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.0...v0.14.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* Turning cli_on_path off also turns agent_skill off ([#43](https://github.com/julienpoirou/herdr-plugin-manager/issues/43)) ([11736aa](https://github.com/julienpoirou/herdr-plugin-manager/commit/11736aae96a2e1495113ba4142e61418f545d29e))
+
 ## [0.14.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.13.0...v0.14.0) (2026-11-08)
 
 

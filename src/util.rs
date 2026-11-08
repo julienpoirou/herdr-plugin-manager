@@ -282,6 +282,21 @@ pub fn ask_line(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// `512 B`, `4.0 KB`, `12.3 MB`: one decimal from a kilobyte up.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
 /// Splits an input line like a shell would for simple cases: whitespace
 /// separates words, single or double quotes group them, and a backslash
 /// escapes a quote, a space or another backslash. Any other backslash is
@@ -517,6 +532,15 @@ mod tests {
             ]
         );
         assert!(split_words("   ").is_empty());
+    }
+
+    #[test]
+    fn sizes_read_like_a_file_manager() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(12_900_000), "12.3 MB");
+        assert_eq!(human_size(1 << 30), "1.0 GB");
     }
 
     #[test]

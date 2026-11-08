@@ -290,16 +290,21 @@ expect "purge a local link" "$HPM" uninstall team.gone --purge --yes
 [ ! -e "$T/dev/gone" ] || fail "linked directory survived --purge"
 ok "purge deletes a local link's directory"
 
-# --- clean removes leftovers of removed plugins only
+# --- clean removes leftovers of removed plugins only, one or all
 GHOST="$XDG_CONFIG_HOME/herdr/plugins/config/team.ghost"
+OTHER="$XDG_CONFIG_HOME/herdr/plugins/config/team.other"
 KEEP="$XDG_CONFIG_HOME/herdr/plugins/config/team.hello"
-mkdir -p "$GHOST" "$KEEP" "$XDG_STATE_HOME/herdr/plugins/team.ghost"
-expect "clean leftovers" "$HPM" clean --yes
-[ ! -e "$GHOST" ] || fail "clean kept a removed plugin's config"
-[ ! -e "$XDG_STATE_HOME/herdr/plugins/team.ghost" ] || fail "clean kept a removed plugin's state"
+mkdir -p "$GHOST" "$OTHER" "$KEEP" "$XDG_STATE_HOME/herdr/plugins/team.ghost"
+expect "clean one" "$HPM" clean team.ghost --yes
+[ ! -e "$GHOST" ] || fail "clean kept the named plugin's config"
+[ ! -e "$XDG_STATE_HOME/herdr/plugins/team.ghost" ] || fail "clean kept the named plugin's state"
+[ -d "$OTHER" ] || fail "clean team.ghost deleted another removed plugin's config"
+if "$HPM" clean team.hello --yes >/dev/null 2>&1; then fail "clean accepted an installed plugin"; fi
+expect "clean all" "$HPM" clean --yes
+[ ! -e "$OTHER" ] || fail "clean without ids kept a removed plugin's config"
 [ -d "$KEEP" ] || fail "clean deleted an installed plugin's config"
 [ -d "$XDG_STATE_HOME/herdr/plugins/herdr-plugin-manager" ] || fail "clean deleted the manager's own data"
-ok "clean deletes only what removed plugins left"
+ok "clean deletes only what the chosen removed plugins left"
 
 # --- with a live server
 herdr server >/dev/null 2>&1 &

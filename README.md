@@ -171,7 +171,7 @@ action.
 | Navigation | arrows / `j` / `k`, `/` filter |
 | Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
-| State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` clean leftovers of removed plugins |
+| State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
 | Other | `o` open homepage, `L` logs, `c`/`C` edit configuration, `r` refresh, `?` help (scrolls), `q` quit |
@@ -205,11 +205,14 @@ plugin's config directory, the cached repository (unless another plugin uses
 it), its auto-update and pin settings, and a local link's directory, after you
 type the plugin id.
 
-`X` (or `herdr-pm clean`) finds what plugins removed earlier left behind,
-whichever way they were removed: config and state directories, Herdr's old
-GitHub checkouts and their lock files, and this manager's auto-update/pin
-settings for them. It lists them and deletes them after confirmation; installed
-plugins and the manager's own data are never touched.
+`X` lists the plugins removed earlier that left something behind, whichever
+way they were removed, with the size and kind of what remains: config and
+state directories, Herdr's old GitHub checkouts and their lock files, and this
+manager's auto-update/pin settings. `Space` checks plugins, `a` checks them
+all, `↵` reviews the paths of the checked ones (or of the highlighted one) and
+deletes them after `y`. `herdr-pm clean [ids…]` does the same from the shell,
+for every removed plugin when no id is given. Installed plugins and the
+manager's own data are never touched.
 
 Auto-update is a per-plugin switch, independent of enable/disable. When Herdr
 starts, the manager's `[[startup]]` hook runs `herdr-pm auto-update`, which
@@ -226,7 +229,7 @@ herdr-pm list [--check] [--json]
 herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
-herdr-pm clean [-y]            delete leftovers of removed plugins
+herdr-pm clean [ids…] [-y]     delete leftovers of removed plugins
 herdr-pm auto-update [enable|disable <id>]
 herdr-pm info <id> [--json]    herdr-pm history [id]
 herdr-pm rollback <id>         herdr-pm pin <id> [ref]

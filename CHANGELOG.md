@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.16.0...v0.16.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* Put herdr-pm on PATH for new Herdr panes without restarting Herdr ([#51](https://github.com/julienpoirou/herdr-plugin-manager/issues/51)) ([8a21531](https://github.com/julienpoirou/herdr-plugin-manager/commit/8a2153175a2b2ebc57ce818d670a2913e38d0b9d))
+
 ## [0.16.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.15.0...v0.16.0) (2026-11-11)
 
 

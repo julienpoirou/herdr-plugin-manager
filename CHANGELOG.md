@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.15.0...v0.16.0) (2026-11-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* export/import and the history alias are removed. Existing manager installations must migrate to the namespaced plugin id using a freshly built release checkout.
+
+### Features
+
+* GitOps backup and sync, namespaced identity and settings ([#49](https://github.com/julienpoirou/herdr-plugin-manager/issues/49)) ([81e5ecd](https://github.com/julienpoirou/herdr-plugin-manager/commit/81e5ecd7704b44c488c2fa0101d2b5f352a8550e))
+
 ## [0.15.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.14.2...v0.15.0) (2026-11-08)
 
 

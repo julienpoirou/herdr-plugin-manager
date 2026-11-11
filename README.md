@@ -242,10 +242,10 @@ off asks first, then runs behind the progress dialog:
 - `cli_on_path` puts `herdr-pm` on your PATH: a link in
   `%LOCALAPPDATA%\herdr-plugin-manager\bin` (Windows) or `~/.local/bin`
   pointing at the manager's current installation (a symbolic link when the
-  system allows it, otherwise a hard link or a copy), and that directory in
-  the user PATH (`~/.profile` when `~/.local/bin` is not on it already). The
-  link moves after every update of the manager, at Herdr startup and when the
-  popup opens. `herdr-pm path enable|disable` does the same from a shell.
+  system allows it, otherwise a hard link or a copy), and that directory on
+  PATH. The link moves after every update of the manager, at Herdr startup
+  and when the popup opens. `herdr-pm path enable|disable` does the same from
+  a shell.
 - `agent_skill` links the `herdr-pm` [agent skill](skills/herdr-pm/SKILL.md)
   into `~/.agents/skills` (Codex, Pi, Cline, Zed…) and into the skills
   directory of each coding agent found (Claude Code, OMP, Cursor, Gemini CLI,
@@ -254,6 +254,19 @@ off asks first, then runs behind the progress dialog:
   `herdr-pm skill enable|disable` from a shell; `herdr-pm --skill` prints the
   skill of the installed version; `npx skills add julienpoirou/herdr-plugin-manager
   --skill herdr-pm -g` installs it without the manager.
+
+Both take effect at once, without restarting Herdr. New Herdr panes inherit
+the environment of a server started earlier, so the PATH also goes through a
+marked block in your shell profiles: the PowerShell profiles on Windows (in
+addition to the user PATH; skipped, with a note, for a shell whose execution
+policy runs no profile), and `~/.profile` plus `~/.bashrc`, `~/.bash_profile`
+and `~/.zshrc` when they exist elsewhere. The block only adds the directory
+when it is missing, and disabling removes it, keeping the rest of the file.
+New agent sessions read the skill links immediately. A process cannot change
+the environment of another one: shells already open keep their PATH, and
+agents already running keep the skills they loaded. Herdr's live handoff
+does not help here: it only replaces the Herdr server during
+`herdr update --handoff`, and Windows servers do not support it.
 
 The skill tells agents to show the `--dry-run --yes` preview and wait for
 your approval before any `--yes` change.

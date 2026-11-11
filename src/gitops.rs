@@ -115,8 +115,9 @@ impl PreviewRepo {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
+        let temporary_root = trusted_root(&std::env::temp_dir())?;
         for attempt in 0..100 {
-            let directory = std::env::temp_dir().join(format!(
+            let directory = temporary_root.join(format!(
                 "herdr-pm-gitops-preview-{}-{nonce}-{attempt}",
                 std::process::id()
             ));
@@ -161,6 +162,71 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Resolve only a machine-local directory authority, before adding any
+/// selector-derived children. New roots inherit their nearest existing
+/// parent's physical location without requiring directories to be created.
+fn trusted_root(path: &Path) -> Result<PathBuf> {
+    let path = absolute(path)?;
+    match fs::canonicalize(&path) {
+        Ok(resolved) => {
+            if !fs::metadata(&resolved)?.is_dir() {
+                bail!(
+                    "configured local root is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(resolved)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(error).with_context(|| {
+                        format!("could not resolve configured local root {}", path.display())
+                    })
+                }
+                Err(inspect) if inspect.kind() == std::io::ErrorKind::NotFound => {}
+                Err(inspect) => {
+                    return Err(inspect).with_context(|| {
+                        format!("could not inspect configured local root {}", path.display())
+                    })
+                }
+            }
+            let parent = path.parent().ok_or_else(|| {
+                anyhow!(
+                    "configured local root has no existing parent: {}",
+                    path.display()
+                )
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                anyhow!(
+                    "configured local root has no directory name: {}",
+                    path.display()
+                )
+            })?;
+            Ok(trusted_root(parent)?.join(name))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("could not resolve configured local root {}", path.display())),
+    }
+}
+
+/// A configured filename authorizes its parent directory, not a symlink at
+/// the file itself. Never call this with a selector-derived child path.
+fn authority_file(path: &Path) -> Result<PathBuf> {
+    let path = absolute(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("configured file has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("configured file has no filename: {}", path.display()))?;
+    Ok(trusted_root(parent)?.join(name))
+}
+
+fn plugin_config_root() -> Result<PathBuf> {
+    trusted_root(&paths::herdr_config_dir().join("plugins").join("config"))
+}
+
 fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -173,7 +239,8 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     }
 }
 
-/// Reject links at every existing component, not just at the final file.
+/// Reject links at every existing component below already-resolved authority
+/// roots, including the final file. Selector-derived paths are never resolved.
 fn no_links(path: &Path) -> Result<()> {
     let path = absolute(path)?;
     for ancestor in path.ancestors() {
@@ -303,14 +370,12 @@ fn selector(value: &str) -> Result<()> {
 fn live_path(value: &str) -> Result<PathBuf> {
     selector(value)?;
     Ok(match value {
-        "herdr/config.toml" => paths::herdr_config_toml(),
-        "manager/config.toml" => paths::pm_config_file(),
+        "herdr/config.toml" => authority_file(&paths::herdr_config_toml())?,
+        "manager/config.toml" => authority_file(&paths::pm_config_file())?,
         _ => {
             let mut parts = value.splitn(3, '/');
             parts.next();
-            paths::herdr_config_dir()
-                .join("plugins")
-                .join("config")
+            plugin_config_root()?
                 .join(parts.next().unwrap())
                 .join(parts.next().unwrap())
         }
@@ -386,7 +451,8 @@ impl Session {
     }
 
     fn open_inner(config: &Config, preview_git: Option<Git>) -> Result<Self> {
-        let lock_path = paths::pm_home().join(".gitops.lock");
+        let home = trusted_root(&paths::pm_home())?;
+        let lock_path = home.join(".gitops.lock");
         no_links(&lock_path)?;
         let lock = if preview_git.is_some() {
             match OpenOptions::new().read(true).write(true).open(&lock_path) {
@@ -420,7 +486,7 @@ impl Session {
             .backup
             .directory
             .clone()
-            .unwrap_or_else(|| paths::pm_home().join("backup"));
+            .unwrap_or_else(|| home.join("backup"));
         let directory = absolute(&directory)?;
         if directory
             .components()
@@ -431,15 +497,15 @@ impl Session {
                 directory.display()
             );
         }
+        let directory = trusted_root(&directory)?;
         no_links(&directory)?;
         for protected in [
-            paths::herdr_config_dir(),
-            paths::herdr_config_toml(),
-            paths::pm_config_dir(),
-            paths::installs_dir(),
-            paths::repo_cache_dir(),
+            trusted_root(&paths::herdr_config_dir())?,
+            authority_file(&paths::herdr_config_toml())?,
+            trusted_root(&paths::pm_config_dir())?,
+            trusted_root(&paths::installs_dir())?,
+            trusted_root(&paths::repo_cache_dir())?,
         ] {
-            let protected = absolute(&protected)?;
             if protected.starts_with(&directory) || directory.starts_with(&protected) {
                 bail!(
                     "backup directory overlaps live configuration or installation files: {}",
@@ -447,10 +513,10 @@ impl Session {
                 );
             }
         }
-        if absolute(&paths::pm_home())?.starts_with(&directory) {
+        if home.starts_with(&directory) {
             bail!("backup directory must be dedicated, not the manager data directory or its ancestor");
         }
-        let state_path = paths::pm_home().join("gitops").join(format!(
+        let state_path = home.join("gitops").join(format!(
             "{}.json",
             digest(directory.to_string_lossy().as_bytes())
         ));
@@ -1886,16 +1952,15 @@ fn snapshot_mode(path: &Path, executable: bool) -> Result<()> {
 /// Actual portable plaintext file selectors; discovery never grants approval.
 pub fn candidates() -> Result<Vec<String>> {
     let mut result = Vec::new();
-    for (selector, path) in [
-        ("herdr/config.toml", paths::herdr_config_toml()),
-        ("manager/config.toml", paths::pm_config_file()),
-    ] {
+    for selected in ["herdr/config.toml", "manager/config.toml"] {
+        let path = live_path(selected)?;
         if let Ok(Some(bytes)) = read_file(&path) {
-            if plaintext(&bytes, selector).is_ok() {
-                result.push(selector.into());
+            if plaintext(&bytes, selected).is_ok() {
+                result.push(selected.into());
             }
         }
     }
+    let plugin_root = plugin_config_root()?;
     for plugin in Herdr::detect(false).list()? {
         if plugin.plugin_id == paths::PLUGIN_ID
             || plugin.plugin_id == paths::OLD_PLUGIN_ID
@@ -1903,7 +1968,7 @@ pub fn candidates() -> Result<Vec<String>> {
         {
             continue;
         }
-        let root = paths::herdr_plugin_config_dir(&plugin.plugin_id);
+        let root = plugin_root.join(paths::plugin_path_component(&plugin.plugin_id));
         discover(
             &root,
             &root,
@@ -2156,7 +2221,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
+        let directory = trusted_root(&std::env::temp_dir()).unwrap().join(format!(
             "herdr-pm-capture-test-{}-{nonce}",
             std::process::id()
         ));
@@ -2198,6 +2263,58 @@ mod tests {
         assert!(session.state.removed.contains(path));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn trusted_root_aliases_resolve_without_following_selector_children() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = trusted_root(&std::env::temp_dir()).unwrap().join(format!(
+            "herdr-pm-authority-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let scratch = PreviewRepo { directory };
+        let physical = scratch.directory.join("physical");
+        fs::create_dir(&physical).unwrap();
+        let alias = scratch.directory.join("configured-root");
+        symlink(&physical, &alias).unwrap();
+
+        // The configured authority may be an OS/user alias, and its
+        // descendant root need not have been created yet.
+        let root = trusted_root(&alias.join("new").join("config")).unwrap();
+        assert_eq!(root, physical.join("new").join("config"));
+        write_changed(&root.join("settings.lua"), b"return { enabled = true }\n").unwrap();
+
+        let outside = scratch.directory.join("outside");
+        let secret = outside.join("secrets.toml");
+        write_changed(&secret, b"secret = 'keep'\n").unwrap();
+        symlink(&outside, root.join("linked-directory")).unwrap();
+        let selected = root.join("linked-directory").join("secrets.toml");
+        assert!(read_file(&selected).is_err());
+        assert!(write_changed(&selected, b"secret = 'replace'\n").is_err());
+        assert!(remove_file(&selected).is_err());
+
+        symlink(&secret, root.join("linked.toml")).unwrap();
+        let configured_file =
+            authority_file(&alias.join("new").join("config").join("linked.toml")).unwrap();
+        assert_eq!(configured_file, root.join("linked.toml"));
+        assert!(read_file(&configured_file).is_err());
+        assert!(write_changed(&configured_file, b"secret = 'replace'\n").is_err());
+        assert_eq!(
+            fs::read(&secret).unwrap().as_slice(),
+            b"secret = 'keep'\n".as_slice()
+        );
+
+        let mut found = Vec::new();
+        discover(&root, &root, "plugins/test.plugin", &mut found).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], "plugins/test.plugin/settings.lua");
+    }
+
     #[test]
     fn metadata_ids_and_encoded_configuration_directories_are_distinct() {
         let mut value = plugin();
@@ -2207,7 +2324,10 @@ mod tests {
         let selected = format!("plugins/{encoded}/settings");
         assert_eq!(
             live_path(&selected).unwrap(),
-            paths::herdr_plugin_config_dir(&value.id).join("settings")
+            plugin_config_root()
+                .unwrap()
+                .join(&encoded)
+                .join("settings")
         );
         assert!(selector("plugins/owner:plugin/settings").is_err());
         assert!(plaintext(b"return { theme = 'dark' }\n", "config.lua").is_ok());

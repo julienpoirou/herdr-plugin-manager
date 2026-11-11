@@ -3,7 +3,7 @@
 Report suspected vulnerabilities privately to **julienpoirou@protonmail.com**.
 Do not include credentials or proprietary repository contents.
 
-Include the affected version, platform, source type (CLI, import, marketplace,
+Include the affected version, platform, source type (CLI, GitOps, marketplace,
 popup), a minimal reproduction, and whether execution occurred before the
 trust confirmation. A safe proof using a temporary marker file is preferred
 to a destructive payload.

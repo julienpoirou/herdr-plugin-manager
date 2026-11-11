@@ -558,8 +558,10 @@ deletion on the next push. A remote snapshot cannot expand the local approval
 list. The manager's `[backup]` section and absolute `log_dir` stay local even
 when `manager/config.toml` is synchronized.
 
-Only explicitly selected UTF-8 files up to 4 MiB are supported. Symlink
-traversal, unsafe paths, runtime state, caches, logs and binaries are refused.
+Only explicitly selected UTF-8 files up to 4 MiB are supported. Machine-local
+authority roots are resolved first (including OS directory aliases); symlink
+traversal within selected config/snapshot trees, unsafe paths, runtime state,
+caches, logs and binaries are refused.
 No encryption or automatic secret removal: approving a file may publish its
 tokens/passwords and their Git history. Use deliberate selections and a
 trusted private repository. Plugin source repositories must remain available;

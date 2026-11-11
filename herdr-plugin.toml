@@ -1,4 +1,4 @@
-id = "herdr-plugin-manager"
+id = "julienpoirou.herdr-plugin-manager"
 name = "Herdr Plugin Manager"
 # x-release-please-start-version
 version = "0.15.0"

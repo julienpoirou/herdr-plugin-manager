@@ -91,6 +91,10 @@ enum Confirm {
         on: bool,
         plan: Vec<String>,
     },
+    BackupEnabled {
+        directory: String,
+        files: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +365,23 @@ impl App {
             }
         }
         self.clamp();
+        if !self.ctx.dry_run {
+            let refreshed = (|| -> Result<()> {
+                let config = Config::load_read_only()?;
+                if config.icons != self.ctx.config.icons {
+                    self.graphics = if config.icons {
+                        detect_graphics()
+                    } else {
+                        None
+                    };
+                }
+                self.ctx.config = config;
+                refresh_services(&self.ctx.herdr, &self.ctx.config)
+            })();
+            if let Err(err) = refreshed {
+                self.say(Level::Warn, format!("local refresh: {err:#}"));
+            }
+        }
     }
 
     fn rebuild_items(&mut self) {
@@ -688,7 +709,7 @@ pub fn run(ctx: Ctx) -> Result<()> {
         default_hook(info);
     }));
     ops::set_plain();
-    if app.ctx.config.logos {
+    if app.ctx.config.icons {
         app.graphics = detect_graphics();
     }
     enter(&mut term)?;
@@ -959,15 +980,28 @@ fn edit_config(app: &mut App) -> Result<()> {
         Ok(c) => app.ctx.config = c,
         Err(err) => anyhow::bail!("config not reloaded: {err:#}"),
     }
+    refresh_services(&app.ctx.herdr, &app.ctx.config)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------- settings
 
+fn refresh_services(herdr: &crate::herdr::Herdr, config: &Config) -> Result<()> {
+    if herdr.dry_run {
+        return Ok(());
+    }
+    // Both actions are local. Existing shells/agent contexts cannot be rewritten.
+    let integration = crate::integrate::refresh(herdr, config.cli_on_path, config.agent_skill);
+    let backup = crate::backup::refresh(herdr, config);
+    integration?;
+    backup
+}
+
 /// The `C` dialog over `config.toml`.
 struct SettingsDialog {
     sel: usize,
     error: Option<String>,
+    candidates: Result<Vec<String>, String>,
 }
 
 fn settings_rows(app: &App) -> Vec<settings::Row> {
@@ -977,7 +1011,18 @@ fn settings_rows(app: &App) -> Vec<settings::Row> {
         .filter(|r| r.origin != Origin::Local)
         .map(|r| r.plugin.plugin_id.clone())
         .collect();
-    settings::rows(&app.ctx.config, &plugins)
+    let candidates = app
+        .settings
+        .as_ref()
+        .map(|dialog| {
+            dialog
+                .candidates
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(String::as_str)
+        })
+        .unwrap_or(Ok(&[]));
+    settings::rows(&app.ctx.config, &plugins, candidates)
 }
 
 /// Applies one change to `config.toml`, or shows why it was refused.
@@ -1001,8 +1046,10 @@ fn apply_setting(app: &mut App, field: &settings::Field, action: settings::Actio
     })();
     let error = match result {
         Ok(config) => {
-            if !config.logos {
+            if !config.icons {
                 app.graphics = None;
+            } else if !app.ctx.config.icons {
+                app.graphics = detect_graphics();
             }
             app.ctx.config = config;
             if matches!(field, settings::Field::Market(_)) {
@@ -1011,7 +1058,13 @@ fn apply_setting(app: &mut App, field: &settings::Field, action: settings::Actio
                     app.load_market(false);
                 }
             }
-            None
+            if app.ctx.dry_run {
+                None
+            } else {
+                refresh_services(&app.ctx.herdr, &app.ctx.config)
+                    .err()
+                    .map(|err| format!("{err:#}"))
+            }
         }
         Err(err) => Some(format!("{err:#}")),
     };
@@ -1061,6 +1114,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             dialog.sel = last;
             return None;
         }
+        _ if kind == Kind::ReadOnly => return None,
         KeyCode::Enter if matches!(kind, Kind::Toggle | Kind::Choice) => Action::Next,
         KeyCode::Enter => {
             let (_, initial) = field.prompt(&app.ctx.config)?;
@@ -1081,6 +1135,11 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     | settings::Field::PluginStrategy(_)
                     | settings::Field::Editor
                     | settings::Field::MinInterval
+                    | settings::Field::LogDir
+                    | settings::Field::BackupDirectory
+                    | settings::Field::BackupRemote
+                    | settings::Field::BackupBranch
+                    | settings::Field::BackupFile(_)
             ) =>
         {
             Action::Delete
@@ -1088,6 +1147,13 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
         _ => return None,
     };
     if kind == Kind::AddAlias {
+        return None;
+    }
+    if field == settings::Field::BackupEnabled && !app.ctx.config.backup.enabled {
+        app.confirm = Some(Confirm::BackupEnabled {
+            directory: app.ctx.config.backup.directory().display().to_string(),
+            files: app.ctx.config.backup.files.len(),
+        });
         return None;
     }
     if matches!(
@@ -1196,6 +1262,15 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" delete   "),
         ],
         Some(Kind::AddAlias) | None => vec![key("↵"), Span::raw(" add   ")],
+        Some(Kind::ReadOnly)
+            if matches!(
+                rows.get(sel).map(|row| &row.field),
+                Some(settings::Field::BackupError)
+            ) =>
+        {
+            vec![Span::raw("close and reopen Settings to retry   ")]
+        }
+        Some(Kind::ReadOnly) => vec![Span::raw("read-only   ")],
     };
     if matches!(
         rows.get(sel).map(|r| &r.field),
@@ -1290,6 +1365,8 @@ fn task_event(app: &mut App, event: TaskEvent) {
         TaskEvent::Done(result) => {
             task.show_log = true;
             task.done = Some(result);
+            // Even a failed task may have completed some local mutations.
+            app.reload();
         }
     }
 }
@@ -1582,6 +1659,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
             app.settings = Some(SettingsDialog {
                 sel: 0,
                 error: None,
+                candidates: crate::gitops::candidates().map_err(|err| format!("{err:#}")),
             });
             return None;
         }
@@ -1917,6 +1995,14 @@ fn answer_confirm(app: &mut App, confirm: Confirm, key: KeyEvent) -> Option<Job>
         },
         Confirm::UpdateAll(ids) if yes => Some(Job::Update(ids)),
         Confirm::Integration { skill, on, .. } if yes => Some(Job::Integrate { skill, on }),
+        Confirm::BackupEnabled { .. } if yes => {
+            apply_setting(
+                app,
+                &settings::Field::BackupEnabled,
+                settings::Action::Set("true".into()),
+            );
+            return None;
+        }
         Confirm::AutoUpdateOn { id, name } if yes => {
             match ops::set_auto_update(&app.ctx, &id, true) {
                 Ok(()) => {
@@ -2756,6 +2842,22 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
             vec![
                 format!("Updates of {name} will be installed without review"),
                 "when Herdr starts. Turn auto-update on?".to_string(),
+            ],
+            yes_no(),
+        ),
+        Confirm::BackupEnabled { directory, files } => (
+            "Enable local backup",
+            vec![
+                "Selected configuration files are copied as PLAINTEXT.".into(),
+                "They may contain passwords, tokens, or private data.".into(),
+                "Only exact files you explicitly approve are copied; none are selected by default."
+                    .into(),
+                format!("Snapshot directory: {directory} ({files} approved files)"),
+                "An independent local background worker watches files and plugin metadata.".into(),
+                "It does not commit or use the network; push/pull are explicit commands.".into(),
+                "Disabling backup stops the worker, but keeps snapshots on disk.".into(),
+                format!("Worker errors: {}", crate::backup::error_log().display()),
+                "Enable local backup?".into(),
             ],
             yes_no(),
         ),

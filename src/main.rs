@@ -1,14 +1,17 @@
 //! Herdr Plugin Manager (`herdr-pm`): manage Herdr plugins from a popup or
 //! the command line, from GitHub or any git server.
 
+mod backup;
 mod config;
 mod git;
+mod gitops;
 mod herdr;
 mod index;
 mod integrate;
 mod logos;
 mod manifest;
 mod market;
+mod migration;
 mod ops;
 mod paths;
 mod registry;
@@ -206,23 +209,20 @@ enum Cmd {
         #[command(subcommand)]
         command: IndexCmd,
     },
-    /// Write installed plugins to a file.
-    Export {
-        /// Output file (stdout when omitted).
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    /// Install the plugins of an export.
-    Import {
-        file: PathBuf,
-        /// Only these plugin ids.
-        ids: Vec<String>,
+    /// Capture the selected configuration, commit and push it to the backup remote.
+    Push {
         #[command(flatten)]
         yes: YesFlag,
     },
+    /// Preview and apply the backup remote; stop on local conflicts.
+    Pull {
+        #[command(flatten)]
+        yes: YesFlag,
+    },
+    #[command(hide = true)]
+    BackupWatch,
     /// Changes made by this manager, newest last; `-f` keeps printing new
     /// ones as they happen.
-    #[command(alias = "history")]
     Logs {
         id: Option<String>,
         #[arg(long, default_value_t = 30)]
@@ -241,6 +241,16 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         command: Option<ConfigCmd>,
+    },
+    /// Migrate an existing manager installation to its namespaced plugin id.
+    Migrate {
+        /// Checkout or release bundle containing the new herdr-plugin.toml and skill.
+        root: PathBuf,
+        /// Fresh herdr-pm binary (defaults to ROOT/bin/herdr-pm).
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        #[command(flatten)]
+        yes: YesFlag,
     },
     /// Open the manager as a Herdr popup (what the `open` action runs).
     Open,
@@ -319,8 +329,20 @@ enum ConfigCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let refresh_backup = !cli.dry_run
+        && !cli.skill
+        && !matches!(&cli.command, Some(Cmd::BackupWatch | Cmd::Logs { .. }));
     match run(cli) {
-        Ok(code) => code,
+        Ok(code) => {
+            if refresh_backup {
+                let result = Config::load_read_only()
+                    .and_then(|config| backup::refresh(&Herdr::detect(false), &config));
+                if let Err(err) = result {
+                    eprintln!("warning: automatic backup needs attention: {err:#}");
+                }
+            }
+            code
+        }
         Err(err) => {
             eprintln!("{} {err:#}", ops::red("error:"));
             ExitCode::from(1)
@@ -331,7 +353,11 @@ fn main() -> ExitCode {
 fn ctx(dry_run: bool, yes: bool) -> Result<Ctx> {
     Ok(Ctx {
         herdr: Herdr::detect(dry_run),
-        config: Config::load()?,
+        config: if dry_run {
+            Config::load_read_only()?
+        } else {
+            Config::load()?
+        },
         yes,
         report: std::sync::Arc::new(ops::TerminalReport),
         dry_run,
@@ -348,6 +374,15 @@ fn code(failures: usize) -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let dry = cli.dry_run;
+    if !matches!(&cli.command, Some(Cmd::Migrate { .. }))
+        && !(cli.command.is_none() && cli.skill)
+        && migration::required()?
+    {
+        bail!(
+            "the manager still uses its old plugin id; use a fresh herdr-pm binary and run \
+             `herdr-pm migrate <new-checkout> --binary <fresh-binary> --yes` first"
+        );
+    }
     let Some(command) = cli.command else {
         if cli.skill {
             print!("{}", integrate::SKILL);
@@ -356,6 +391,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return tui::run(ctx(dry, false)?).map(|_| ExitCode::SUCCESS);
     };
     match command {
+        Cmd::Migrate { root, binary, yes } => {
+            let herdr = Herdr::detect(dry);
+            let preview = migration::plan(&root, binary.as_deref())?;
+            let accepted = ops::Report::review(
+                &ops::TerminalReport,
+                "Plugin identity migration",
+                &preview,
+                (!dry && !yes.yes).then_some("Migrate the manager installation and its settings?"),
+            )?;
+            if !accepted {
+                println!("cancelled");
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !dry {
+                migration::run(&herdr, &root, binary.as_deref(), false)?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Tui => tui::run(ctx(dry, false)?).map(|_| ExitCode::SUCCESS),
         Cmd::List { check, json } => list(&ctx(dry, false)?, check, json),
         Cmd::Install {
@@ -407,7 +460,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 HookArg::Startup => config::Hook::Startup,
                 HookArg::Event => config::Hook::Event,
             });
-            let config = Config::load()?;
+            let config = Config::load_read_only()?;
             if matches!(hook, Some(config::Hook::Startup)) && !dry {
                 // An update may have moved the installation since.
                 let _ = integrate::refresh(
@@ -461,7 +514,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             limit,
         } => search(
-            &Config::load()?,
+            &Config::load_read_only()?,
             &query.join(" "),
             source.as_deref(),
             &sort,
@@ -469,16 +522,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             limit,
         ),
-        Cmd::Sources => sources(&Config::load()?),
+        Cmd::Sources => sources(&Config::load_read_only()?),
         Cmd::Index { command } => index_cmd(command),
-        Cmd::Export { output } => export(&Herdr::detect(dry), output),
-        Cmd::Import { file, ids, yes } => {
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("could not read {}", file.display()))?;
-            let parsed: ops::ExportFile =
-                serde_json::from_str(&text).context("not a valid export file")?;
-            Ok(code(ops::import(&ctx(dry, yes.yes)?, &parsed, &ids)?))
-        }
+        Cmd::Push { yes } => gitops::push(&ctx(dry, yes.yes)?).map(|_| ExitCode::SUCCESS),
+        Cmd::Pull { yes } => gitops::pull(&ctx(dry, yes.yes)?).map(|_| ExitCode::SUCCESS),
+        Cmd::BackupWatch => backup::watch().map(|_| ExitCode::SUCCESS),
         Cmd::Logs {
             id,
             limit,
@@ -903,27 +951,6 @@ fn index_cmd(command: IndexCmd) -> Result<ExitCode> {
     }
 }
 
-fn export(herdr: &Herdr, output: Option<PathBuf>) -> Result<ExitCode> {
-    let (file, skipped) = ops::export(herdr)?;
-    for s in &skipped {
-        eprintln!("{} skipped {s}", ops::dim("•"));
-    }
-    let text = serde_json::to_string_pretty(&file)?;
-    match output {
-        Some(path) => {
-            std::fs::write(&path, format!("{text}\n"))?;
-            eprintln!(
-                "{} exported {} plugin(s) to {}",
-                ops::green("✓"),
-                file.plugins.len(),
-                path.display()
-            );
-        }
-        None => println!("{text}"),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum LogFormat {
     Text,
@@ -973,7 +1000,7 @@ fn logs(id: Option<&str>, limit: usize, format: LogFormat, follow: bool) -> Resu
     let keep = events.len().saturating_sub(limit);
     events.drain(..keep);
     if events.is_empty() && !follow && matches!(format, LogFormat::Text) {
-        let off = Config::load().is_ok_and(|c| c.history == config::HistoryFormat::Off);
+        let off = Config::load_read_only().is_ok_and(|c| c.history == config::HistoryFormat::Off);
         let note = if off {
             "No recorded changes (history = \"off\" in config.toml)."
         } else {
@@ -1038,7 +1065,7 @@ fn config_cmd(command: Option<ConfigCmd>) -> Result<ExitCode> {
                 println!("{} already exists", path.display());
             }
         }
-        ConfigCmd::Show => println!("{}", toml::to_string_pretty(&Config::load()?)?),
+        ConfigCmd::Show => println!("{}", toml::to_string_pretty(&Config::load_read_only()?)?),
     }
     Ok(ExitCode::SUCCESS)
 }

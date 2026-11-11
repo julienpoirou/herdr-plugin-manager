@@ -30,12 +30,12 @@ other transports without asking a forge API for a checkout:
 | Version history | Separate installations, rollback, pin/unpin and branch/tag/commit switching |
 | Update context | New commits and changes to the executable surface, not only a version bump |
 | Discovery | herdr.dev, gitlab.com and codeberg.org built in; GitHub/GHE topic search, Gitea/Forgejo, GitLab, static JSON indexes and indexes stored in Git |
-| Reproducibility | JSON export/import at exact exported commits |
-| Operations | Enable/disable (including offline), uninstall, history, doctor, dry-run |
+| Reproducibility | GitOps snapshots at exact commits, with explicitly approved plaintext configuration |
+| Operations | Enable/disable (including offline), uninstall, logs, doctor, dry-run |
 
 Remote-helper transports such as `ext::` are deliberately rejected. This also
-protects imports: an imported URL cannot select a Git helper or a command-line
-option before the review.
+protects GitOps: a synchronized source URL cannot select a Git helper or a
+command-line option before the review.
 
 ## Install
 
@@ -66,7 +66,7 @@ Bind the popup (recommended: `prefix+m`; Herdr uses `prefix+g` for `goto`):
 [[keys.command]]
 key = "prefix+m"
 type = "plugin_action"
-command = "herdr-plugin-manager.open"
+command = "julienpoirou.herdr-plugin-manager.open"
 description = "Open the plugin manager"
 ```
 
@@ -75,6 +75,41 @@ Then run `herdr server reload-config`. Put `bin/herdr-pm` on `PATH` (or use
 
 On native Windows, the manifest uses `scripts/build.ps1`; Git for Windows,
 PowerShell and Rust/MSVC must be available.
+
+The plugin id is `julienpoirou.herdr-plugin-manager`; the GitHub repository,
+crate and executable names have not changed.
+
+### Upgrading the old plugin identity
+
+Older updaters correctly refuse a manifest whose id changed. Close old manager
+popups/commands, obtain a fresh source checkout at the new release, build it,
+and run its explicit migration before updating normally:
+
+```sh
+git clone https://github.com/julienpoirou/herdr-plugin-manager.git
+cd herdr-plugin-manager
+cargo build --release --locked
+./target/release/herdr-pm migrate . --binary ./target/release/herdr-pm --dry-run
+./target/release/herdr-pm migrate . --binary ./target/release/herdr-pm --yes
+```
+
+On Windows use `.\target\release\herdr-pm.exe` for both executable paths.
+A binary-only release archive is not a migration root: the command needs the
+manifest, skill, source and build scripts from the checkout.
+
+Migration preserves preferences, enabled state, followed ref, auto-update,
+logs and installation history. Existing physical checkouts—including other
+plugins inside the old manager directory—stay in place. It updates action
+keybindings and reloads a running Herdr without restarting it. A held legacy
+manager remains held at the migration snapshot's source commit; the old exact
+commit remains historical. Rollback refuses old manifests declaring the old id.
+Use a committed release checkout for a reproducible snapshot.
+
+If the old manager is still registered as Herdr GitHub-managed, first relink
+its existing `plugin_root` with `herdr plugin link <root>` so its historical
+checkout is not eligible for Herdr's managed cleanup. Conflicting destinations
+are refused rather than merged or overwritten.
+
 
 ## Releases and packages
 
@@ -171,7 +206,7 @@ registry/list inconsistencies.
 
 ## Popup
 
-Open with `herdr-pm`, the configured key, or the `herdr-plugin-manager.open`
+Open with `herdr-pm`, the configured key, or the `julienpoirou.herdr-plugin-manager.open`
 action.
 
 | Area | Keys |
@@ -223,11 +258,12 @@ off asks first, then runs behind the progress dialog:
 The skill tells agents to show the `--dry-run --yes` preview and wait for
 your approval before any `--yes` change.
 
-`logos` (on by default) shows the project or owner picture next to the
+`icons` (on by default) shows the project or owner picture next to the
 details in Installed and Marketplace, only in terminals that draw images:
 Kitty, Ghostty, WezTerm, iTerm2, foot, Konsole…, and inside Herdr when its
 outer terminal speaks the Kitty protocol (Herdr's `terminal.kitty_graphics`).
 Pictures come from GitHub, GitLab and Gitea/Forgejo and are cached for a week.
+The former `logos` preference is migrated to `icons`, preserving its value.
 
 The detail panel shows the installed version as `branch@commit`
 (`main@8cda521`, `v1.4.0@8cda521`), or `@8cda521 (pinned)`.
@@ -324,7 +360,8 @@ herdr-pm search [words…] [--source S] [--sort stars|updated|name] [--refresh] 
 herdr-pm sources
 herdr-pm index build (--repo URL… | --repos-file F | --scan-dir DIR [--url-base URL]) [-o F]
 herdr-pm index check <file>
-herdr-pm export [-o file]      herdr-pm import <file> [ids…]
+herdr-pm push [-y]             herdr-pm pull [-y]
+herdr-pm migrate <checkout> [--binary path] [-y]
 herdr-pm doctor                herdr-pm config path|init|show
 herdr-pm path enable|disable   herdr-pm skill enable|disable
 herdr-pm --skill               print the agent skill
@@ -335,9 +372,9 @@ them.
 
 ### Logs
 
-`herdr-pm logs` shows the last 30 manager changes, oldest first. `history`
-remains an alias. These are install/update/pin/removal records, not the
-command-output logs from `herdr plugin log`.
+`herdr-pm logs` shows the last 30 manager changes, oldest first. These are
+install/update/pin/removal records, not the command-output logs from
+`herdr plugin log`. There is no `history` command alias.
 
 ```sh
 herdr-pm logs
@@ -355,6 +392,14 @@ Schema 8.11.0, or no writes. Turning it off does not delete old records.
 Changing formats keeps both files readable; `logs` merges their history and
 follows appends to either file, including a format change while it runs.
 The `--format` option controls stdout independently of this setting.
+
+`log_dir` in Settings chooses an absolute writable directory; `d` restores
+the default. Existing log files are not moved when changing directories.
+New installations default to `%LOCALAPPDATA%\herdr\plugins\julienpoirou.herdr-plugin-manager`
+on Windows and `$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager`
+(or `~/.local/state/herdr/plugins/julienpoirou.herdr-plugin-manager`) on Linux.
+`/var/log/herdr-plugin-manager` is an optional administrator-provisioned
+directory, not the unprivileged default.
 
 ECS records contain `@timestamp` in UTC, `event.action`, `event.outcome`,
 `event.category: ["package"]`, `package.name`, and `package.reference` when
@@ -382,11 +427,19 @@ market_ttl = 600        # seconds before the marketplace is refreshed
 check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
 github_via_git = true   # owner/repo through the Git pipeline, not Herdr's installer
-logos = true            # pictures where the terminal draws images
+icons = true            # pictures where the terminal draws images
 history = "jsonl"       # jsonl (default), ecs or off
+# log_dir = "/absolute/writable/log/directory" # omitted: manager state directory
 cli_on_path = false     # herdr-pm on your PATH (asks in C)
 agent_skill = false     # the herdr-pm skill for coding agents (asks in C)
 editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
+
+[backup]
+enabled = false        # opt-in continuous LOCAL snapshots; no automatic push
+branch = "main"
+files = []             # exact plaintext approvals, selected in Settings
+# directory = "/absolute/dedicated/backup" # omitted: manager state/backup
+# remote = "ssh://git@git.example/my-herdr.git"
 
 [auto_update]
 strategy = "latest"     # latest, release, minor or patch
@@ -456,24 +509,76 @@ GitHub authentication uses an explicit source token, `GH_TOKEN`,
 GitHub API version is `2022-11-28`, which remains valid and is also understood
 by GHES versions supported by this configuration.
 
-## Same setup on every machine
+## GitOps: the same setup on every machine
 
-`config.toml` holds preferences, not the plugins. The plugin set lives in an
-export, which is plain JSON and fits in a dotfiles repository next to
-`config.toml`:
+In Settings (`C`), configure **Backup**: a dedicated local directory, Git
+remote, branch, and the exact configuration files you approve. Enablement
+asks for confirmation: files are **plaintext** and an independent local
+worker will observe changes every two seconds. The approval list starts empty.
+Selecting a directory or remote does not grant access to additional files.
 
 ```sh
-herdr-pm export -o herdr-plugins.json    # on the machine you like
-herdr-pm import herdr-plugins.json       # elsewhere: previews, then installs
-herdr-pm import herdr-plugins.json --yes # unattended
+herdr-pm push                  # review the diff, commit, then push
+herdr-pm pull                  # fetch, review, install/apply; stop on conflict
+herdr-pm pull --dry-run --yes  # preview without changing live state/repository
 ```
 
-Each plugin comes back at its exported commit, following the same branch or
-tag (or pinned, when it was), enabled or disabled, with its auto-update
-switch. Importing again changes nothing on a machine that matches. Local links
-are not exported. Copy `config.toml` (`herdr-pm config path`) for the
-preferences; with `cli_on_path` or `agent_skill` on, the next Herdr start (or
-popup) creates the PATH link and the skill links on the new machine.
+On each additional machine, configure its own local Backup settings and
+approve the files it may apply, then pull. Git handles authentication through
+your normal SSH agent or credential helper; no Git credentials are embedded
+in the snapshot format.
+
+```text
+backup/
+├── plugins.toml
+├── herdr/config.toml                # only when explicitly approved
+├── manager/config.toml              # only when explicitly approved
+└── plugins/<encoded-plugin-id>/...  # exact approved custom files
+```
+
+`plugins.toml` is a deterministic TOML document, not an event stream:
+`schema`, approved `files`, `[[plugins]]` records and `[[local_only]]`
+notices. Each reproducible plugin records its source URL, subdirectory,
+exact commit, displayed version, followed ref, optional pin, enabled state
+and auto-update flag. Local hand-linked code is reported as local-only;
+it is never silently presented as a portable code backup.
+
+The worker updates only the local snapshot. **It never commits or contacts a
+remote.** Push shows a diff, stages only snapshot-owned paths, commits using
+your Git identity when needed, and performs a normal fast-forward push.
+No automatic merge, reset, or force-push. Pull refuses divergent Git history,
+manual/staged snapshot edits, changed local plugin state, or conflicting
+selected configuration. Resolve the reported paths/history explicitly before
+retrying; unrelated plugins and local links are not silently removed.
+
+Different machines may approve different files. Unselected remote
+configuration remains in the snapshot but is not applied to live files.
+Only an explicitly selected file that is absent locally authorizes its
+deletion on the next push. A remote snapshot cannot expand the local approval
+list. The manager's `[backup]` section and absolute `log_dir` stay local even
+when `manager/config.toml` is synchronized.
+
+Only explicitly selected UTF-8 files up to 4 MiB are supported. Symlink
+traversal, unsafe paths, runtime state, caches, logs and binaries are refused.
+No encryption or automatic secret removal: approving a file may publish its
+tokens/passwords and their Git history. Use deliberate selections and a
+trusted private repository. Plugin source repositories must remain available;
+the snapshot records commits, not copies of plugin code or build tools.
+Arbitrary machine-specific paths inside custom configuration cannot be made
+portable automatically.
+
+Pull registers new plugin versions for **new invocations**, reloads Herdr
+configuration when changed, and refreshes enabled CLI/skill links immediately.
+It does not replace existing plugin processes, rewrite open shells' PATH, or
+reload an agent's already-loaded skill context. A Herdr server handoff is not
+performed: that experimental mechanism is for replacing Herdr itself, not
+synchronizing configuration.
+
+The worker starts when Backup is enabled or the manager next runs, replaces
+itself after manager updates, and stops cooperatively when disabled. Errors
+and recovery are recorded in `backup-watch.log` in the manager state directory
+(also shown in Settings). Backup does not include terminal sessions, running
+processes or terminal history.
 
 ## A marketplace without a forge API
 
@@ -493,7 +598,7 @@ the format. See `examples/publish-index.sh` for incremental publication.
 herdr-plugin-manager stores its data under Herdr's state directory:
 
 ```text
-~/.local/state/herdr/plugins/herdr-plugin-manager/
+~/.local/state/herdr/plugins/julienpoirou.herdr-plugin-manager/
 ├── registry.json       # remotes, followed refs, current and previous installs
 ├── installs/           # independent checkouts
 ├── cache/              # bare mirrors and marketplace responses
@@ -532,8 +637,9 @@ cargo build --locked && sh tests/e2e.sh   # requires herdr on PATH
 
 The E2E suite uses real Herdr and temporary repositories. It covers local,
 `file://` and `git://` installs, monorepos, builds, updates/diffs, rollback,
-pin/switch, `--replace`, offline and live-server operations, import/export,
-marketplace indexes, malicious imports, terminal escapes and invalid paths.
+pin/switch, `--replace`, offline and live-server operations, identity migration,
+continuous approved-file backup, marketplace indexes, hostile Git transports,
+terminal escapes and invalid paths.
 
 ## Français
 
@@ -544,8 +650,9 @@ Gitea/Forgejo, un dépôt nu, `git daemon` ou un chemin local. Le binaire
 Ses fonctions principales sont les monorepos (`depot.git//plugins/outil`), les
 alias de serveurs, l'aperçu des commandes avant confirmation, les diffs de
 mise à jour, les installations indépendantes avec rollback, pin/unpin/switch,
-marketplaces (herdr.dev, gitlab.com et codeberg.org par défaut), les index JSON hébergés dans Git, l'export/import aux
-commits exacts, `doctor`, l'historique et le mode hors ligne.
+marketplaces (herdr.dev, gitlab.com et codeberg.org par défaut), les index JSON
+hébergés dans Git, la synchronisation GitOps (`push`/`pull`) aux commits exacts,
+`doctor`, les logs et le mode hors ligne.
 
 ```sh
 herdr plugin install julienpoirou/herdr-plugin-manager
@@ -554,7 +661,7 @@ herdr-pm install /srv/git/mono.git//plugins/foo --ref v1.4.0
 ```
 
 Raccourci conseillé : `prefix+m` avec la commande
-`herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
+`julienpoirou.herdr-plugin-manager.open` (exemple TOML ci-dessus). Dans le popup, la souris
 fonctionne aussi : molette, clic sur une ligne ou sur un onglet. `herdr-pm config
 init` crée la configuration, `C` la modifie dans le popup (réglages, stratégies,
 sources, alias), `E` l'ouvre dans votre éditeur et `?` affiche l'aide du popup.

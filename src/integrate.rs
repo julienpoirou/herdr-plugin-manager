@@ -133,7 +133,13 @@ fn is_link(path: &Path) -> bool {
 
 /// Where a link points, when it is one.
 fn link_target(path: &Path) -> Option<PathBuf> {
-    std::fs::read_link(path).ok()
+    std::fs::read_link(path).ok().map(|target| {
+        if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        }
+    })
 }
 
 /// Removes what `link_file`/`link_dir` created. A directory that is not a
@@ -498,6 +504,42 @@ pub fn disable_skill(out: &dyn Steps) -> Result<()> {
     out.step("removing the skill");
     remove_link(&skill_home()?)?;
     out.progress(total, total);
+    Ok(())
+}
+
+/// Migration must not replace an unrelated file that now occupies an old
+/// integration's name. Validate everything before changing identity metadata.
+pub(crate) fn validate_migration_links(
+    legacy_root: Option<&Path>,
+    cli_on: bool,
+    skill_on: bool,
+) -> Result<()> {
+    let owned = |path: &Path, target: Option<PathBuf>| -> Result<()> {
+        if std::fs::symlink_metadata(path).is_ok()
+            && !target
+                .as_deref()
+                .is_some_and(|target| up_to_date(target, path))
+        {
+            bail!(
+                "{} is not the legacy manager's integration; refusing to overwrite it",
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    if cli_on {
+        owned(&cli_link()?, legacy_root.map(|r| r.join("bin").join(EXE)))?;
+    }
+    if skill_on {
+        let home = skill_home()?;
+        owned(
+            &home,
+            legacy_root.map(|r| r.join("skills").join(SKILL_NAME)),
+        )?;
+        for (_, link) in detected_agents()? {
+            owned(&link, Some(home.clone()))?;
+        }
+    }
     Ok(())
 }
 

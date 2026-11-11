@@ -266,6 +266,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 fn powershell(script: &str, dir: &Path) -> Result<String> {
     let out = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        // PowerShell 7 exports its own module path; Windows PowerShell would
+        // then fail to load its built-in modules (Set-ItemProperty…).
+        .env_remove("PSModulePath")
         .env("HPM_DIR", dir)
         .output()
         .context("could not run powershell.exe")?;
@@ -279,10 +282,11 @@ fn powershell(script: &str, dir: &Path) -> Result<String> {
 }
 
 /// Adds or removes `dir` in the user PATH (HKCU\Environment, kept as an
-/// expandable string), then tells running programs. Returns whether it
-/// changed.
+/// expandable string), then tells running programs. Already-running
+/// programs keep their environment, notably a Herdr server started earlier
+/// whose new panes inherit it: the PowerShell profiles cover those.
 #[cfg(windows)]
-fn set_user_path(dir: &Path, present: bool) -> Result<bool> {
+fn set_registry_path(dir: &Path, present: bool) -> Result<bool> {
     let script = format!(
         r#"$d = $env:HPM_DIR
 $key = Get-Item 'HKCU:\Environment'
@@ -300,50 +304,194 @@ if ($new -ne $old) {{
     Ok(powershell(&script, dir)? == "changed")
 }
 
-#[cfg(not(windows))]
+/// The user's all-hosts profile of `shell` and whether its execution policy
+/// runs it; `None` when the shell is not installed.
+#[cfg(windows)]
+fn powershell_profile(shell: &str) -> Result<Option<(PathBuf, String)>> {
+    let out = match Command::new(shell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PROFILE.CurrentUserAllHosts; Get-ExecutionPolicy",
+        ])
+        .env_remove("PSModulePath")
+        .output()
+    {
+        Ok(out) => out,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("could not run {shell}")),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    match (out.status.success(), lines.next(), lines.next()) {
+        (true, Some(profile), Some(policy)) => {
+            Ok(Some((PathBuf::from(profile), policy.to_string())))
+        }
+        _ => bail!(
+            "{shell} did not report its profile: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("no output")
+        ),
+    }
+}
+
+/// Puts `dir` on PATH for new shells, including the panes of a Herdr server
+/// started before the change (they inherit its old environment), and takes
+/// it out again. Returns what changed, for the progress output.
+#[cfg(windows)]
+fn set_user_path(dir: &Path, present: bool) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    if set_registry_path(dir, present)? {
+        notes.push(format!(
+            "{} {} your user PATH",
+            dir.display(),
+            if present { "added to" } else { "removed from" }
+        ));
+    }
+    let block = powershell_block(dir);
+    for (shell, name) in [
+        ("pwsh.exe", "PowerShell"),
+        ("powershell.exe", "Windows PowerShell"),
+    ] {
+        let (profile, policy) = match powershell_profile(shell) {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(err) => {
+                notes.push(format!("{name} profile left unchanged: {err:#}"));
+                continue;
+            }
+        };
+        // A profile the policy refuses to run would print an error in every
+        // new shell instead of fixing PATH.
+        let runs = matches!(policy.as_str(), "RemoteSigned" | "Unrestricted" | "Bypass");
+        if present && !runs {
+            notes.push(format!(
+                "{name}: execution policy {policy} runs no profile; its new panes get herdr-pm once Herdr restarts"
+            ));
+            continue;
+        }
+        match update_profile(&profile, present.then_some(block.as_str()), true) {
+            Ok(true) => notes.push(format!(
+                "{name} profile {}: {}",
+                if present { "updated" } else { "cleaned" },
+                profile.display()
+            )),
+            Ok(false) => {}
+            Err(err) => notes.push(format!("{name} profile left unchanged: {err:#}")),
+        }
+    }
+    Ok(notes)
+}
+
 const PROFILE_START: &str = "# >>> herdr-plugin-manager >>>";
-#[cfg(not(windows))]
 const PROFILE_END: &str = "# <<< herdr-plugin-manager <<<";
 
-/// `~/.local/bin` is on PATH on most systems; when it is not, a marked
-/// block in `~/.profile` (and `~/.bashrc`/`~/.zshrc` when they exist) adds
-/// it, and removing it takes the block out again.
+/// PowerShell lines adding `dir` to `$env:Path` unless it is there already.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_block(dir: &Path) -> String {
+    let quoted = dir.display().to_string().replace('\'', "''");
+    format!(
+        "$hpmDir = '{quoted}'\n\
+         if (($env:Path -split ';') -notcontains $hpmDir) {{ $env:Path = \"$hpmDir;$env:Path\" }}\n\
+         Remove-Variable hpmDir\n"
+    )
+}
+
+/// POSIX shell lines adding `dir` to `$PATH` unless it is there already.
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_block(dir: &Path) -> String {
+    let quoted = dir.display().to_string().replace('\'', r"'\''");
+    format!(
+        "hpm_dir='{quoted}'\n\
+         case \":$PATH:\" in *\":$hpm_dir:\"*) ;; *) export PATH=\"$hpm_dir:$PATH\" ;; esac\n\
+         unset hpm_dir\n"
+    )
+}
+
+/// `~/.local/bin` is often on PATH already, but not in the environment a
+/// Herdr server started earlier hands to its new panes. A marked block in
+/// `~/.profile` (and `~/.bashrc`, `~/.bash_profile`, `~/.zshrc` when they
+/// exist) covers login and interactive shells alike; disabling removes it.
 #[cfg(not(windows))]
-fn set_user_path(dir: &Path, present: bool) -> Result<bool> {
+fn set_user_path(dir: &Path, present: bool) -> Result<Vec<String>> {
     let home = home()?;
-    let on_path =
-        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir));
-    let mut changed = false;
-    for name in [".profile", ".bashrc", ".zshrc"] {
+    let block = posix_block(dir);
+    let mut notes = Vec::new();
+    for name in [".profile", ".bashrc", ".bash_profile", ".zshrc"] {
         let file = home.join(name);
         if name != ".profile" && !file.exists() {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let kept = strip_block(&text);
-        let updated = if present && !on_path {
-            format!(
-                "{kept}{}{PROFILE_START}\nexport PATH=\"{}:$PATH\"\n{PROFILE_END}\n",
-                if kept.is_empty() || kept.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                },
-                dir.display()
-            )
-        } else {
-            kept
-        };
-        if updated != text {
-            std::fs::write(&file, updated)
-                .with_context(|| format!("could not update {}", file.display()))?;
-            changed = true;
+        if update_profile(&file, present.then_some(block.as_str()), false)? {
+            notes.push(format!(
+                "~/{name} {}",
+                if present { "updated" } else { "cleaned" }
+            ));
         }
     }
-    Ok(changed)
+    Ok(notes)
 }
 
-#[cfg(not(windows))]
+/// Writes `file` with the marked block replaced by `block` (or removed),
+/// keeping everything else, its line endings and a UTF-8 BOM. Returns
+/// whether it changed. `bom` marks new files (Windows PowerShell 5.1 reads
+/// BOM-less files as ANSI). Text that is not UTF-8 is left alone.
+fn update_profile(file: &Path, block: Option<&str>, bom: bool) -> Result<bool> {
+    const BOM: &str = "\u{feff}";
+    let bytes = match std::fs::read(file) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("could not read {}", file.display())),
+    };
+    let Some(text) = bytes.as_deref().map(std::str::from_utf8).transpose().ok() else {
+        bail!("{} is not UTF-8; add the PATH line by hand", file.display());
+    };
+    if text.is_none() && block.is_none() {
+        return Ok(false);
+    }
+    let text = text.unwrap_or(if bom { BOM } else { "" });
+    let updated = with_block(text, block);
+    if updated == text {
+        return Ok(false);
+    }
+    if updated.trim_start_matches(BOM).trim().is_empty() {
+        std::fs::remove_file(file)
+            .with_context(|| format!("could not remove {}", file.display()))?;
+        return Ok(true);
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(file, updated)
+        .with_context(|| format!("could not update {}", file.display()))?;
+    Ok(true)
+}
+
+/// `text` without the marked block, then with `block` appended between the
+/// markers, in the line endings the text already uses. A leading BOM stays
+/// in front (it would otherwise hide a marker on the first line).
+fn with_block(text: &str, block: Option<&str>) -> String {
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(body) => ("\u{feff}", body),
+        None => ("", text),
+    };
+    let crlf = body.contains("\r\n") || (cfg!(windows) && !body.contains('\n'));
+    let mut out = strip_block(body);
+    if let Some(block) = block {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{PROFILE_START}\n{block}{PROFILE_END}\n"));
+    }
+    if crlf {
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    format!("{bom}{out}")
+}
+
 fn strip_block(text: &str) -> String {
     let mut out = String::new();
     let mut inside = false;
@@ -370,13 +518,31 @@ pub fn cli_plan(on: bool, skill_on: bool) -> Result<Vec<String>> {
             format!("Link {}", link.display()),
             "  to the manager's current herdr-pm (symbolic link when allowed,".into(),
             "  otherwise a hard link or a copy), moved after every update.".into(),
-            format!("Add {} to your user PATH.", dir.display()),
-            "New terminals find herdr-pm; open ones keep their PATH.".into(),
+            if cfg!(windows) {
+                format!(
+                    "Add {} to your user PATH and to your PowerShell profiles,",
+                    dir.display()
+                )
+            } else {
+                format!(
+                    "Add {} to PATH in ~/.profile (and ~/.bashrc, ~/.bash_profile, ~/.zshrc),",
+                    dir.display()
+                )
+            },
+            "  so new terminals and new Herdr panes find herdr-pm at once,".into(),
+            "  without restarting Herdr; shells already open keep their PATH.".into(),
         ]
     } else {
         let mut lines = vec![
             format!("Remove {}", link.display()),
-            format!("and take {} out of your user PATH.", dir.display()),
+            if cfg!(windows) {
+                format!(
+                    "and take {} out of your user PATH and PowerShell profiles.",
+                    dir.display()
+                )
+            } else {
+                format!("and take {} out of your shell profiles.", dir.display())
+            },
         ];
         if skill_on {
             lines.push("Agents need herdr-pm, so the agent skill goes off too:".into());
@@ -443,10 +609,12 @@ pub fn enable_cli(herdr: &Herdr, out: &dyn Steps) -> Result<()> {
     out.progress(1, 2);
     out.step("adding it to your PATH");
     let dir = cli_dir()?;
-    if set_user_path(&dir, true)? {
-        out.line(&format!("{} added to your user PATH", dir.display()));
-    } else {
+    let notes = set_user_path(&dir, true)?;
+    if notes.is_empty() {
         out.line(&format!("{} was already on your PATH", dir.display()));
+    }
+    for note in notes {
+        out.line(&note);
     }
     out.progress(2, 2);
     Ok(())
@@ -460,8 +628,8 @@ pub fn disable_cli(out: &dyn Steps) -> Result<()> {
     out.progress(1, 2);
     out.step("taking it out of your PATH");
     let dir = cli_dir()?;
-    if set_user_path(&dir, false)? {
-        out.line(&format!("{} removed from your user PATH", dir.display()));
+    for note in set_user_path(&dir, false)? {
+        out.line(&note);
     }
     out.progress(2, 2);
     Ok(())
@@ -545,8 +713,11 @@ pub(crate) fn validate_migration_links(
 
 /// Moves the PATH link and the skill to the manager's current installation
 /// when an update changed it, links the skill for agents installed since,
-/// and puts the link directory on PATH when it is missing (a config.toml
-/// copied from another machine). Does nothing for integrations that are off.
+/// and puts the link directory on PATH when it is missing. The startup hook
+/// and the popup run with the Herdr server's environment, so a missing
+/// directory there means new panes need the profile blocks (a server started
+/// before the change, or a config.toml copied from another machine). Does
+/// nothing for integrations that are off.
 pub fn refresh(herdr: &Herdr, cli_on: bool, skill_on: bool) -> Result<()> {
     if !cli_on && !skill_on {
         return Ok(());
@@ -581,17 +752,62 @@ pub fn refresh(herdr: &Herdr, cli_on: bool, skill_on: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn profile_block_is_added_once_and_removed_cleanly() {
-        let original = "export EDITOR=vim\n";
-        let with = format!(
-            "{original}{PROFILE_START}\nexport PATH=\"/h/.local/bin:$PATH\"\n{PROFILE_END}\n"
+    fn profile_block_keeps_user_content_and_line_endings() {
+        let block = posix_block(Path::new("/h/.local/bin"));
+        let original = "export EDITOR=vim";
+        let added = with_block(original, Some(&block));
+        assert!(added.starts_with("export EDITOR=vim"));
+        assert_eq!(with_block(&added, Some(&block)), added);
+        assert_eq!(
+            with_block(&added, None).trim_end(),
+            "export EDITOR=vim",
+            "removing the block keeps the user's lines"
         );
-        assert_eq!(strip_block(&with), original);
-        assert_eq!(strip_block(original), original);
+
+        let moved = posix_block(Path::new("/elsewhere"));
+        let replaced = with_block(&added, Some(&moved));
+        assert!(replaced.contains("/elsewhere") && !replaced.contains("/h/.local/bin"));
+        assert_eq!(replaced.matches(PROFILE_START).count(), 1);
+
+        let windows = "\u{feff}Set-Alias g git\r\n";
+        let added = with_block(windows, Some(&powershell_block(Path::new(r"C:\bin"))));
+        assert!(added.starts_with("\u{feff}Set-Alias g git\r\n"));
+        assert!(!added.replace("\r\n", "").contains('\n'));
+        assert_eq!(with_block(&added, None), windows);
+    }
+
+    #[test]
+    fn profile_files_are_created_updated_and_removed() {
+        let dir = std::env::temp_dir().join(format!("hpm-profile-{}", std::process::id()));
+        let file = dir.join("PowerShell").join("profile.ps1");
+        let block = powershell_block(Path::new(r"C:\Users\O'Brien\bin"));
+        assert!(block.contains(r"'C:\Users\O''Brien\bin'"));
+        assert!(update_profile(&file, Some(&block), true).unwrap());
+        assert!(std::fs::read_to_string(&file)
+            .unwrap()
+            .starts_with('\u{feff}'));
+        assert!(!update_profile(&file, Some(&block), true).unwrap());
+        assert!(update_profile(&file, None, true).unwrap());
+        assert!(
+            !file.exists(),
+            "a profile holding only the block is removed"
+        );
+        assert!(!update_profile(&file, None, true).unwrap());
+
+        std::fs::write(&file, "\u{feff}Import-Module posh-git\n").unwrap();
+        update_profile(&file, Some(&block), true).unwrap();
+        update_profile(&file, None, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "\u{feff}Import-Module posh-git\n"
+        );
+        std::fs::write(&file, [0xff, 0xfe, b'a', 0]).unwrap();
+        assert!(update_profile(&file, Some(&block), true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

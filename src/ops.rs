@@ -2474,7 +2474,7 @@ pub fn set_cli_on_path(ctx: &Ctx, on: bool) -> Result<()> {
     settings::write(&Field::CliOnPath, &Action::Set(on.to_string()))?;
     ctx.line(if on {
         format!(
-            "{} herdr-pm is on your PATH ({}); open a new terminal to use it.",
+            "{} herdr-pm is on your PATH ({}): new terminals and new Herdr panes find it; open shells keep their PATH.",
             green("✓"),
             crate::integrate::cli_dir()?.display()
         )

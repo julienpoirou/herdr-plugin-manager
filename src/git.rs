@@ -42,9 +42,9 @@ pub struct CommitInfo {
 }
 
 /// Rejects option injection and Git's ext/remote-helper transports. All
-/// callers, including JSON imports, must pass through this boundary before
+/// callers, including GitOps snapshots, must pass through this boundary before
 /// any network process can run.
-fn validate_remote(url: &str) -> Result<()> {
+pub(crate) fn validate_remote(url: &str) -> Result<()> {
     if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
         bail!("unsafe git remote {url:?}");
     }
@@ -91,6 +91,11 @@ impl Git {
 
     fn command(&self) -> Command {
         let mut command = Command::new("git");
+        #[cfg(windows)]
+        if std::env::var_os("HERDR_PM_BACKUP_GENERATION").is_some() {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
         // Check out the committed bytes. Git for Windows defaults to
         // core.autocrlf=true, which rewrote manifests (failing the
         // reviewed-manifest check) and shell scripts (breaking builds).
@@ -122,6 +127,16 @@ impl Git {
 
     /// Runs git and returns trimmed stdout.
     pub fn run(&self, cwd: Option<&Path>, args: &[&str], network: bool) -> Result<String> {
+        Ok(
+            String::from_utf8_lossy(&self.run_bytes(cwd, args, network)?)
+                .trim()
+                .to_string(),
+        )
+    }
+
+    /// Runs git without trimming or decoding its output (blob bytes and NUL
+    /// separated tree/path listings must retain their exact contents).
+    pub fn run_bytes(&self, cwd: Option<&Path>, args: &[&str], network: bool) -> Result<Vec<u8>> {
         let mut command = self.command();
         command.args(args);
         if let Some(cwd) = cwd {
@@ -163,7 +178,7 @@ impl Git {
             }
             bail!("git {}: {message}", args.first().copied().unwrap_or(""));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(output.stdout)
     }
 
     pub fn version(&self) -> Result<String> {

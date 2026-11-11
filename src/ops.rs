@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::Config;
 use crate::git::{Git, Mirror};
@@ -434,13 +434,13 @@ pub enum Mode {
     Install,
     Update,
     Switch,
-    Import,
+    Sync,
 }
 
 impl Mode {
     fn verb(self) -> &'static str {
         match self {
-            Mode::Install | Mode::Import => "install",
+            Mode::Install | Mode::Sync => "install",
             Mode::Update => "update",
             Mode::Switch => "switch",
         }
@@ -609,6 +609,12 @@ pub fn install_git(ctx: &Ctx, request: GitRequest) -> Result<bool> {
     let id = manifest.id.trim().to_string();
     if let Some(expected) = &request.expect_id {
         if &id != expected {
+            if expected == paths::OLD_PLUGIN_ID && id == paths::PLUGIN_ID {
+                bail!(
+                    "the manager identity changed to {}; bootstrap a new binary and run `herdr-pm migrate <new-checkout> --binary <new-binary> --yes` before updating; refusing to rename an installed plugin implicitly",
+                    paths::PLUGIN_ID
+                );
+            }
             bail!(
                 "{source_display} now contains plugin {id}, expected {expected}; refusing to {}",
                 request.mode.verb()
@@ -926,7 +932,7 @@ fn capitalize(s: &str) -> String {
 
 fn past(mode: Mode) -> &'static str {
     match mode {
-        Mode::Install | Mode::Import => "installed",
+        Mode::Install | Mode::Sync => "installed",
         Mode::Update => "updated",
         Mode::Switch => "switched",
     }
@@ -1612,7 +1618,16 @@ pub fn orphans(herdr: &Herdr) -> Result<Vec<Orphan>> {
         .map(|id| paths::plugin_path_component(id))
         .collect();
     kept.push(paths::plugin_path_component(paths::PLUGIN_ID));
-    let roots: Vec<PathBuf> = plugins
+    let registry = Registry::load()?;
+    let roots: Vec<PathBuf> = registry
+        .plugins
+        .values()
+        .flat_map(|r| std::iter::once(&r.current).chain(r.previous.iter()))
+        .map(|i| PathBuf::from(&i.plugin_root))
+        .chain(plugins.iter().map(|p| PathBuf::from(&p.plugin_root)))
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    let active_roots: Vec<PathBuf> = plugins
         .iter()
         .filter_map(|p| std::fs::canonicalize(&p.plugin_root).ok())
         .collect();
@@ -1627,7 +1642,10 @@ pub fn orphans(herdr: &Herdr) -> Result<Vec<Orphan>> {
     for (kind, base) in &plugin_dirs {
         for dir in dirs_in(base) {
             let name = file_name(&dir);
-            if !name.starts_with('.') && !kept.contains(&name) {
+            let in_use = std::fs::canonicalize(&dir)
+                .map(|d| roots.iter().any(|r| r.starts_with(&d)))
+                .unwrap_or(true);
+            if !name.starts_with('.') && !kept.contains(&name) && !in_use {
                 found.push((name, kind, dir));
             }
         }
@@ -1640,7 +1658,7 @@ pub fn orphans(herdr: &Herdr) -> Result<Vec<Orphan>> {
         let name = file_name(&dir);
         let id = checkout_id(&name).to_string();
         let in_use = std::fs::canonicalize(&dir)
-            .map(|d| roots.iter().any(|r| r.starts_with(&d)))
+            .map(|d| active_roots.iter().any(|r| r.starts_with(&d)))
             .unwrap_or(true)
             || kept.contains(&id);
         if !in_use {
@@ -1662,7 +1680,6 @@ pub fn orphans(herdr: &Herdr) -> Result<Vec<Orphan>> {
             }
         }
     }
-    let registry = Registry::load()?;
     let mut stale: Vec<&String> = registry
         .auto_update
         .iter()
@@ -2107,6 +2124,16 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
     else {
         bail!("no earlier installation of {id} is kept on disk");
     };
+    let previous_manifest = Manifest::parse(&std::fs::read_to_string(
+        Path::new(&prev.plugin_root).join(manifest::FILE_NAME),
+    )?)?;
+    if previous_manifest.id.trim() != row.plugin.plugin_id {
+        bail!(
+            "earlier installation declares {}, not {}; refusing an identity-changing rollback (legacy manager installations remain preserved on disk)",
+            previous_manifest.id,
+            row.plugin.plugin_id
+        );
+    }
     let mut review = vec![format!(
         "  change    {} ({}) → {} ({}, installed {})",
         util::sanitize(&record.current.version),
@@ -2147,6 +2174,12 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<()> {
     if ctx.dry_run {
         ctx.line(format!("[dry-run] would link {}", prev.plugin_root));
         return Ok(());
+    }
+    let on_disk = Manifest::parse(&std::fs::read_to_string(
+        Path::new(&prev.plugin_root).join(manifest::FILE_NAME),
+    )?)?;
+    if on_disk.id.trim() != row.plugin.plugin_id {
+        bail!("rollback manifest identity changed after its preview; refusing to link");
     }
     ctx.step(&format!("linking {}", prev.plugin_root));
     ctx.herdr
@@ -2556,229 +2589,6 @@ pub fn switch(ctx: &Ctx, id: &str, reference: &str) -> Result<()> {
             }
             Ok(())
         }
-    }
-}
-
-// ---------------------------------------------------------------- export / import
-
-pub const EXPORT_FORMAT: &str = "herdr-plugin-manager-export";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ExportEntry {
-    pub id: String,
-    /// `github` or `git`.
-    pub kind: String,
-    /// GitHub `owner/repo` or a git URL.
-    pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subdir: Option<String>,
-    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
-    pub follow_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
-    #[serde(default = "yes")]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub auto_update: bool,
-}
-
-impl ExportEntry {
-    /// The git remote of a `github` entry.
-    fn github_url(&self) -> String {
-        format!("https://github.com/{}.git", self.source)
-    }
-}
-
-fn yes() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportFile {
-    pub format: String,
-    pub version: u32,
-    pub exported_unix: u64,
-    pub plugins: Vec<ExportEntry>,
-}
-
-pub fn export(herdr: &Herdr) -> Result<(ExportFile, Vec<String>)> {
-    let rows = rows(herdr)?;
-    let mut plugins = Vec::new();
-    let mut skipped = Vec::new();
-    for row in rows {
-        match row.origin {
-            Origin::Local => skipped.push(format!(
-                "{} (local link {})",
-                row.plugin.plugin_id, row.plugin.plugin_root
-            )),
-            Origin::Github => plugins.push(ExportEntry {
-                id: row.plugin.plugin_id.clone(),
-                kind: "github".into(),
-                source: row.plugin.source.github_slug().unwrap_or_default(),
-                subdir: row.plugin.source.subdir.clone(),
-                follow_ref: row.plugin.source.requested_ref.clone(),
-                commit: row.plugin.source.resolved_commit.clone(),
-                enabled: row.plugin.enabled,
-                auto_update: row.auto_update,
-            }),
-            Origin::Git => {
-                let r = row.record.as_ref().unwrap();
-                plugins.push(ExportEntry {
-                    id: r.id.clone(),
-                    kind: "git".into(),
-                    source: r.url.clone(),
-                    subdir: r.subdir.clone(),
-                    follow_ref: r.requested_ref.clone(),
-                    commit: Some(r.current.commit.clone()),
-                    enabled: row.plugin.enabled,
-                    auto_update: row.auto_update,
-                })
-            }
-        }
-    }
-    Ok((
-        ExportFile {
-            format: EXPORT_FORMAT.into(),
-            version: 1,
-            exported_unix: util::now_unix(),
-            plugins,
-        },
-        skipped,
-    ))
-}
-
-/// Installs an export as exported: git plugins at the exported commit, then
-/// following the exported ref; GitHub plugins through Herdr. Returns the
-/// number of failures.
-pub fn import(ctx: &Ctx, file: &ExportFile, only: &[String]) -> Result<usize> {
-    if file.format != EXPORT_FORMAT {
-        bail!(
-            "not a herdr-plugin-manager export (format {:?})",
-            file.format
-        );
-    }
-    let rows = rows(&ctx.herdr)?;
-    let mut failures = 0;
-    for entry in &file.plugins {
-        if !only.is_empty() && !only.contains(&entry.id) {
-            continue;
-        }
-        let current = rows.iter().find(|r| r.plugin.plugin_id == entry.id);
-        let same = current.is_some_and(|row| match (row.origin, entry.kind.as_str()) {
-            (Origin::Git, "git" | "github") => {
-                let r = row.record.as_ref().unwrap();
-                let url = if entry.kind == "github" {
-                    entry.github_url()
-                } else {
-                    entry.source.clone()
-                };
-                r.url == url
-                    && r.subdir == entry.subdir
-                    && Some(&r.current.commit) == entry.commit.as_ref()
-            }
-            (Origin::Github, "github") => {
-                row.plugin.source.github_slug().as_deref() == Some(entry.source.as_str())
-                    && row.plugin.source.subdir == entry.subdir
-                    && row.plugin.source.resolved_commit == entry.commit
-            }
-            _ => false,
-        });
-        if same {
-            let row = current.unwrap();
-            if row.plugin.enabled != entry.enabled && !ctx.dry_run {
-                ctx.herdr.set_enabled(&entry.id, entry.enabled)?;
-                ctx.line(format!(
-                    "{} {}: {}",
-                    green("✓"),
-                    entry.id,
-                    if entry.enabled { "enabled" } else { "disabled" }
-                ));
-            } else {
-                ctx.line(format!("{} {} unchanged", dim("•"), entry.id));
-            }
-            import_auto_update(ctx, entry, row.auto_update);
-            continue;
-        }
-        let result = match entry.kind.as_str() {
-            "git" => (|| -> Result<()> {
-                let parsed = source::parse(&entry.source, &ctx.config.aliases)?
-                    .with_subdir(entry.subdir.clone());
-                let Source::Git { url, subdir } = parsed else {
-                    bail!(
-                        "git import entry {} does not contain a git source",
-                        entry.id
-                    );
-                };
-                install_git(
-                    ctx,
-                    GitRequest {
-                        url,
-                        subdir,
-                        checkout_ref: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
-                        follow_ref: Some(entry.follow_ref.clone()),
-                        mode: Mode::Import,
-                        enabled: Some(entry.enabled),
-                        replace: false,
-                        expect_id: Some(entry.id.clone()),
-                    },
-                )
-                .map(|_| ())
-            })(),
-            // Through the git pipeline (`github_via_git`): at the exported
-            // commit, then following the exported ref like a git entry.
-            "github" if ctx.config.github_via_git => install_git(
-                ctx,
-                GitRequest {
-                    url: entry.github_url(),
-                    subdir: entry.subdir.clone(),
-                    checkout_ref: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
-                    follow_ref: Some(entry.follow_ref.clone()),
-                    mode: Mode::Import,
-                    enabled: Some(entry.enabled),
-                    replace: false,
-                    expect_id: Some(entry.id.clone()),
-                },
-            )
-            .map(|_| ()),
-            "github" => (|| -> Result<()> {
-                let spec = match &entry.subdir {
-                    Some(s) => format!("{}/{s}", entry.source),
-                    None => entry.source.clone(),
-                };
-                install(
-                    ctx,
-                    InstallRequest {
-                        source: source::parse(&format!("github:{spec}"), &Default::default())?,
-                        // Reproduce the exported state exactly; a following
-                        // ref is only a fallback for older/incomplete exports.
-                        reference: entry.commit.clone().or_else(|| entry.follow_ref.clone()),
-                        enabled: Some(entry.enabled),
-                        replace: false,
-                    },
-                )
-                .map(|_| ())
-            })(),
-            other => Err(anyhow!("unknown kind {other:?}")),
-        };
-        match result {
-            Ok(()) => import_auto_update(ctx, entry, false),
-            Err(err) => {
-                failures += 1;
-                ctx.line(format!("{} {}: {err:#}", red("✗"), entry.id));
-            }
-        }
-    }
-    Ok(failures)
-}
-
-/// Turns auto-update on for an imported plugin when the export had it.
-fn import_auto_update(ctx: &Ctx, entry: &ExportEntry, already: bool) {
-    if !entry.auto_update || already || ctx.dry_run {
-        return;
-    }
-    match set_auto_update(ctx, &entry.id, true) {
-        Ok(()) => ctx.line(format!("{} {}: auto-update on", green("✓"), entry.id)),
-        Err(err) => ctx.line(format!("{} {}: {err:#}", yellow("!"), entry.id)),
     }
 }
 

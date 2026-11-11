@@ -29,9 +29,17 @@ pub enum Field {
     CheckConcurrency,
     UseGhCli,
     GithubViaGit,
-    Logos,
+    Icons,
     /// Format of the change log.
     History,
+    LogDir,
+    BackupEnabled,
+    BackupDirectory,
+    BackupRemote,
+    BackupBranch,
+    BackupFile(String),
+    BackupError,
+    BackupStatus,
     Editor,
     Strategy,
     Trigger,
@@ -57,6 +65,7 @@ pub enum Kind {
     Text,
     Alias,
     AddAlias,
+    ReadOnly,
 }
 
 impl Field {
@@ -65,14 +74,22 @@ impl Field {
             Field::KeepInstalls | Field::MarketTtl | Field::CheckConcurrency => Kind::Number,
             Field::UseGhCli
             | Field::GithubViaGit
-            | Field::Logos
+            | Field::Icons
+            | Field::BackupEnabled
+            | Field::BackupFile(_)
             | Field::Market(_)
             | Field::CliOnPath
             | Field::AgentSkill => Kind::Toggle,
             Field::Strategy | Field::Trigger | Field::History | Field::PluginStrategy(_) => {
                 Kind::Choice
             }
-            Field::Editor | Field::MinInterval => Kind::Text,
+            Field::Editor
+            | Field::MinInterval
+            | Field::LogDir
+            | Field::BackupDirectory
+            | Field::BackupRemote
+            | Field::BackupBranch => Kind::Text,
+            Field::BackupError | Field::BackupStatus => Kind::ReadOnly,
             Field::Alias(_) => Kind::Alias,
             Field::AddAlias => Kind::AddAlias,
         }
@@ -102,6 +119,22 @@ impl Field {
                 "editor command (empty: VISUAL, EDITOR, then vi/notepad): ".into(),
                 config.editor.clone().unwrap_or_default(),
             ),
+            Field::LogDir => (
+                "absolute log directory (Delete resets to default): ".into(),
+                effective_log_dir(config).display().to_string(),
+            ),
+            Field::BackupDirectory => (
+                "absolute dedicated backup directory (Delete resets): ".into(),
+                config.backup.directory().display().to_string(),
+            ),
+            Field::BackupRemote => (
+                "Git remote URL (empty: local capture only): ".into(),
+                config.backup.remote.clone().unwrap_or_default(),
+            ),
+            Field::BackupBranch => (
+                "Git branch (Delete resets to main): ".into(),
+                config.backup.branch.clone(),
+            ),
             Field::Alias(name) => (
                 format!("{name} = "),
                 config.aliases.get(name).cloned().unwrap_or_default(),
@@ -123,9 +156,69 @@ fn on_off(on: bool) -> String {
     if on { "on" } else { "off" }.to_string()
 }
 
+fn effective_log_dir(config: &Config) -> std::path::PathBuf {
+    config.log_dir.clone().unwrap_or_else(crate::paths::pm_home)
+}
+
+/// Proves the selected directory can receive logs before changing the config.
+fn prepare_log_dir(path: &std::path::Path) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    if !path.is_absolute() {
+        bail!("log_dir must be an absolute directory: {}", path.display());
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("could not create log directory {}", path.display()))?;
+    loop {
+        let probe = path.join(format!(
+            ".herdr-pm-write-probe-{}-{}",
+            std::process::id(),
+            NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let result = file.write_all(b"log directory write check\n");
+                drop(file);
+                let cleanup = std::fs::remove_file(&probe);
+                result.with_context(|| {
+                    format!("log directory is not writable: {}", path.display())
+                })?;
+                cleanup
+                    .with_context(|| format!("could not remove write probe {}", probe.display()))?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("log directory is not writable: {}", path.display()))
+            }
+        }
+    }
+}
+
+fn change_log_dir(doc: &mut DocumentMut, action: &Action, default: &std::path::Path) -> Result<()> {
+    match action {
+        Action::Set(text) => {
+            prepare_log_dir(std::path::Path::new(text.trim()))?;
+            put(&mut doc["log_dir"], text.trim());
+        }
+        Action::Delete => {
+            prepare_log_dir(default)?;
+            doc.remove("log_dir");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Every editable setting, by section. `plugins` are the ids that can get
 /// their own strategy.
-pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
+pub fn rows(config: &Config, plugins: &[String], candidates: Result<&[String], &str>) -> Vec<Row> {
     let row = |section, label: &str, value: String, field| Row {
         section,
         label: label.to_string(),
@@ -169,13 +262,13 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
         ),
         row(
             "General",
-            "logos",
-            if config.logos {
+            "icons",
+            if config.icons {
                 "on: pictures where the terminal draws images".to_string()
             } else {
                 "off".to_string()
             },
-            Field::Logos,
+            Field::Icons,
         ),
         row(
             "General",
@@ -186,6 +279,12 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
                 HistoryFormat::Off => "off: changes are not logged".to_string(),
             },
             Field::History,
+        ),
+        row(
+            "General",
+            "log_dir",
+            effective_log_dir(config).display().to_string(),
+            Field::LogDir,
         ),
         row(
             "General",
@@ -274,6 +373,83 @@ pub fn rows(config: &Config, plugins: &[String]) -> Vec<Row> {
         String::new(),
         Field::AddAlias,
     ));
+    rows.extend([
+        row(
+            "Backup (plaintext, local only)",
+            "enabled",
+            on_off(config.backup.enabled),
+            Field::BackupEnabled,
+        ),
+        row(
+            "Backup (plaintext, local only)",
+            "directory",
+            config.backup.directory().display().to_string(),
+            Field::BackupDirectory,
+        ),
+        row(
+            "Backup (plaintext, local only)",
+            "remote",
+            config
+                .backup
+                .remote
+                .clone()
+                .unwrap_or_else(|| "(not set; push/pull unavailable)".into()),
+            Field::BackupRemote,
+        ),
+        row(
+            "Backup (plaintext, local only)",
+            "branch",
+            config.backup.branch.clone(),
+            Field::BackupBranch,
+        ),
+        row(
+            "Backup (plaintext, local only)",
+            "worker errors",
+            crate::backup::error_log().display().to_string(),
+            Field::BackupStatus,
+        ),
+    ]);
+    match candidates {
+        Ok(candidates) => {
+            let mut files: Vec<&String> = candidates.iter().chain(&config.backup.files).collect();
+            files.sort();
+            files.dedup();
+            for file in files {
+                let selected = config.backup.files.contains(file);
+                let available = candidates.contains(file);
+                rows.push(row(
+                    "Plaintext file approvals (empty by default)",
+                    file,
+                    format!(
+                        "{}{}",
+                        on_off(selected),
+                        if available {
+                            ""
+                        } else {
+                            " (currently missing)"
+                        }
+                    ),
+                    Field::BackupFile(file.clone()),
+                ));
+            }
+        }
+        Err(err) => {
+            rows.push(row(
+                "Plaintext file approvals (empty by default)",
+                "files unavailable",
+                err.to_string(),
+                Field::BackupError,
+            ));
+            for file in &config.backup.files {
+                rows.push(row(
+                    "Plaintext file approvals (empty by default)",
+                    file,
+                    "on (listing unavailable; may revoke)".into(),
+                    Field::BackupFile(file.clone()),
+                ));
+            }
+        }
+    }
     rows.push(row(
         "Integrations",
         "cli_on_path",
@@ -423,11 +599,57 @@ pub fn write(field: &Field, action: &Action) -> Result<Config> {
 /// Applies one change to the text of `config.toml` and returns the new
 /// text, refused unless `Config::parse` accepts it.
 pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
+    let migrated = Config::migrate_text(text)?;
+    let text = migrated.as_deref().unwrap_or(text);
     let config = Config::parse(text)?;
     let mut doc: DocumentMut = text.parse()?;
     match field {
         Field::CliOnPath => put(&mut doc["cli_on_path"], flag(action, config.cli_on_path)),
         Field::AgentSkill => put(&mut doc["agent_skill"], flag(action, config.agent_skill)),
+        Field::BackupEnabled => put(
+            &mut table(&mut doc, "backup")?["enabled"],
+            flag(action, config.backup.enabled),
+        ),
+        Field::BackupDirectory | Field::BackupRemote | Field::BackupBranch => {
+            let key = match field {
+                Field::BackupDirectory => "directory",
+                Field::BackupRemote => "remote",
+                _ => "branch",
+            };
+            match action {
+                Action::Set(text) if !text.trim().is_empty() => {
+                    put(&mut table(&mut doc, "backup")?[key], text.trim());
+                }
+                Action::Set(_) | Action::Delete => {
+                    table(&mut doc, "backup")?.remove(key);
+                }
+                _ => {}
+            }
+        }
+        Field::BackupFile(file) => {
+            let mut files = config.backup.files.clone();
+            let selected = files.contains(file);
+            let approve = !matches!(action, Action::Delete) && flag(action, selected);
+            if approve && !selected {
+                // Recheck at approval time, not only when the dialog was opened.
+                if !crate::gitops::candidates()?.contains(file) {
+                    bail!("backup file is no longer an available candidate: {file}");
+                }
+                files.push(file.clone());
+            } else if !approve {
+                files.retain(|selected| selected != file);
+            }
+            files.sort();
+            let array: toml_edit::Array = files.iter().map(String::as_str).collect();
+            put(&mut table(&mut doc, "backup")?["files"], array);
+        }
+        Field::BackupError => {
+            bail!("file candidates could not be listed; close and reopen Settings to retry")
+        }
+        Field::BackupStatus => bail!(
+            "worker errors are recorded in {}",
+            crate::backup::error_log().display()
+        ),
         Field::KeepInstalls => put(
             &mut doc["keep_installs"],
             step(config.keep_installs as u64, action, 1, 0)?,
@@ -442,11 +664,12 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
         ),
         Field::UseGhCli => put(&mut doc["use_gh_cli"], !config.use_gh_cli),
         Field::GithubViaGit => put(&mut doc["github_via_git"], !config.github_via_git),
-        Field::Logos => put(&mut doc["logos"], flag(action, config.logos)),
+        Field::Icons => put(&mut doc["icons"], flag(action, config.icons)),
         Field::History => put(
             &mut doc["history"],
             cycle(&HISTORY, config.history, action).label(),
         ),
+        Field::LogDir => change_log_dir(&mut doc, action, &crate::paths::pm_home())?,
         Field::Trigger => {
             let next = cycle(&TRIGGERS, config.auto_update.trigger, action);
             put(
@@ -548,8 +771,109 @@ mod tests {
     use super::*;
     use crate::config::EXAMPLE;
 
+    #[test]
+    fn backup_can_capture_locally_without_remote_or_plaintext_file_grants() {
+        let text = apply("", Field::BackupEnabled, Action::Set("true".into()));
+        let config = Config::parse(&text).unwrap();
+        assert!(config.backup.enabled);
+        assert!(config.backup.files.is_empty());
+        assert!(config.backup.remote.is_none());
+        let text = apply(
+            &text,
+            Field::BackupRemote,
+            Action::Set("ssh://git@example.org/config.git".into()),
+        );
+        assert!(Config::parse(&text).unwrap().backup.remote.is_some());
+        let text = apply(&text, Field::BackupRemote, Action::Delete);
+        assert!(Config::parse(&text).unwrap().backup.remote.is_none());
+        assert!(change(
+            &text,
+            &Field::BackupRemote,
+            &Action::Set("ext::unsafe".into())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn failed_candidate_listing_surfaces_error_and_allows_revocation_only() {
+        let config = Config::parse("[backup]\nfiles = ['manager/config.toml']\n").unwrap();
+        let rows = rows(&config, &[], Err("permission denied"));
+        assert!(rows
+            .iter()
+            .any(|row| row.field == Field::BackupError && row.value == "permission denied"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row.field, Field::BackupFile(_)))
+                .count(),
+            1
+        );
+        let text = apply(
+            "[backup]\nfiles = ['manager/config.toml']\n",
+            Field::BackupFile("manager/config.toml".into()),
+            Action::Delete,
+        );
+        assert!(Config::parse(&text).unwrap().backup.files.is_empty());
+    }
+
     fn apply(text: &str, field: Field, action: Action) -> String {
         change(text, &field, &action).unwrap()
+    }
+
+    #[test]
+    fn icons_setting_migrates_legacy_preferences_without_a_schema_alias() {
+        let text = apply(
+            "# preference\nlogos = false # terminal pictures\n",
+            Field::KeepInstalls,
+            Action::Set("4".into()),
+        );
+        assert!(!text.contains("logos"));
+        assert!(text.contains("# preference"));
+        assert!(text.contains("icons = false # terminal pictures"));
+        let text = apply(&text, Field::Icons, Action::Next);
+        assert!(Config::parse(&text).unwrap().icons);
+        assert!(text.contains("# terminal pictures"));
+    }
+
+    #[test]
+    fn log_directory_is_created_checked_and_reset() {
+        let root = std::env::temp_dir().join(format!(
+            "hpm-log-setting-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = root.join("new").join("logs");
+        let text = apply(
+            "",
+            Field::LogDir,
+            Action::Set(directory.display().to_string()),
+        );
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.log_dir.as_deref(), Some(directory.as_path()));
+        assert!(change("", &Field::LogDir, &Action::Set("relative/logs".into())).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "do not overwrite").unwrap();
+        assert!(change("", &Field::LogDir, &Action::Set(file.display().to_string())).is_err());
+        assert!(change(
+            "",
+            &Field::LogDir,
+            &Action::Set(file.join("child").display().to_string())
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "do not overwrite");
+        let manual = format!("log_dir = {:?}\n", file.to_str().unwrap());
+        assert!(Config::parse(&manual).is_err());
+        let default = root.join("default");
+        let mut doc: DocumentMut = text.parse().unwrap();
+        change_log_dir(&mut doc, &Action::Delete, &default).unwrap();
+        assert!(default.is_dir());
+        assert!(Config::parse(&doc.to_string()).unwrap().log_dir.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

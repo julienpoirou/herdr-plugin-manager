@@ -132,7 +132,10 @@ impl Registry {
 
 impl Locked {
     pub fn save(&self) -> Result<()> {
-        let path = paths::registry_file();
+        let path = crate::herdr::resolve_write_target(&paths::registry_file())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(&self.registry)?)?;
         std::fs::rename(&tmp, &path)?;
@@ -140,7 +143,7 @@ impl Locked {
     }
 }
 
-/// One line per change, so `herdr-pm history` can show what happened.
+/// One line per change, so `herdr-pm logs` can show what happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub unix: u64,
@@ -161,26 +164,35 @@ pub struct Event {
 /// Appends `event` to the change log in the configured format
 /// (`history` in config.toml), or nowhere when it is off.
 pub fn log_event(event: Event) {
-    let format = crate::config::Config::load()
-        .map(|c| c.history)
-        .unwrap_or_default();
-    let (path, line) = match format {
-        HistoryFormat::Off => return,
-        HistoryFormat::Jsonl => (paths::history_file(), serde_json::to_string(&event)),
-        HistoryFormat::Ecs => (
-            paths::history_ecs_file(),
-            serde_json::to_string(&to_ecs(&event)),
-        ),
+    if let Err(err) = append_event(&event) {
+        eprintln!("warning: could not record change log: {err:#}");
+    }
+}
+
+fn append_event(event: &Event) -> Result<()> {
+    let config = crate::config::Config::load()?;
+    let filename = match config.history {
+        HistoryFormat::Off => return Ok(()),
+        HistoryFormat::Jsonl => "history.jsonl",
+        HistoryFormat::Ecs => "history.ecs.ndjson",
+    };
+    let path = config.log_dir.unwrap_or_else(paths::pm_home).join(filename);
+    let line = match config.history {
+        HistoryFormat::Jsonl => serde_json::to_string(event)?,
+        HistoryFormat::Ecs => serde_json::to_string(&to_ecs(event))?,
+        HistoryFormat::Off => unreachable!(),
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create log directory {}", parent.display()))?;
     }
-    if let (Ok(mut file), Ok(line)) = (
-        OpenOptions::new().create(true).append(true).open(&path),
-        line,
-    ) {
-        let _ = writeln!(file, "{line}");
-    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("could not open log {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("could not append log {}", path.display()))?;
+    Ok(())
 }
 
 /// Version of the Elastic Common Schema the ECS log follows.
@@ -258,16 +270,25 @@ pub fn from_ecs(doc: &serde_json::Value) -> Option<Event> {
 #[derive(Default)]
 pub struct EventReader {
     offsets: [u64; 2],
+    files: [Option<std::path::PathBuf>; 2],
 }
 
 impl EventReader {
     pub fn read_new(&mut self) -> std::io::Result<Vec<Event>> {
-        self.read_files([paths::history_file(), paths::history_ecs_file()])
+        let directory = paths::log_dir().map_err(std::io::Error::other)?;
+        self.read_files([
+            directory.join("history.jsonl"),
+            directory.join("history.ecs.ndjson"),
+        ])
     }
 
     fn read_files(&mut self, files: [std::path::PathBuf; 2]) -> std::io::Result<Vec<Event>> {
         let mut events = Vec::new();
         for (index, path) in files.into_iter().enumerate() {
+            if self.files[index].as_ref() != Some(&path) {
+                self.offsets[index] = 0;
+                self.files[index] = Some(path.clone());
+            }
             let file = match std::fs::File::open(path) {
                 Ok(file) => file,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -391,7 +412,37 @@ mod tests {
         std::fs::write(&files[0], "").unwrap();
         assert!(reader.read_files(files.clone()).unwrap().is_empty());
         std::fs::write(&files[0], format!("{line}\n")).unwrap();
-        assert_eq!(reader.read_files(files).unwrap()[0].action, "pin");
+        assert_eq!(reader.read_files(files.clone()).unwrap()[0].action, "pin");
+        let moved = root.join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let moved_files = [
+            moved.join("history.jsonl"),
+            moved.join("history.ecs.ndjson"),
+        ];
+        std::fs::write(&moved_files[0], format!("{line}\n")).unwrap();
+        std::fs::write(&moved_files[1], format!("{}\n", to_ecs(&event))).unwrap();
+        // Changing just one resolved path resets only that format's cursor.
+        let fresh = reader
+            .read_files([moved_files[0].clone(), files[1].clone()])
+            .unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].action, "pin");
+        let fresh = reader.read_files(moved_files.clone()).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].action, "pin");
+        assert!(reader.read_files(moved_files.clone()).unwrap().is_empty());
+        // Following a new directory still retries incomplete lines.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&moved_files[0])
+            .unwrap();
+        write!(file, "{}", &line[..line.len() / 2]).unwrap();
+        file.flush().unwrap();
+        assert!(reader.read_files(moved_files.clone()).unwrap().is_empty());
+        writeln!(file, "{}", &line[line.len() / 2..]).unwrap();
+        drop(file);
+        assert_eq!(reader.read_files(moved_files.clone()).unwrap().len(), 1);
+        assert!(reader.read_files(moved_files).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

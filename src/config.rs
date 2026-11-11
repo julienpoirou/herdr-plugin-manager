@@ -1,5 +1,5 @@
 //! `config.toml` in the manager's Herdr config directory
-//! (`herdr plugin config-dir herdr-plugin-manager`).
+//! (`herdr plugin config-dir julienpoirou.herdr-plugin-manager`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -280,6 +280,89 @@ impl AutoUpdate {
     }
 }
 
+/// Machine-local opt-in plaintext snapshots. Network sync is always explicit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Backup {
+    pub enabled: bool,
+    pub directory: Option<PathBuf>,
+    pub remote: Option<String>,
+    pub branch: String,
+    pub files: Vec<String>,
+}
+
+impl Default for Backup {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: None,
+            remote: None,
+            branch: "main".to_string(),
+            files: Vec::new(),
+        }
+    }
+}
+
+impl Backup {
+    pub fn directory(&self) -> PathBuf {
+        self.directory
+            .clone()
+            .unwrap_or_else(|| paths::pm_home().join("backup"))
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(path) = &self.directory {
+            if !path.is_absolute() {
+                bail!(
+                    "backup.directory must be an absolute directory: {}",
+                    path.display()
+                );
+            }
+            match path.metadata() {
+                Ok(metadata) if !metadata.is_dir() => {
+                    bail!("backup.directory is not a directory: {}", path.display());
+                }
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(err).with_context(|| {
+                        format!("could not inspect backup.directory {}", path.display())
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let Some(remote) = &self.remote {
+            crate::git::validate_remote(remote).context("invalid backup.remote")?;
+        }
+        if self.branch.trim().is_empty()
+            || self.branch.starts_with('-')
+            || self.branch.chars().any(char::is_control)
+        {
+            bail!("backup.branch must name a Git branch");
+        }
+        let mut selected = std::collections::BTreeSet::new();
+        for file in &self.files {
+            let parts: Vec<_> = file.split('/').collect();
+            let supported = matches!(file.as_str(), "herdr/config.toml" | "manager/config.toml")
+                || (parts.len() >= 3 && parts[0] == "plugins");
+            if !supported
+                || parts.iter().any(|part| {
+                    part.is_empty()
+                        || matches!(*part, "." | "..")
+                        || part
+                            .chars()
+                            .any(|c| c.is_control() || "\\:*?[]".contains(c))
+                })
+            {
+                bail!("backup.files requires exact portable file selectors, not paths or globs: {file:?}");
+            }
+            if !selected.insert(file) {
+                bail!("backup.files contains duplicate selector {file:?}");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -317,10 +400,16 @@ pub struct Config {
     /// Project and owner pictures in the popup, where the terminal draws
     /// images.
     #[serde(default = "default_true")]
-    pub logos: bool,
+    pub icons: bool,
     /// How changes are logged for `herdr-pm logs` (and log shippers).
     #[serde(default)]
     pub history: HistoryFormat,
+    /// Directory for change logs; defaults to the manager's data directory.
+    #[serde(default)]
+    pub log_dir: Option<PathBuf>,
+    /// Local backup controls and exact plaintext file approvals; never imported.
+    #[serde(default)]
+    pub backup: Backup,
     #[serde(default)]
     pub auto_update: AutoUpdate,
     /// Sources added to the built-in ones (`builtin_markets`); one with the
@@ -372,8 +461,10 @@ impl Default for Config {
             github_via_git: true,
             cli_on_path: false,
             agent_skill: false,
-            logos: true,
+            icons: true,
             history: HistoryFormat::default(),
+            log_dir: None,
+            backup: Backup::default(),
             auto_update: AutoUpdate::default(),
             marketplace: Vec::new(),
         }
@@ -434,15 +525,53 @@ impl Config {
     }
 
     pub fn load() -> Result<Config> {
-        let path = Config::path();
-        let text = match std::fs::read_to_string(&path) {
+        Self::load_path(&Config::path(), true)
+    }
+
+    /// Loads legacy preferences in memory without modifying the config file.
+    pub fn load_read_only() -> Result<Config> {
+        Self::load_path(&Config::path(), false)
+    }
+
+    fn load_path(path: &std::path::Path, persist_migration: bool) -> Result<Config> {
+        let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(err) => {
                 return Err(err).with_context(|| format!("could not read {}", path.display()))
             }
         };
-        Config::parse(&text).with_context(|| format!("invalid config {}", path.display()))
+        let migrated = Self::migrate_text(&text)
+            .with_context(|| format!("could not migrate config {}", path.display()))?;
+        let config = Config::parse(migrated.as_deref().unwrap_or(&text))
+            .with_context(|| format!("invalid config {}", path.display()))?;
+        if let Some(updated) = migrated.filter(|_| persist_migration) {
+            std::fs::write(path, updated)
+                .with_context(|| format!("could not migrate config {}", path.display()))?;
+        }
+        Ok(config)
+    }
+
+    /// One-time persisted-key migration, preserving the value and its comments.
+    /// Parsing itself deliberately accepts only the current schema.
+    pub fn migrate_text(text: &str) -> Result<Option<String>> {
+        let mut doc: toml_edit::DocumentMut = text.parse()?;
+        if !doc.contains_key("logos") {
+            return Ok(None);
+        }
+        if doc.contains_key("icons") {
+            bail!(
+                "config contains both logos and icons; remove logos after choosing the icons value"
+            );
+        }
+        let (old_key, item) = doc.as_table_mut().remove_entry("logos").unwrap();
+        let mut key = toml_edit::Key::new("icons");
+        *key.leaf_decor_mut() = old_key.leaf_decor().clone();
+        *key.dotted_decor_mut() = old_key.dotted_decor().clone();
+        doc.as_table_mut().insert_formatted(&key, item);
+        let updated = doc.to_string();
+        Self::parse(&updated)?;
+        Ok(Some(updated))
     }
 
     /// Parses and checks a config file's text, built-in sources included.
@@ -455,6 +584,22 @@ impl Config {
     }
 
     pub fn check(&self) -> Result<()> {
+        self.backup.check()?;
+        if let Some(path) = &self.log_dir {
+            if !path.is_absolute() {
+                bail!("log_dir must be an absolute directory: {}", path.display());
+            }
+            match path.metadata() {
+                Ok(metadata) if !metadata.is_dir() => {
+                    bail!("log_dir is not a directory: {}", path.display());
+                }
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(err)
+                        .with_context(|| format!("could not inspect log_dir {}", path.display()));
+                }
+                _ => {}
+            }
+        }
         match crate::util::parse_duration(&self.auto_update.min_interval) {
             Some(secs) if secs >= 60 => {}
             Some(_) => bail!("auto_update.min_interval must be at least 1m"),
@@ -551,6 +696,92 @@ impl MarketSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_defaults_do_not_grant_plaintext_files_or_require_remote() {
+        let defaults = Config::parse("").unwrap();
+        assert_eq!(defaults.backup, Backup::default());
+        let enabled = Config::parse("[backup]\nenabled = true\n").unwrap();
+        assert!(enabled.backup.enabled);
+        assert!(enabled.backup.remote.is_none());
+        assert!(enabled.backup.files.is_empty());
+        assert_eq!(enabled.backup.branch, "main");
+        assert!(Config::parse("[backup]\nunknown = true\n").is_err());
+    }
+
+    #[test]
+    fn backup_file_approvals_are_exact_and_transport_is_checked() {
+        for file in [
+            "../secrets",
+            "plugins/id/../secret",
+            "plugins/id/*.toml",
+            "plugins/id/file?",
+            "plugins/id/C:\\\\secret",
+            "/manager/config.toml",
+        ] {
+            let text = format!("[backup]\nfiles = [{}]\n", toml::Value::String(file.into()));
+            assert!(Config::parse(&text).is_err(), "{file}");
+        }
+        assert!(Config::parse(
+            "[backup]\nfiles = ['herdr/config.toml', 'plugins/a.b/nested/settings.toml']\n"
+        )
+        .is_ok());
+        assert!(Config::parse(
+            "[backup]\nfiles = ['manager/config.toml', 'manager/config.toml']\n"
+        )
+        .is_err());
+        assert!(Config::parse("[backup]\ndirectory = 'relative'\n").is_err());
+        assert!(Config::parse("[backup]\nremote = 'ext::unsafe'\n").is_err());
+        assert!(Config::parse("[backup]\nbranch = ''\n").is_err());
+    }
+
+    #[test]
+    fn icons_migration_preserves_comments_and_runs_once_on_load() {
+        let root = std::env::temp_dir().join(format!(
+            "hpm-config-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let original = "# pictures preference\nlogos = false # keep this comment\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(!Config::load_path(&path, false).unwrap().icons);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!Config::load_path(&path, true).unwrap().icons);
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("icons = false # keep this comment"));
+        assert!(migrated.contains("# pictures preference"));
+        assert!(!migrated.contains("logos"));
+        assert!(Config::migrate_text(&migrated).unwrap().is_none());
+        assert!(!Config::load_path(&path, true).unwrap().icons);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+        assert!(Config::parse(original).is_err());
+        assert!(Config::migrate_text("logos = false\nicons = true\n").is_err());
+        std::fs::write(&path, "logos = false\nunknown = true\n").unwrap();
+        assert!(Config::load_path(&path, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "logos = false\nunknown = true\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn icons_and_log_directory_have_current_schema_defaults() {
+        let defaults = Config::parse("").unwrap();
+        assert!(defaults.icons);
+        assert!(defaults.log_dir.is_none());
+        assert!(!Config::parse("icons = false\n").unwrap().icons);
+        assert!(Config::parse("log_dir = 'relative/logs'\n").is_err());
+        let directory = std::env::temp_dir();
+        let text = format!("log_dir = {:?}\n", directory.to_str().unwrap());
+        assert_eq!(Config::parse(&text).unwrap().log_dir, Some(directory));
+        assert!(!toml::to_string(&defaults).unwrap().contains("logos"));
+    }
 
     #[test]
     fn example_config_parses() {

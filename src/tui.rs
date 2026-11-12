@@ -43,8 +43,6 @@ const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
 const MUTED: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(236);
-/// Key caps that can be clicked.
-const BUTTON_BG: Color = Color::Indexed(238);
 
 fn muted() -> Style {
     Style::default().fg(MUTED)
@@ -1589,7 +1587,12 @@ struct Hint {
     /// Start column, width, and what a click there does.
     clicks: Vec<(u16, u16, Click)>,
     width: u16,
+    /// The window's back `←` and close `×`, drawn at its top right.
+    buttons: Vec<(&'static str, Click)>,
 }
+
+/// Clickable pieces of a line: start column, width, and what a click does.
+type Clicks = Vec<(u16, u16, Click)>;
 
 impl Hint {
     fn new(mouse: bool) -> Hint {
@@ -1598,22 +1601,37 @@ impl Hint {
             spans: Vec::new(),
             clicks: Vec::new(),
             width: 0,
+            buttons: Vec::new(),
         }
     }
 
-    /// A window title starting with its back `←` and close `×` buttons
-    /// (with the mouse only).
+    /// A window title, with its back `←` and close `×` buttons kept apart
+    /// for the top right corner (with the mouse only).
     fn title(mouse: bool, back: Option<Click>, close: Option<Click>) -> Hint {
         let mut hint = Hint::new(mouse);
         if mouse {
-            for (glyph, click) in [("←", back), ("×", close)] {
-                if let Some(click) = click {
-                    hint.push(Span::raw(" "), None);
-                    hint.push(Span::styled(glyph, key_style()), Some(click));
-                }
-            }
+            hint.buttons = [("←", back), ("×", close)]
+                .into_iter()
+                .filter_map(|(glyph, click)| Some((glyph, click?)))
+                .collect();
         }
         hint
+    }
+
+    /// The `←×` buttons side by side, preceded by a space: the line, its
+    /// clicks and its width. `None` without buttons.
+    fn take_buttons(&mut self) -> Option<(Line<'static>, Clicks, u16)> {
+        if self.buttons.is_empty() {
+            return None;
+        }
+        let mut buttons = Hint::new(self.mouse);
+        buttons.push(Span::raw(" "), None);
+        for (glyph, click) in std::mem::take(&mut self.buttons) {
+            buttons.push(Span::styled(glyph, key_style()), Some(click));
+        }
+        let width = buttons.width;
+        let (line, clicks) = buttons.into_parts();
+        Some((line, clicks, width))
     }
 
     /// Text; with a click, the text up to its trailing spaces takes it.
@@ -1631,18 +1649,13 @@ impl Hint {
         self
     }
 
-    /// A key cap, drawn as a button when it can be clicked.
+    /// A key cap; with the mouse, a click on it presses the key.
     fn cap(
         &mut self,
         cap: impl Into<Cow<'static, str>>,
         style: Style,
         click: Option<Click>,
     ) -> &mut Hint {
-        let style = if self.mouse && click.is_some() {
-            style.bg(BUTTON_BG)
-        } else {
-            style
-        };
         self.push(Span::styled(cap, style), click)
     }
 
@@ -2356,21 +2369,31 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     // Esc goes back from the marketplace, or clears the filter.
     let back = (app.view == View::Market || !app.filter.is_empty()).then_some(Click::Key(ESC));
     let mut hint = Hint::title(app.mouse(), back, Some(Click::Key(QUIT)));
+    let buttons = hint.take_buttons();
+    let buttons_width = buttons.as_ref().map_or(0, |(_, _, width)| *width);
     for (span, view) in tabs.into_iter().zip([View::Installed, View::Market]) {
         hint.push(span, Some(Click::Tab(view)));
         hint.push(Span::raw(" "), None);
     }
     if app.ctx.dry_run {
         let right = "DRY RUN";
-        let gap = (area.width as usize).saturating_sub(hint.width as usize + right.len() + 1);
+        let gap = (area.width as usize)
+            .saturating_sub(hint.width as usize + right.len() + 1 + buttons_width as usize);
         hint.push(Span::raw(" ".repeat(gap)), None);
         hint.push(Span::styled(right, Style::default().fg(WARN)), None);
     }
     let (line, clicks) = hint.into_parts();
-    app.hits
-        .borrow_mut()
-        .place(&clicks, area.x, area.y, area.right());
+    let mut hits = app.hits.borrow_mut();
+    hits.place(&clicks, area.x, area.y, area.right());
     f.render_widget(Paragraph::new(line), area);
+    if let Some((line, clicks, width)) = buttons {
+        let x = area.right().saturating_sub(width);
+        hits.place(&clicks, x, area.y, area.right());
+        f.render_widget(
+            Paragraph::new(line),
+            Rect::new(x, area.y, width.min(area.width), 1),
+        );
+    }
 }
 
 fn status_span(app: &App, row: &Row) -> Span<'static> {
@@ -3083,15 +3106,16 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Starts a dialog over what is drawn: clears the area and the clicks
-/// below it, and frames it with `title` (its buttons first).
+/// below it, and frames it with `title`, its buttons at the top right.
 fn dialog_block(
     f: &mut Frame,
     app: &App,
     rect: Rect,
     border: Color,
-    title: Hint,
+    mut title: Hint,
 ) -> Block<'static> {
     f.render_widget(Clear, rect);
+    let buttons = title.take_buttons();
     let (title, clicks) = title.into_parts();
     let mut hits = app.hits.borrow_mut();
     hits.clear();
@@ -3101,10 +3125,17 @@ fn dialog_block(
         rect.y,
         rect.right().saturating_sub(1),
     );
-    Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
-        .title(title)
+        .title(title);
+    if let Some((line, clicks, width)) = buttons {
+        // Right after the last dash, against the top right corner.
+        let right = rect.right().saturating_sub(1);
+        hits.place(&clicks, right.saturating_sub(width), rect.y, right);
+        block = block.title_top(line.right_aligned());
+    }
+    block
 }
 
 /// Makes line `index` of a dialog's text clickable, when it is on screen.
@@ -4046,6 +4077,7 @@ mod tests {
         assert_eq!(hits.at(0, 0), None);
 
         let mut hint = Hint::title(false, Some(Click::Key(ESC)), Some(Click::Key(QUIT)));
+        assert!(hint.take_buttons().is_none());
         hint.key("u", key_style(), Span::raw(" update  "), &[ch('u')]);
         let (line, clicks) = hint.into_parts();
         assert!(clicks.is_empty());
@@ -4056,6 +4088,14 @@ mod tests {
     #[test]
     fn hint_pieces_land_on_their_text() {
         let mut hint = Hint::title(true, Some(Click::Key(ESC)), Some(Click::Key(QUIT)));
+        let (buttons, button_clicks, width) = hint.take_buttons().unwrap();
+        // " ←×": side by side, for the top right corner.
+        assert_eq!((buttons.width(), width), (3, 3));
+        let mut hits = Hits::new(true);
+        hits.place(&button_clicks, 97, 0, 100);
+        assert_eq!(hits.at(97, 0), None);
+        assert_eq!(hits.at(98, 0), Some(Click::Key(ESC)));
+        assert_eq!(hits.at(99, 0), Some(Click::Key(QUIT)));
         hint.push(Span::raw(" Title "), None);
         hint.key("u", key_style(), Span::raw(" update  "), &[ch('u')])
             .key(
@@ -4067,19 +4107,16 @@ mod tests {
         let (_, clicks) = hint.into_parts();
         let mut hits = Hits::new(true);
         hits.place(&clicks, 10, 0, 100);
-        // " ← × Title u update  ←→ page"
-        assert_eq!(hits.at(11, 0), Some(Click::Key(ESC)));
-        assert_eq!(hits.at(12, 0), None);
-        assert_eq!(hits.at(13, 0), Some(Click::Key(QUIT)));
-        assert_eq!(hits.at(16, 0), None);
+        // " Title u update  ←→ page": the buttons are no longer in the title.
+        assert_eq!(hits.at(10, 0), None);
         // `u` and its label, not the spaces after it.
-        for col in 21..29 {
+        for col in 17..25 {
             assert_eq!(hits.at(col, 0), Some(ch('u')), "column {col}");
         }
-        assert_eq!(hits.at(29, 0), None);
-        assert_eq!(hits.at(31, 0), Some(press(KeyCode::Left)));
-        assert_eq!(hits.at(32, 0), Some(press(KeyCode::Right)));
-        assert_eq!(hits.at(34, 0), None);
+        assert_eq!(hits.at(25, 0), None);
+        assert_eq!(hits.at(27, 0), Some(press(KeyCode::Left)));
+        assert_eq!(hits.at(28, 0), Some(press(KeyCode::Right)));
+        assert_eq!(hits.at(30, 0), None);
     }
 
     #[test]

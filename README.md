@@ -212,7 +212,7 @@ action.
 | Area | Keys |
 |---|---|
 | Navigation | arrows / `j` / `k`, `/` filter |
-| Mouse | every key shown in a footer or dialog is also a button; `×` (top left) closes, `←` goes back; click a row to select it, again to act; wheel scrolls; click a tab to switch views |
+| Mouse | every key shown in a footer or dialog is clickable, its label included; `←×` at the top right go back and close; click a row to select it, again to act; wheel scrolls; click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
 | State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback, `t` take a GitHub plugin over from Herdr |

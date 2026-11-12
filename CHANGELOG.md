@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.17.0...v0.17.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **tui:** Back and close buttons side by side at the top right, unstyled footer ([#56](https://github.com/julienpoirou/herdr-plugin-manager/issues/56)) ([fa6f483](https://github.com/julienpoirou/herdr-plugin-manager/commit/fa6f483f20ac381cfc6bedc1471f8b4490fee11a))
+
 ## [0.17.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.16.1...v0.17.0) (2026-11-12)
 
 

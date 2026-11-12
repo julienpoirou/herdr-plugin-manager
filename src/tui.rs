@@ -6,7 +6,7 @@
 //! terminal, then returns.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -151,6 +151,8 @@ struct Picker {
     name: String,
     picks: Vec<Pick>,
     sel: usize,
+    /// First pick shown (see `scroll_window`).
+    top: Cell<usize>,
     loading: bool,
     error: Option<String>,
 }
@@ -160,6 +162,8 @@ struct Cleaner {
     orphans: Vec<Orphan>,
     chosen: Vec<bool>,
     sel: usize,
+    /// First leftover shown (see `scroll_window`).
+    top: Cell<usize>,
     loading: bool,
     error: Option<String>,
 }
@@ -1009,6 +1013,8 @@ struct SettingsDialog {
     /// Automatic backup's current failure, read when the dialog opens and
     /// after each change.
     problem: Option<String>,
+    /// First line shown (see `scroll_window`).
+    top: Cell<usize>,
 }
 
 fn settings_rows(app: &App) -> Vec<settings::Row> {
@@ -1147,6 +1153,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     | settings::Field::LogDir
                     | settings::Field::BackupRemote
                     | settings::Field::BackupBranch
+                    | settings::Field::BackupPlugins
                     | settings::Field::BackupFile(_)
             ) =>
         {
@@ -1194,6 +1201,21 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     None
 }
 
+/// The first line of a list `len` long shown `height` lines at a time, so
+/// that line `sel` stays visible. The window only moves when the selection
+/// leaves it: clicking a visible line never makes the list jump.
+fn scroll_window(top: &Cell<usize>, sel: usize, height: usize, len: usize) -> usize {
+    let mut start = top.get();
+    if sel < start {
+        start = sel;
+    } else if height > 0 && sel >= start + height {
+        start = sel + 1 - height;
+    }
+    start = start.min(len.saturating_sub(height));
+    top.set(start);
+    start
+}
+
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     use settings::Kind;
     let Some(dialog) = &app.settings else {
@@ -1235,9 +1257,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         body.push((Line::from(vec![label, value]).style(style), Some(place)));
     }
     let height = (area.height.saturating_sub(10) as usize).clamp(5, 30);
-    let start = sel_line
-        .saturating_sub(height / 2)
-        .min(body.len().saturating_sub(height));
+    let start = scroll_window(&dialog.top, sel_line, height, body.len());
     let (mut lines, places): (Vec<Line>, Vec<_>) =
         body.into_iter().skip(start).take(height).unzip();
     lines.push(Line::raw(""));
@@ -1295,7 +1315,10 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             hint.push(Span::raw("read-only   "), None);
         }
     }
-    if matches!(field, Some(settings::Field::PluginStrategy(_))) {
+    if matches!(
+        field,
+        Some(settings::Field::PluginStrategy(_) | settings::Field::BackupPlugins)
+    ) {
         hint.key("d", key, Span::raw(" default   "), &delete);
     }
     hint.key("E", key, Span::raw(" editor   "), &[ch('E')]).key(
@@ -1894,6 +1917,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 error: None,
                 candidates: crate::gitops::candidates().map_err(|err| format!("{err:#}")),
                 problem: crate::backup::problem(),
+                top: Cell::new(0),
             });
             return None;
         }
@@ -3446,6 +3470,7 @@ fn open_picker(app: &mut App, row: Row) {
         name: row.plugin.name.clone(),
         picks: Vec::new(),
         sel: 0,
+        top: Cell::new(0),
         loading: true,
         error: None,
     });
@@ -3600,10 +3625,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     let height = (area.height.saturating_sub(8) as usize).clamp(3, 18);
-    let start = picker
-        .sel
-        .saturating_sub(height / 2)
-        .min(picker.picks.len().saturating_sub(height));
+    let start = scroll_window(&picker.top, picker.sel, height, picker.picks.len());
     // Line of each pick shown, and its index.
     let mut shown = Vec::new();
     for (i, pick) in picker.picks.iter().enumerate().skip(start).take(height) {
@@ -3697,6 +3719,7 @@ fn open_cleaner(app: &mut App) {
         orphans: Vec::new(),
         chosen: Vec::new(),
         sel: 0,
+        top: Cell::new(0),
         loading: true,
         error: None,
     });
@@ -3792,10 +3815,7 @@ fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     let height = (area.height.saturating_sub(8) as usize).clamp(3, 18);
-    let start = cleaner
-        .sel
-        .saturating_sub(height / 2)
-        .min(cleaner.orphans.len().saturating_sub(height));
+    let start = scroll_window(&cleaner.top, cleaner.sel, height, cleaner.orphans.len());
     // Line of each leftover shown, and its index.
     let mut shown = Vec::new();
     for (i, orphan) in cleaner.orphans.iter().enumerate().skip(start).take(height) {
@@ -4117,6 +4137,25 @@ mod tests {
         assert_eq!(hits.at(27, 0), Some(press(KeyCode::Left)));
         assert_eq!(hits.at(28, 0), Some(press(KeyCode::Right)));
         assert_eq!(hits.at(30, 0), None);
+    }
+
+    #[test]
+    fn lists_only_scroll_when_the_selection_leaves_the_window() {
+        let top = Cell::new(0);
+        // 30 lines, 10 shown: selecting any visible line keeps the window.
+        for sel in 0..10 {
+            assert_eq!(scroll_window(&top, sel, 10, 30), 0);
+        }
+        // Going past the bottom shows it as the last line.
+        assert_eq!(scroll_window(&top, 12, 10, 30), 3);
+        // Clicking a visible line higher up does not move the window.
+        assert_eq!(scroll_window(&top, 5, 10, 30), 3);
+        // Above the window, it becomes the first line.
+        assert_eq!(scroll_window(&top, 1, 10, 30), 1);
+        // Never past the end, even when the list shrinks.
+        top.set(25);
+        assert_eq!(scroll_window(&top, 27, 10, 30), 20);
+        assert_eq!(scroll_window(&top, 2, 10, 5), 0);
     }
 
     #[test]

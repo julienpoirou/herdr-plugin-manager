@@ -449,7 +449,6 @@ mkdir -p "$T/live-manager-config" "$XDG_CONFIG_HOME/herdr"
 cat > "$T/live-manager-config/config.toml" <<EOF
 [backup]
 enabled = false
-directory = "$T/live-snapshot"
 remote = "$T/live-backup.git"
 files = ["herdr/config.toml"]
 EOF

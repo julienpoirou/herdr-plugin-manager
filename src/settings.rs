@@ -34,12 +34,12 @@ pub enum Field {
     History,
     LogDir,
     BackupEnabled,
-    BackupDirectory,
     BackupRemote,
     BackupBranch,
     BackupFile(String),
     BackupError,
-    BackupStatus,
+    /// What keeps automatic backup from working; shown only then.
+    BackupProblem,
     Editor,
     Strategy,
     Trigger,
@@ -86,10 +86,9 @@ impl Field {
             Field::Editor
             | Field::MinInterval
             | Field::LogDir
-            | Field::BackupDirectory
             | Field::BackupRemote
             | Field::BackupBranch => Kind::Text,
-            Field::BackupError | Field::BackupStatus => Kind::ReadOnly,
+            Field::BackupError | Field::BackupProblem => Kind::ReadOnly,
             Field::Alias(_) => Kind::Alias,
             Field::AddAlias => Kind::AddAlias,
         }
@@ -122,10 +121,6 @@ impl Field {
             Field::LogDir => (
                 "absolute log directory (Delete resets to default): ".into(),
                 effective_log_dir(config).display().to_string(),
-            ),
-            Field::BackupDirectory => (
-                "absolute dedicated backup directory (Delete resets): ".into(),
-                config.backup.directory().display().to_string(),
             ),
             Field::BackupRemote => (
                 "Git remote URL (empty: local capture only): ".into(),
@@ -217,8 +212,13 @@ fn change_log_dir(doc: &mut DocumentMut, action: &Action, default: &std::path::P
 }
 
 /// Every editable setting, by section. `plugins` are the ids that can get
-/// their own strategy.
-pub fn rows(config: &Config, plugins: &[String], candidates: Result<&[String], &str>) -> Vec<Row> {
+/// their own strategy; `problem` is the automatic backup's current failure.
+pub fn rows(
+    config: &Config,
+    plugins: &[String],
+    candidates: Result<&[String], &str>,
+    problem: Option<&str>,
+) -> Vec<Row> {
     let row = |section, label: &str, value: String, field| Row {
         section,
         label: label.to_string(),
@@ -382,12 +382,6 @@ pub fn rows(config: &Config, plugins: &[String], candidates: Result<&[String], &
         ),
         row(
             "Backup (plaintext, local only)",
-            "directory",
-            config.backup.directory().display().to_string(),
-            Field::BackupDirectory,
-        ),
-        row(
-            "Backup (plaintext, local only)",
             "remote",
             config
                 .backup
@@ -402,13 +396,15 @@ pub fn rows(config: &Config, plugins: &[String], candidates: Result<&[String], &
             config.backup.branch.clone(),
             Field::BackupBranch,
         ),
-        row(
-            "Backup (plaintext, local only)",
-            "worker errors",
-            crate::backup::error_log().display().to_string(),
-            Field::BackupStatus,
-        ),
     ]);
+    if let (true, Some(problem)) = (config.backup.enabled, problem) {
+        rows.push(row(
+            "Backup (plaintext, local only)",
+            "problem",
+            problem.to_string(),
+            Field::BackupProblem,
+        ));
+    }
     match candidates {
         Ok(candidates) => {
             let mut files: Vec<&String> = candidates.iter().chain(&config.backup.files).collect();
@@ -610,9 +606,8 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
             &mut table(&mut doc, "backup")?["enabled"],
             flag(action, config.backup.enabled),
         ),
-        Field::BackupDirectory | Field::BackupRemote | Field::BackupBranch => {
+        Field::BackupRemote | Field::BackupBranch => {
             let key = match field {
-                Field::BackupDirectory => "directory",
                 Field::BackupRemote => "remote",
                 _ => "branch",
             };
@@ -646,10 +641,9 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
         Field::BackupError => {
             bail!("file candidates could not be listed; close and reopen Settings to retry")
         }
-        Field::BackupStatus => bail!(
-            "worker errors are recorded in {}",
-            crate::backup::error_log().display()
-        ),
+        Field::BackupProblem => {
+            bail!("automatic backup retries by itself; fix the cause shown and it recovers")
+        }
         Field::KeepInstalls => put(
             &mut doc["keep_installs"],
             step(config.keep_installs as u64, action, 1, 0)?,
@@ -797,7 +791,7 @@ mod tests {
     #[test]
     fn failed_candidate_listing_surfaces_error_and_allows_revocation_only() {
         let config = Config::parse("[backup]\nfiles = ['manager/config.toml']\n").unwrap();
-        let rows = rows(&config, &[], Err("permission denied"));
+        let rows = rows(&config, &[], Err("permission denied"), None);
         assert!(rows
             .iter()
             .any(|row| row.field == Field::BackupError && row.value == "permission denied"));
@@ -813,6 +807,27 @@ mod tests {
             Action::Delete,
         );
         assert!(Config::parse(&text).unwrap().backup.files.is_empty());
+    }
+
+    #[test]
+    fn backup_problem_is_shown_only_while_backup_is_on_and_failing() {
+        let off = Config::parse("").unwrap();
+        let on = Config::parse("[backup]\nenabled = true\n").unwrap();
+        let problem = |config: &Config, problem| {
+            rows(config, &[], Ok(&[]), problem)
+                .into_iter()
+                .find(|row| row.field == Field::BackupProblem)
+                .map(|row| row.value)
+        };
+        assert_eq!(problem(&on, None), None);
+        assert_eq!(problem(&off, Some("git not found")), None);
+        assert_eq!(
+            problem(&on, Some("git not found")).as_deref(),
+            Some("git not found")
+        );
+        assert!(rows(&on, &[], Ok(&[]), None)
+            .iter()
+            .all(|row| row.label != "directory" && row.label != "worker errors"));
     }
 
     fn apply(text: &str, field: Field, action: Action) -> String {

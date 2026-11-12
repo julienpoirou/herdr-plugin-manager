@@ -162,6 +162,34 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// The most recent state file named after a snapshot-directory digest, from
+/// before the snapshot repository had a fixed location.
+fn legacy_state(state_dir: &Path) -> Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let path = entry?.path();
+        let digest_named = path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        let meta = fs::symlink_metadata(&path)?;
+        if !digest_named || !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified()?;
+        if latest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            latest = Some((modified, path));
+        }
+    }
+    Ok(latest.map(|(_, path)| path))
+}
+
 /// Resolve only a machine-local directory authority, before adding any
 /// selector-derived children. New roots inherit their nearest existing
 /// parent's physical location without requiring directories to be created.
@@ -175,7 +203,7 @@ fn trusted_root(path: &Path) -> Result<PathBuf> {
                     path.display()
                 );
             }
-            Ok(resolved)
+            Ok(without_verbatim_prefix(resolved))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match fs::symlink_metadata(&path) {
@@ -207,6 +235,19 @@ fn trusted_root(path: &Path) -> Result<PathBuf> {
         }
         Err(error) => Err(error)
             .with_context(|| format!("could not resolve configured local root {}", path.display())),
+    }
+}
+
+/// `canonicalize` returns `\\?\C:\…` on Windows, which Git reads as a
+/// remote host when such a path is passed as an argument (`git fetch`).
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(local)
+    } else {
+        path
     }
 }
 
@@ -474,30 +515,7 @@ impl Session {
             lock.lock()?;
             Some(lock)
         };
-        if config
-            .backup
-            .directory
-            .as_ref()
-            .is_some_and(|path| !path.is_absolute())
-        {
-            bail!("backup.directory must be absolute");
-        }
-        let directory = config
-            .backup
-            .directory
-            .clone()
-            .unwrap_or_else(|| home.join("backup"));
-        let directory = absolute(&directory)?;
-        if directory
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            bail!(
-                "backup directory may not contain '..': {}",
-                directory.display()
-            );
-        }
-        let directory = trusted_root(&directory)?;
+        let directory = trusted_root(&config.backup.directory())?;
         no_links(&directory)?;
         for protected in [
             trusted_root(&paths::herdr_config_dir())?,
@@ -513,19 +531,26 @@ impl Session {
                 );
             }
         }
-        if home.starts_with(&directory) {
-            bail!("backup directory must be dedicated, not the manager data directory or its ancestor");
-        }
-        let state_path = home.join("gitops").join(format!(
-            "{}.json",
-            digest(directory.to_string_lossy().as_bytes())
-        ));
+        let state_dir = home.join("gitops");
+        let state_path = state_dir.join("state.json");
         no_links(&state_path)?;
-        let state: State = match fs::read(&state_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("invalid GitOps state {}; move it aside only after resolving local snapshot changes", state_path.display()))?,
+        // The state used to be named after a digest of a configurable
+        // snapshot directory; adopt the latest such file once.
+        let legacy = if state_path.exists() {
+            None
+        } else {
+            legacy_state(&state_dir)?
+        };
+        let source = legacy.as_deref().unwrap_or(&state_path);
+        let state: State = match fs::read(source) {
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("invalid GitOps state {}; move it aside only after resolving local snapshot changes", source.display()))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(err) => return Err(err.into()),
         };
+        if let (Some(legacy), None) = (&legacy, &preview_git) {
+            fs::rename(legacy, &state_path)
+                .with_context(|| format!("could not adopt GitOps state {}", legacy.display()))?;
+        }
         for path in state
             .captured
             .keys()
@@ -1175,19 +1200,23 @@ fn push_preflight(git: Git, session: &Session, remote: &str, branch: &str) -> Re
         true,
     )?;
     let Some(head) = session.head(git) else {
-        bail!("the remote backup branch already exists, but this backup repository has no local commit. Pull first to adopt its history; no local commit was created");
+        bail!("the remote backup branch already exists, but this backup repository has no local commit. Run `herdr-pm pull` to adopt its history, then run `herdr-pm push` again; no local commit was created");
     };
-    if git
-        .run(
+    let ancestor = |older: &str, newer: &str| {
+        git.run(
             Some(session.git_directory()),
-            &["merge-base", "--is-ancestor", &reference, &head],
+            &["merge-base", "--is-ancestor", older, newer],
             false,
         )
-        .is_err()
-    {
-        bail!("the remote backup branch is ahead of or divergent from the local backup history. Pull first if it is a fast-forward; otherwise resolve the Git history manually in {}. No local commit was created", session.directory.display());
+        .is_ok()
+    };
+    if ancestor(&reference, &head) {
+        return Ok(());
     }
-    Ok(())
+    if ancestor(&head, &reference) {
+        bail!("the remote backup branch has changes this machine has not pulled yet. Run `herdr-pm pull` (it keeps your local changes unless the same item also changed remotely), then run `herdr-pm push` again. No local commit was created");
+    }
+    bail!("the remote backup branch and the local backup history have diverged; resolve the Git history manually in {}. No local commit was created", session.directory.display());
 }
 
 fn capture_generated(
@@ -1431,70 +1460,234 @@ fn load_snapshot(git: Git, directory: &Path, tree: &Tree) -> Result<Snapshot> {
     Ok(Snapshot { metadata, files })
 }
 
-fn drift(local: &Summary, baseline: Option<&Summary>, incoming: &Snapshot) -> Vec<String> {
-    let mut result = Vec::new();
-    for plugin in &incoming.metadata.plugins {
-        if local.local_only.contains_key(&plugin.id) {
-            result.push(format!("plugins.toml: incoming plugin {} collides with a local-only link; remove or explicitly take over that link before pulling", plugin.id));
+/// How one plugin or selected file is reconciled from its state at the last
+/// sync (`base`), on this machine (`local`) and in the fetched snapshot
+/// (`remote`). `None` means absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Both sides agree: nothing to do.
+    Same,
+    /// Only the remote changed it: apply the remote state, removal included.
+    TakeRemote,
+    /// Only this machine changed it: keep it; the next push publishes it.
+    KeepLocal,
+    /// Both changed it differently, or both added different versions.
+    Conflict,
+}
+
+fn decide<T: PartialEq + ?Sized>(
+    base: Option<&T>,
+    local: Option<&T>,
+    remote: Option<&T>,
+) -> Decision {
+    if local == remote {
+        Decision::Same
+    } else if local == base {
+        Decision::TakeRemote
+    } else if remote == base {
+        Decision::KeepLocal
+    } else {
+        Decision::Conflict
+    }
+}
+
+/// A plugin as reconciled. Local-only plugins (links, sources without an
+/// exact commit) carry no sync instruction, so only this machine's count.
+#[derive(PartialEq)]
+enum Installed<'a> {
+    Exact(&'a PluginState),
+    LocalOnly,
+}
+
+/// Everything a pull would do, decided before any mutation: all changes are
+/// listed for review, and any conflict stops the pull first.
+#[derive(Default)]
+struct Plan {
+    conflicts: Vec<String>,
+    /// Remote plugin states to take: install/update to the exact commit.
+    install: Vec<PluginState>,
+    /// Plugins removed remotely and unchanged here: uninstall, keep config.
+    uninstall: Vec<String>,
+    /// Selected files set to their remote state (written, or deleted).
+    files: Vec<String>,
+    lines: Vec<String>,
+}
+
+fn plugin_line(plugin: &PluginState) -> String {
+    format!(
+        "{} {} @ {} (enabled={}, auto-update={}, follows={})",
+        plugin.id,
+        util::sanitize(&plugin.version),
+        util::short_sha(&plugin.commit),
+        plugin.enabled,
+        plugin.auto_update,
+        util::sanitize(plugin.follow_ref.as_deref().unwrap_or("default branch"))
+    )
+}
+
+fn kept(base: bool, local: bool) -> &'static str {
+    match (base, local) {
+        (false, _) => "addition",
+        (true, false) => "removal",
+        (true, true) => "change",
+    }
+}
+
+/// Three-way reconciliation of this machine (`local`) with the fetched
+/// snapshot (`remote`) against the last sync. Without a baseline (first
+/// pull) everything counts as new on both sides, and a selected local file
+/// that differs from the remote conflicts instead of being kept.
+fn reconcile(local: &Summary, baseline: Option<&Summary>, remote: &Summary) -> Plan {
+    let mut plan = Plan::default();
+    let empty = Summary::default();
+    let base = baseline.unwrap_or(&empty);
+    let ids: BTreeSet<&String> = base
+        .plugins
+        .keys()
+        .chain(local.plugins.keys())
+        .chain(local.local_only.keys())
+        .chain(remote.plugins.keys())
+        .collect();
+    for id in ids {
+        let incoming = remote.plugins.get(id);
+        if incoming.is_some() && local.local_only.contains_key(id) {
+            plan.conflicts.push(format!("plugins.toml: incoming plugin {id} collides with a local-only link; remove or explicitly take over that link before pulling"));
+            continue;
+        }
+        let current = local.plugins.get(id).map(Installed::Exact).or_else(|| {
+            local
+                .local_only
+                .contains_key(id)
+                .then_some(Installed::LocalOnly)
+        });
+        let previous = base.plugins.get(id).map(Installed::Exact);
+        let theirs = incoming.map(Installed::Exact);
+        match decide(previous.as_ref(), current.as_ref(), theirs.as_ref()) {
+            Decision::Same => {
+                if let Some(plugin) = incoming {
+                    plan.lines
+                        .push(format!("  unchanged {}", plugin_line(plugin)));
+                }
+            }
+            Decision::TakeRemote => match incoming {
+                Some(plugin) => {
+                    plan.lines.push(format!(
+                        "  take remote: {} {}",
+                        if current.is_some() {
+                            "update to exact"
+                        } else {
+                            "install exact"
+                        },
+                        plugin_line(plugin)
+                    ));
+                    plan.install.push(plugin.clone());
+                }
+                None if remote.local_only.contains_key(id) => plan.lines.push(format!(
+                    "  keep plugin {id}: the remote snapshot lists it as local-only (no reproducible source to take)"
+                )),
+                None => {
+                    plan.lines.push(format!("  take remote: uninstall plugin {id} (removed in the remote snapshot; its configuration files are kept)"));
+                    plan.uninstall.push(id.clone());
+                }
+            },
+            Decision::KeepLocal => plan.lines.push(match (&current, baseline) {
+                (Some(Installed::LocalOnly), _) => format!(
+                    "  keep local-only plugin {id}: {}",
+                    util::sanitize(&local.local_only[id])
+                ),
+                (Some(Installed::Exact(_)), None) => {
+                    format!("  keep unrelated local plugin {id} (not removed)")
+                }
+                _ => format!(
+                    "  keep local {} of plugin {id} (will be pushed)",
+                    kept(previous.is_some(), current.is_some())
+                ),
+            }),
+            Decision::Conflict => plan.conflicts.push(if baseline.is_some() {
+                format!("plugins.toml: plugin {id} changed both on this machine and in the remote snapshot since the last sync")
+            } else {
+                format!(
+                    "plugins.toml: existing plugin {id} differs from remote; no previous sync baseline"
+                )
+            }),
         }
     }
-    if let Some(baseline) = baseline {
-        let ids: BTreeSet<&String> = baseline
-            .plugins
-            .keys()
-            .chain(local.plugins.keys())
-            .chain(baseline.local_only.keys())
-            .chain(local.local_only.keys())
-            .collect();
-        for id in ids {
-            if baseline.plugins.get(id) != local.plugins.get(id)
-                || baseline.local_only.get(id) != local.local_only.get(id)
-            {
-                result.push(format!(
-                    "plugins.toml: plugin {id} changed locally since the last sync"
-                ));
+    for (path, current) in &local.files {
+        let Some(incoming) = remote.files.get(path) else {
+            // An unselected remote path is not a deletion instruction.
+            plan.lines
+                .push(format!("  keep {path}: not selected in remote snapshot"));
+            continue;
+        };
+        let previous = base.files.get(path).and_then(Option::as_ref);
+        match decide(previous, current.as_ref(), incoming.as_ref()) {
+            Decision::Same => {}
+            Decision::TakeRemote => {
+                plan.lines
+                    .push(if incoming.is_some() || path == "manager/config.toml" {
+                        format!("  take remote: restore {path}")
+                    } else {
+                        format!(
+                            "  take remote: delete selected file {path} (removed in the remote snapshot)"
+                        )
+                    });
+                plan.files.push(path.clone());
+            }
+            Decision::KeepLocal if baseline.is_some() => plan.lines.push(format!(
+                "  keep local {} of {path} (will be pushed)",
+                kept(previous.is_some(), current.is_some())
+            )),
+            Decision::KeepLocal | Decision::Conflict => {
+                plan.conflicts.push(if baseline.is_some() {
+                    format!("{path}: selected configuration changed both on this machine and in the remote snapshot since the last sync")
+                } else {
+                    format!("{path}: existing local configuration differs from remote; no previous sync baseline")
+                })
             }
         }
-        for (path, value) in &local.files {
-            if let Some(previous) = baseline.files.get(path) {
-                if previous != value {
-                    result.push(format!(
-                        "{path}: selected local configuration changed since the last sync"
-                    ));
-                }
-            } else if incoming.metadata.files.contains(path)
-                && value.is_some()
-                && *value != incoming.files.get(path).map(|bytes| digest(bytes))
-            {
-                result.push(format!(
-                    "{path}: newly selected local file differs from the remote"
-                ));
-            }
+    }
+    for path in remote.files.keys() {
+        if !local.files.contains_key(path) {
+            plan.lines.push(format!(
+                "  skip {path}: not explicitly selected on this machine"
+            ));
         }
-    } else {
-        for plugin in &incoming.metadata.plugins {
-            if local
-                .plugins
-                .get(&plugin.id)
-                .is_some_and(|current| current != plugin)
-            {
-                result.push(format!("plugins.toml: existing plugin {} differs from remote; no previous sync baseline", plugin.id));
-            }
+    }
+    plan
+}
+
+/// Plugins and selected files whose local state differs between two
+/// collections, e.g. edits made while a pull was under review.
+fn local_changes(before: &Summary, after: &Summary) -> Vec<String> {
+    let mut result = Vec::new();
+    let ids: BTreeSet<&String> = before
+        .plugins
+        .keys()
+        .chain(after.plugins.keys())
+        .chain(before.local_only.keys())
+        .chain(after.local_only.keys())
+        .collect();
+    for id in ids {
+        if before.plugins.get(id) != after.plugins.get(id)
+            || before.local_only.get(id) != after.local_only.get(id)
+        {
+            result.push(format!("plugins.toml: plugin {id}"));
         }
-        for (path, current) in &local.files {
-            if incoming.metadata.files.contains(path)
-                && current.is_some()
-                && *current != incoming.files.get(path).map(|bytes| digest(bytes))
-            {
-                result.push(format!("{path}: existing local configuration differs from remote; no previous sync baseline"));
-            }
+    }
+    let paths: BTreeSet<&String> = before.files.keys().chain(after.files.keys()).collect();
+    for path in paths {
+        if before.files.get(path) != after.files.get(path) {
+            result.push(path.clone());
         }
     }
     result
 }
 
-/// Validate Git history, all remote inputs, and local drift before installing
-/// anything. No merge, force update, or remote-expanded config allowlist.
+/// Validate Git history and all remote inputs, then reconcile three ways
+/// against the last sync before installing anything: remote-only changes are
+/// taken, local-only changes kept (for the next push), and items changed on
+/// both sides stop the pull. No merge, force update, or remote-expanded
+/// config allowlist.
 pub fn pull(ctx: &Ctx) -> Result<()> {
     let remote = remote(&ctx.config)?;
     let git = operation_git(ctx);
@@ -1524,13 +1717,12 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     )?;
     let incoming_tree = tree(git, session.git_directory(), &commit)?;
     let incoming = load_snapshot(git, session.git_directory(), &incoming_tree)?;
-    let local = collect(&ctx.herdr, &ctx.config)?;
-    let local_summary = summary(&local);
+    let local_summary = summary(&collect(&ctx.herdr, &ctx.config)?);
     let baseline = session.state.baseline.as_ref();
     if baseline.is_some_and(|baseline| {
         baseline.remote != remote || baseline.branch != ctx.config.backup.branch
     }) {
-        bail!("backup remote or branch changed since the last sync; use a separate dedicated backup.directory for a different history");
+        bail!("backup remote or branch changed since the last sync. The local snapshot history in {} and its sync state {} belong to the previous remote/branch; move both aside to start over with this one", session.directory.display(), session.state_path.display());
     }
     if let Some(head) = &head {
         if git
@@ -1560,14 +1752,14 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
         "backup Git worktree/index has changes not generated by capture",
         worktree_conflicts(git, &session)?,
     )?;
-    stop_conflicts(
-        "local installation/configuration drift",
-        drift(
-            &local_summary,
-            baseline.map(|baseline| &baseline.summary),
-            &incoming,
-        ),
-    )?;
+    let plan = reconcile(
+        &local_summary,
+        baseline.map(|baseline| &baseline.summary),
+        &summary(&incoming),
+    );
+    if !plan.conflicts.is_empty() {
+        bail!("GitOps conflict: changed differently on this machine and in the remote snapshot\n  {}\nNothing was installed, removed or written. For each item, make this machine match the remote version, or restore it to its state at the last sync so the remote version is taken, then pull again. To publish your own version instead, pull that way, re-apply your change, then push. No automatic merge or overwrite is performed.", plan.conflicts.join("\n  "));
+    }
     let old_tree = match &head {
         Some(head) => tree(git, session.git_directory(), head)?,
         None => Tree::new(),
@@ -1613,22 +1805,9 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     }
     stop_conflicts("untracked backup files collide with the remote", collisions)?;
     let mut apply = BTreeMap::new();
-    let mut lines = vec![
-        format!(
-            "  branch {} at {}",
-            ctx.config.backup.branch,
-            util::short_sha(&commit)
-        ),
-        "  only this machine's explicit file selections may be applied".into(),
-    ];
-    for path in &ctx.config.backup.files {
+    for path in &plan.files {
         let current = read_file(&live_path(path)?)?;
         let incoming_bytes = incoming.files.get(path);
-        // An unselected remote path is not a deletion instruction.
-        if !incoming.metadata.files.contains(path) {
-            lines.push(format!("  keep {path}: not selected in remote snapshot"));
-            continue;
-        }
         let desired = if path == "manager/config.toml" {
             Some(restored_manager(
                 incoming_bytes.map(Vec::as_slice),
@@ -1638,89 +1817,48 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
             incoming_bytes.cloned()
         };
         if current != desired {
-            lines.push(format!(
-                "  {} {path}",
-                if desired.is_some() {
-                    "restore"
-                } else {
-                    "remove selected file"
-                }
-            ));
             apply.insert(path.clone(), (current, desired));
         }
     }
-    for path in &incoming.metadata.files {
-        if !ctx.config.backup.files.contains(path) {
-            lines.push(format!(
-                "  skip {path}: not explicitly selected on this machine"
-            ));
-        }
-    }
-    for plugin in &local.metadata.plugins {
-        if !incoming
-            .metadata
-            .plugins
-            .iter()
-            .any(|incoming| incoming.id == plugin.id)
-        {
-            lines.push(format!(
-                "  keep unrelated local plugin {} (not removed)",
-                plugin.id
-            ));
-        }
-    }
-    for plugin in &local.metadata.local_only {
-        lines.push(format!(
-            "  keep local-only plugin {}: {}",
-            plugin.id,
-            util::sanitize(&plugin.reason)
-        ));
+    let mut lines = vec![
+        format!(
+            "  branch {} at {}",
+            ctx.config.backup.branch,
+            util::short_sha(&commit)
+        ),
+        "  only this machine's explicit file selections may be applied".into(),
+    ];
+    lines.extend(plan.lines.iter().cloned());
+    if plan.install.is_empty() && plan.uninstall.is_empty() && apply.is_empty() {
+        lines.push("  nothing to take from the remote snapshot".into());
     }
     unsupported_lines(&incoming, &mut lines);
     // All manifests are reviewed up front, not only after preceding plugins
     // have already changed. install_git retains its own authoritative review.
-    for plugin in &incoming.metadata.plugins {
-        lines.push(format!(
-            "  {} {} {} @ {} (enabled={}, auto-update={}, follows={})",
-            if local_summary.plugins.get(&plugin.id) == Some(plugin) {
-                "keep"
-            } else {
-                "install exact"
-            },
-            plugin.id,
-            util::sanitize(&plugin.version),
-            util::short_sha(&plugin.commit),
-            plugin.enabled,
-            plugin.auto_update,
-            util::sanitize(plugin.follow_ref.as_deref().unwrap_or("default branch"))
-        ));
-        if local_summary.plugins.get(&plugin.id) != Some(plugin) {
-            ctx.report
-                .step(&format!("validating exact source for {}", plugin.id));
-            let mirror = review_mirror(git, &session, &plugin.url)?;
-            let resolved = git.resolve(&mirror, Some(&plugin.commit))?;
-            if resolved != plugin.commit {
-                bail!("{} did not resolve to its recorded exact commit", plugin.id);
-            }
-            let manifest_path = match &plugin.subdir {
-                Some(subdir) => format!("{subdir}/{}", manifest::FILE_NAME),
-                None => manifest::FILE_NAME.into(),
-            };
-            let text = git
-                .show_file(&mirror, &resolved, &manifest_path)?
-                .ok_or_else(|| {
-                    anyhow!("{} has no {manifest_path} at {}", plugin.id, plugin.commit)
-                })?;
-            let manifest = Manifest::parse(&text)?;
-            manifest.validate(ctx.herdr.version().ok().as_ref())?;
-            if manifest.id.trim() != plugin.id || manifest.version != plugin.version {
-                bail!(
-                    "{} exact commit manifest id/version differs from plugins.toml",
-                    plugin.id
-                );
-            }
-            lines.extend(manifest.preview_lines());
+    for plugin in &plan.install {
+        ctx.report
+            .step(&format!("validating exact source for {}", plugin.id));
+        let mirror = review_mirror(git, &session, &plugin.url)?;
+        let resolved = git.resolve(&mirror, Some(&plugin.commit))?;
+        if resolved != plugin.commit {
+            bail!("{} did not resolve to its recorded exact commit", plugin.id);
         }
+        let manifest_path = match &plugin.subdir {
+            Some(subdir) => format!("{subdir}/{}", manifest::FILE_NAME),
+            None => manifest::FILE_NAME.into(),
+        };
+        let text = git
+            .show_file(&mirror, &resolved, &manifest_path)?
+            .ok_or_else(|| anyhow!("{} has no {manifest_path} at {}", plugin.id, plugin.commit))?;
+        let manifest = Manifest::parse(&text)?;
+        manifest.validate(ctx.herdr.version().ok().as_ref())?;
+        if manifest.id.trim() != plugin.id || manifest.version != plugin.version {
+            bail!(
+                "{} exact commit manifest id/version differs from plugins.toml",
+                plugin.id
+            );
+        }
+        lines.extend(manifest.preview_lines());
     }
     if !approval(
         ctx,
@@ -1735,58 +1873,62 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     // first install, while the watcher remains excluded by our lock.
     stop_conflicts(
         "local files/plugins changed during review",
-        drift(
-            &summary(&collect(&ctx.herdr, &ctx.config)?),
-            Some(&local_summary),
-            &incoming,
-        ),
+        local_changes(&local_summary, &summary(&collect(&ctx.herdr, &ctx.config)?)),
     )?;
     check_repo_unchanged(&session.directory, &repo_before)?;
-    for plugin in &incoming.metadata.plugins {
-        if local_summary.plugins.get(&plugin.id) != Some(plugin) {
-            let applied = ops::install_git(
-                ctx,
-                GitRequest {
-                    url: plugin.url.clone(),
-                    subdir: plugin.subdir.clone(),
-                    checkout_ref: Some(plugin.commit.clone()),
-                    follow_ref: Some(plugin.follow_ref.clone()),
-                    mode: Mode::Sync,
-                    enabled: Some(plugin.enabled),
-                    replace: true,
-                    expect_id: Some(plugin.id.clone()),
-                },
-            )?;
-            if !applied {
-                // A declined per-plugin review must not mark the sync successful.
-                let current = ops::rows(&ctx.herdr)?
-                    .into_iter()
-                    .find(|row| row.plugin.plugin_id == plugin.id);
-                if current
-                    .as_ref()
-                    .is_none_or(|row| row.commit() != Some(plugin.commit.as_str()))
-                {
-                    bail!("sync stopped: installation of {} was declined; previous successful installations are retained, and Git/configuration were not advanced", plugin.id);
-                }
-            }
+    for plugin in &plan.install {
+        let applied = ops::install_git(
+            ctx,
+            GitRequest {
+                url: plugin.url.clone(),
+                subdir: plugin.subdir.clone(),
+                checkout_ref: Some(plugin.commit.clone()),
+                follow_ref: Some(plugin.follow_ref.clone()),
+                mode: Mode::Sync,
+                enabled: Some(plugin.enabled),
+                replace: true,
+                expect_id: Some(plugin.id.clone()),
+            },
+        )?;
+        if !applied {
+            // A declined per-plugin review must not mark the sync successful.
             let current = ops::rows(&ctx.herdr)?
                 .into_iter()
-                .find(|row| row.plugin.plugin_id == plugin.id)
-                .ok_or_else(|| anyhow!("{} missing after install", plugin.id))?;
-            if current.plugin.enabled != plugin.enabled {
-                ops::set_enabled(ctx, &plugin.id, plugin.enabled)?;
-            }
-            ops::set_auto_update(ctx, &plugin.id, plugin.auto_update)?;
-            let installed = collect(&ctx.herdr, &ctx.config)?;
-            if installed
-                .metadata
-                .plugins
-                .iter()
-                .find(|entry| entry.id == plugin.id)
-                != Some(plugin)
+                .find(|row| row.plugin.plugin_id == plugin.id);
+            if current
+                .as_ref()
+                .is_none_or(|row| row.commit() != Some(plugin.commit.as_str()))
             {
-                bail!("sync stopped: {} does not match its reviewed exact source/version/ref/settings; Git/configuration were not advanced", plugin.id);
+                bail!("sync stopped: installation of {} was declined; previous successful installations are retained, and Git/configuration were not advanced", plugin.id);
             }
+        }
+        let current = ops::rows(&ctx.herdr)?
+            .into_iter()
+            .find(|row| row.plugin.plugin_id == plugin.id)
+            .ok_or_else(|| anyhow!("{} missing after install", plugin.id))?;
+        if current.plugin.enabled != plugin.enabled {
+            ops::set_enabled(ctx, &plugin.id, plugin.enabled)?;
+        }
+        ops::set_auto_update(ctx, &plugin.id, plugin.auto_update)?;
+        let installed = collect(&ctx.herdr, &ctx.config)?;
+        if installed
+            .metadata
+            .plugins
+            .iter()
+            .find(|entry| entry.id == plugin.id)
+            != Some(plugin)
+        {
+            bail!("sync stopped: {} does not match its reviewed exact source/version/ref/settings; Git/configuration were not advanced", plugin.id);
+        }
+    }
+    for id in &plan.uninstall {
+        // Not a purge: the plugin's configuration files stay on disk.
+        ops::uninstall(ctx, id, false)?;
+        if ops::rows(&ctx.herdr)?
+            .iter()
+            .any(|row| row.plugin.plugin_id == *id)
+        {
+            bail!("sync stopped: uninstall of {id} was declined; previous successful changes are retained, and Git/configuration were not advanced");
         }
     }
     // Check again after builds: selected files may have changed while a build ran.
@@ -1882,14 +2024,18 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     }
     session.state.preserved_files = incoming.metadata.files.iter().cloned().collect();
     session.state.removed.clear();
-    let actual = collect(&ctx.herdr, &refreshed_config)?;
+    // The baseline is what the remote holds now, so changes kept locally
+    // still count as local changes on the next pull.
     session.state.baseline = Some(Baseline {
         remote: remote.into(),
         branch: ctx.config.backup.branch.clone(),
         commit,
-        summary: summary(&actual),
+        summary: summary(&incoming),
     });
     session.save()?;
+    // Re-capture so local changes kept by this pull become capture-generated
+    // snapshot changes, which the next push publishes as a fast-forward.
+    session.capture(&collect(&ctx.herdr, &refreshed_config)?)?;
     ctx.report.line("Snapshot applied. Unrelated plugins were kept; backup settings and log_dir remained machine-local.");
     ctx.report.line("CLI/skill links were refreshed for new invocations. Existing plugin processes, open shell PATH values and already-loaded agent contexts are not restarted or rewritten.");
     Ok(())
@@ -2105,53 +2251,248 @@ mod tests {
         assert!(validate_plugin(&value).is_err());
     }
 
+    fn plugins(values: &[PluginState]) -> BTreeMap<String, PluginState> {
+        values
+            .iter()
+            .map(|value| (value.id.clone(), value.clone()))
+            .collect()
+    }
+
+    fn files(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        entries
+            .iter()
+            .map(|(path, text)| ((*path).to_owned(), text.map(|text| digest(text.as_bytes()))))
+            .collect()
+    }
+
     #[test]
-    fn selected_local_edits_and_plugin_drift_stop_pull() {
+    fn three_way_decision_keeps_local_takes_remote_or_conflicts() {
+        use Decision::*;
+        let (a, b, c) = (&1, &2, &3);
+        // Only the remote changed it: take it, removals included.
+        assert_eq!(decide(Some(a), Some(a), Some(b)), TakeRemote);
+        assert_eq!(decide(Some(a), Some(a), None), TakeRemote);
+        assert_eq!(decide(None, None, Some(b)), TakeRemote);
+        // Only this machine changed it: keep it for the next push.
+        assert_eq!(decide(Some(a), Some(b), Some(a)), KeepLocal);
+        assert_eq!(decide(Some(a), None, Some(a)), KeepLocal);
+        assert_eq!(decide(None, Some(b), None), KeepLocal);
+        // Both sides agree, whatever the baseline was.
+        assert_eq!(decide(Some(a), Some(a), Some(a)), Same);
+        assert_eq!(decide(Some(a), Some(b), Some(b)), Same);
+        assert_eq!(decide(None, Some(b), Some(b)), Same);
+        // Changed differently on both sides, or added differently on both.
+        assert_eq!(decide(Some(a), Some(b), Some(c)), Conflict);
+        assert_eq!(decide(Some(a), Some(b), None), Conflict);
+        assert_eq!(decide(None, Some(b), Some(c)), Conflict);
+    }
+
+    #[test]
+    fn pull_keeps_unpushed_local_file_while_taking_remote_change() {
+        let custom = "plugins/fixture.sync/custom.toml";
         let value = plugin();
-        let incoming = Snapshot {
-            metadata: Metadata {
-                schema: SCHEMA,
-                files: vec!["herdr/config.toml".into()],
-                plugins: vec![value.clone()],
-                local_only: vec![],
-            },
-            files: BTreeMap::from([("herdr/config.toml".into(), b"theme = 'remote'\n".to_vec())]),
+        let baseline = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[
+                ("herdr/config.toml", Some("theme = 'old'\n")),
+                (custom, Some("color = 'old'\n")),
+            ]),
+            ..Summary::default()
         };
-        let baseline = summary(&incoming);
-        assert!(drift(&baseline, Some(&baseline), &incoming).is_empty());
+        let mut local = baseline.clone();
+        local
+            .files
+            .insert(custom.into(), Some(digest(b"color = 'local'\n")));
+        let mut remote = baseline.clone();
+        remote.files.insert(
+            "herdr/config.toml".into(),
+            Some(digest(b"theme = 'remote'\n")),
+        );
+        let plan = reconcile(&local, Some(&baseline), &remote);
+        assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+        assert_eq!(plan.files, vec!["herdr/config.toml".to_owned()]);
+        assert!(plan.install.is_empty() && plan.uninstall.is_empty());
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("keep local change of") && line.contains(custom)));
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("take remote") && line.contains("herdr/config.toml")));
+
+        // A plugin changed only remotely is taken; one changed only locally is kept.
+        let mut remote_plugin = value.clone();
+        remote_plugin.commit = "b".repeat(40);
+        remote.plugins = plugins(&[remote_plugin.clone()]);
+        assert_eq!(
+            reconcile(&local, Some(&baseline), &remote).install,
+            vec![remote_plugin]
+        );
+        let mut local_plugin = value.clone();
+        local_plugin.enabled = false;
+        local.plugins = plugins(&[local_plugin]);
+        remote.plugins = baseline.plugins.clone();
+        let plan = reconcile(&local, Some(&baseline), &remote);
+        assert!(plan.conflicts.is_empty() && plan.install.is_empty());
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("keep local change of plugin test.plugin")));
+    }
+
+    #[test]
+    fn same_item_changed_differently_on_both_sides_conflicts() {
+        let value = plugin();
+        let baseline = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[("herdr/config.toml", Some("theme = 'old'\n"))]),
+            ..Summary::default()
+        };
         let mut local = baseline.clone();
         local.files.insert(
             "herdr/config.toml".into(),
             Some(digest(b"theme = 'local'\n")),
         );
         local.plugins.get_mut(&value.id).unwrap().auto_update = true;
-        let conflicts = drift(&local, Some(&baseline), &incoming);
-        assert_eq!(conflicts.len(), 2);
-        assert!(conflicts
+        let mut remote = baseline.clone();
+        remote.files.insert(
+            "herdr/config.toml".into(),
+            Some(digest(b"theme = 'remote'\n")),
+        );
+        remote.plugins.get_mut(&value.id).unwrap().enabled = false;
+        let plan = reconcile(&local, Some(&baseline), &remote);
+        assert_eq!(plan.conflicts.len(), 2);
+        assert!(plan
+            .conflicts
             .iter()
-            .any(|path| path.contains("herdr/config.toml")));
-        assert!(conflicts.iter().any(|path| path.contains("test.plugin")));
+            .any(|conflict| conflict.contains("herdr/config.toml")));
+        assert!(plan
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("test.plugin")));
+        // The same change made on both sides is no conflict.
+        let plan = reconcile(&local, Some(&baseline), &local);
+        assert!(plan.conflicts.is_empty() && plan.files.is_empty() && plan.install.is_empty());
+    }
+
+    #[test]
+    fn remote_removals_are_proposed_for_review() {
+        let value = plugin();
+        let path = "plugins/test.plugin/settings";
+        let baseline = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[(path, Some("a = 1\n"))]),
+            ..Summary::default()
+        };
+        let remote = Summary {
+            files: files(&[(path, None)]),
+            ..Summary::default()
+        };
+        let plan = reconcile(&baseline, Some(&baseline), &remote);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.uninstall, vec![value.id.clone()]);
+        assert_eq!(plan.files, vec![path.to_owned()]);
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("uninstall plugin test.plugin")));
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("delete selected file") && line.contains(path)));
+        // Removed remotely but changed here: conflict, nothing removed.
+        let mut local = baseline.clone();
+        local.plugins.get_mut(&value.id).unwrap().auto_update = true;
+        local.files.insert(path.into(), Some(digest(b"a = 2\n")));
+        let plan = reconcile(&local, Some(&baseline), &remote);
+        assert_eq!(plan.conflicts.len(), 2);
+        // A remote local-only entry is not an instruction to uninstall.
+        let remote = Summary {
+            local_only: BTreeMap::from([(value.id.clone(), "local developer link".into())]),
+            ..remote
+        };
+        assert!(reconcile(&baseline, Some(&baseline), &remote)
+            .uninstall
+            .is_empty());
+        // A path no longer selected remotely is not a deletion instruction.
+        let plan = reconcile(&baseline, Some(&baseline), &Summary::default());
+        assert!(plan.files.is_empty());
+    }
+
+    #[test]
+    fn items_added_on_both_sides_conflict_only_when_different() {
+        let value = plugin();
+        let path = "herdr/config.toml";
+        let baseline = Summary::default();
+        let added = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[(path, Some("theme = 'same'\n"))]),
+            ..Summary::default()
+        };
+        let plan = reconcile(&added, Some(&baseline), &added);
+        assert!(plan.conflicts.is_empty() && plan.install.is_empty() && plan.files.is_empty());
+        let mut other = added.clone();
+        other.plugins.get_mut(&value.id).unwrap().commit = "b".repeat(40);
+        other
+            .files
+            .insert(path.into(), Some(digest(b"theme = 'other'\n")));
+        assert_eq!(
+            reconcile(&added, Some(&baseline), &other).conflicts.len(),
+            2
+        );
+        // Added on one side only: kept locally, or taken from the remote.
+        let remote = Summary {
+            files: files(&[(path, None)]),
+            ..Summary::default()
+        };
+        let plan = reconcile(&added, Some(&baseline), &remote);
+        assert!(plan.conflicts.is_empty() && plan.install.is_empty() && plan.files.is_empty());
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("keep local addition of plugin test.plugin")));
+        let local = Summary {
+            files: files(&[(path, None)]),
+            ..Summary::default()
+        };
+        let plan = reconcile(&local, Some(&baseline), &added);
+        assert_eq!(plan.install, vec![value]);
+        assert_eq!(plan.files, vec![path.to_owned()]);
+    }
+
+    #[test]
+    fn edits_during_review_are_detected() {
+        let value = plugin();
+        let before = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[("herdr/config.toml", Some("theme = 'a'\n"))]),
+            ..Summary::default()
+        };
+        assert!(local_changes(&before, &before).is_empty());
+        let mut after = before.clone();
+        after
+            .files
+            .insert("herdr/config.toml".into(), Some(digest(b"theme = 'b'\n")));
+        after.plugins.get_mut(&value.id).unwrap().auto_update = true;
+        assert_eq!(local_changes(&before, &after).len(), 2);
     }
 
     #[test]
     fn local_only_collision_stops_pull_even_with_unchanged_baseline() {
         let value = plugin();
-        let incoming = Snapshot {
-            metadata: Metadata {
-                schema: SCHEMA,
-                files: vec![],
-                plugins: vec![value.clone()],
-                local_only: vec![],
-            },
-            files: BTreeMap::new(),
+        let remote = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            ..Summary::default()
         };
         let local = Summary {
             local_only: BTreeMap::from([(value.id.clone(), "local developer link".into())]),
             ..Summary::default()
         };
-        for baseline in [None, Some(&local)] {
-            let conflicts = drift(&local, baseline, &incoming);
-            assert!(conflicts.iter().any(
+        for baseline in [None, Some(&local), Some(&remote)] {
+            let plan = reconcile(&local, baseline, &remote);
+            assert!(plan.install.is_empty());
+            assert!(plan.conflicts.iter().any(
                 |conflict| conflict.contains("local-only link") && conflict.contains(&value.id)
             ));
         }
@@ -2357,12 +2698,14 @@ mod tests {
             },
             files: BTreeMap::from([("manager/config.toml".into(), b"icons = false\n".to_vec())]),
         };
-        assert!(drift(&summary(&local), None, &incoming).is_empty());
+        let plan = reconcile(&summary(&local), None, &summary(&incoming));
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.files, vec!["manager/config.toml".to_owned()]);
         let mut local = local;
         local
             .files
             .insert("herdr/config.toml".into(), b"theme = 'local'\n".to_vec());
-        let conflicts = drift(&summary(&local), None, &incoming);
+        let conflicts = reconcile(&summary(&local), None, &summary(&incoming)).conflicts;
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].contains("herdr/config.toml"));
     }

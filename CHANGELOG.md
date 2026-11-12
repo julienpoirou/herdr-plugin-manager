@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.18.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.17.1...v0.18.0) (2026-11-12)
+
+
+### Features
+
+* **gitops:** Choose per machine whether the plugin list is backed up ([#58](https://github.com/julienpoirou/herdr-plugin-manager/issues/58)) ([d50800d](https://github.com/julienpoirou/herdr-plugin-manager/commit/d50800daaefc456f490e32a652b7dc273ef1fe38))
+
+
+### Bug Fixes
+
+* **tui:** Settings, the version picker and the leftovers list only scroll when the selection leaves the window, so a click on a visible line no longer makes the list jump. ([d50800d](https://github.com/julienpoirou/herdr-plugin-manager/commit/d50800daaefc456f490e32a652b7dc273ef1fe38))
+
 ## [0.17.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.17.0...v0.17.1) (2026-11-12)
 
 

@@ -212,12 +212,18 @@ action.
 | Area | Keys |
 |---|---|
 | Navigation | arrows / `j` / `k`, `/` filter |
-| Mouse | wheel moves the selection, click selects a row, click a tab to switch views |
+| Mouse | every key shown in a footer or dialog is also a button; `×` (top left) closes, `←` goes back; click a row to select it, again to act; wheel scrolls; click a tab to switch views |
 | Updates | `u` selected, `U` all, each with its own review; `A` auto-update on/off (marked `⟳`) |
 | State | `e` enable/disable, `x` remove (`u`) or delete completely (`d`), `X` pick removed plugins whose leftovers to delete |
 | Versions | `p` version picker (pinned plugins show `📌`), `s` switch ref, `z` rollback, `t` take a GitHub plugin over from Herdr |
 | Discovery | `m` or Tab, `/` search, `s` sort, `f` source, arrows for pages |
 | Other | `o` open homepage, `C` settings, `E` config.toml in your editor, `r` refresh, `?` help (scrolls), `q` quit |
+
+Keyboard and mouse work together: a click sends exactly the key it shows, so
+both run the same code. The `?` help lists every key; its lines are
+clickable too, which reaches the keys the footer has no room for. Inside
+Herdr with `ui.mouse_capture = false` (keyboard-only), the popup does not
+capture the mouse and shows no `×`, `←` or buttons.
 
 Install, update (one or all), removal, rollback, pinning another version and
 switching run inside the popup. The trust preview appears as a dialog (`y`

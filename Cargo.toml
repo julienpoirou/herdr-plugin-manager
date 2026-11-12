@@ -1,6 +1,6 @@
 [package]
 name = "herdr-plugin-manager"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Herdr Plugin Manager: reviewed installs from any Git transport, rollback, and multi-forge plugin discovery."

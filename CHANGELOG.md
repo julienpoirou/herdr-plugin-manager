@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.16.1...v0.17.0) (2026-11-12)
+
+
+### Features
+
+* **tui:** Every shortcut is also clickable, with close and back buttons ([#55](https://github.com/julienpoirou/herdr-plugin-manager/issues/55)) ([e051881](https://github.com/julienpoirou/herdr-plugin-manager/commit/e051881f5cb7505b32a8a4736ef6aa533643c7d9))
+
+
+### Bug Fixes
+
+* **gitops:** Pull and push from any machine with per-item three-way reconciliation ([#53](https://github.com/julienpoirou/herdr-plugin-manager/issues/53)) ([d943248](https://github.com/julienpoirou/herdr-plugin-manager/commit/d943248507cef1a9f05896d5c26170aec7d1d602))
+
 ## [0.16.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.16.0...v0.16.1) (2026-11-11)
 
 

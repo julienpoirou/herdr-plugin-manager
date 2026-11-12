@@ -51,13 +51,13 @@ exact plugin/configuration changes, stopping on local conflicts. Both support
 `--dry-run --yes` for previews and require approval before applying with `--yes`.
 There are no export/import commands.
 
-Set up `[backup]` through Settings (`C`): local directory, remote, branch, and
+Set up `[backup]` through Settings (`C`): remote, branch, and
 exact plaintext file approvals (empty by default). Its enabled worker captures
 local changes every two seconds; it never commits or pushes automatically.
 `plugins.toml` records source/commit/ref/version/pin/enabled/auto-update.
 Only locally approved config files are applied. `[backup]` and `log_dir` stay
 machine-local; local-only code, binaries, caches, logs and sessions are not backed up.
-Errors appear in the worker log path shown in Settings.
+A failing worker shows a `problem` line in the Backup section of Settings.
 
 
 ## Change (preview with `--dry-run --yes` first)

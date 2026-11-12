@@ -26,7 +26,7 @@ struct Generation {
     length: u64,
 }
 
-pub fn error_log() -> PathBuf {
+fn error_log() -> PathBuf {
     paths::pm_home().join("backup-watch.log")
 }
 
@@ -117,8 +117,12 @@ fn wait_stopped(lock: &File) -> Result<()> {
 /// immediately when enabled; never commits, contacts a remote, or kills a PID.
 pub fn refresh(herdr: &Herdr, config: &Config) -> Result<()> {
     let result = refresh_inner(herdr, config);
-    if let Err(err) = &result {
-        let _ = record_error(&format!("backup refresh failed: {err:#}"));
+    match &result {
+        Err(err) => {
+            let _ = record_error(&format!("backup refresh failed: {err:#}"));
+        }
+        // Off, or on with a successful first snapshot: nothing is failing.
+        Ok(()) => clear_problem(),
     }
     result
 }
@@ -314,6 +318,23 @@ fn refresh_inner(herdr: &Herdr, config: &Config) -> Result<()> {
     }
 }
 
+fn problem_path() -> PathBuf {
+    paths::pm_home().join("backup-watch.problem")
+}
+
+/// What currently keeps automatic backup from working, if anything. The
+/// full history stays in `backup-watch.log`.
+pub fn problem() -> Option<String> {
+    std::fs::read_to_string(problem_path())
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn clear_problem() {
+    let _ = std::fs::remove_file(problem_path());
+}
+
 fn record_error(message: &str) -> Result<()> {
     let mut log = OpenOptions::new()
         .create(true)
@@ -324,6 +345,7 @@ fn record_error(message: &str) -> Result<()> {
         "{} {message}",
         crate::util::format_iso8601(crate::util::now_unix())
     )?;
+    std::fs::write(problem_path(), message)?;
     Ok(())
 }
 
@@ -385,6 +407,7 @@ fn watch_inner() -> Result<()> {
                 if !last_error.is_empty() {
                     record_error("backup capture recovered")?;
                     last_error.clear();
+                    clear_problem();
                 }
             }
             Err(err) => {

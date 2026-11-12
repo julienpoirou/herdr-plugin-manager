@@ -285,7 +285,6 @@ impl AutoUpdate {
 #[serde(default, deny_unknown_fields)]
 pub struct Backup {
     pub enabled: bool,
-    pub directory: Option<PathBuf>,
     pub remote: Option<String>,
     pub branch: String,
     pub files: Vec<String>,
@@ -295,7 +294,6 @@ impl Default for Backup {
     fn default() -> Self {
         Self {
             enabled: false,
-            directory: None,
             remote: None,
             branch: "main".to_string(),
             files: Vec::new(),
@@ -304,32 +302,12 @@ impl Default for Backup {
 }
 
 impl Backup {
+    /// The local snapshot repository: an internal detail of the manager.
     pub fn directory(&self) -> PathBuf {
-        self.directory
-            .clone()
-            .unwrap_or_else(|| paths::pm_home().join("backup"))
+        paths::pm_home().join("backup")
     }
 
     fn check(&self) -> Result<()> {
-        if let Some(path) = &self.directory {
-            if !path.is_absolute() {
-                bail!(
-                    "backup.directory must be an absolute directory: {}",
-                    path.display()
-                );
-            }
-            match path.metadata() {
-                Ok(metadata) if !metadata.is_dir() => {
-                    bail!("backup.directory is not a directory: {}", path.display());
-                }
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(err).with_context(|| {
-                        format!("could not inspect backup.directory {}", path.display())
-                    });
-                }
-                _ => {}
-            }
-        }
         if let Some(remote) = &self.remote {
             crate::git::validate_remote(remote).context("invalid backup.remote")?;
         }
@@ -552,23 +530,32 @@ impl Config {
         Ok(config)
     }
 
-    /// One-time persisted-key migration, preserving the value and its comments.
-    /// Parsing itself deliberately accepts only the current schema.
+    /// One-time persisted-key migrations, preserving values and comments:
+    /// `logos` became `icons`, and `backup.directory` is no longer a setting
+    /// (the snapshot repository always lives in the manager's data
+    /// directory). Parsing itself deliberately accepts only the current schema.
     pub fn migrate_text(text: &str) -> Result<Option<String>> {
         let mut doc: toml_edit::DocumentMut = text.parse()?;
-        if !doc.contains_key("logos") {
+        let mut changed = false;
+        if doc.contains_key("logos") {
+            if doc.contains_key("icons") {
+                bail!(
+                    "config contains both logos and icons; remove logos after choosing the icons value"
+                );
+            }
+            let (old_key, item) = doc.as_table_mut().remove_entry("logos").unwrap();
+            let mut key = toml_edit::Key::new("icons");
+            *key.leaf_decor_mut() = old_key.leaf_decor().clone();
+            *key.dotted_decor_mut() = old_key.dotted_decor().clone();
+            doc.as_table_mut().insert_formatted(&key, item);
+            changed = true;
+        }
+        if let Some(backup) = doc.get_mut("backup").and_then(|b| b.as_table_like_mut()) {
+            changed |= backup.remove("directory").is_some();
+        }
+        if !changed {
             return Ok(None);
         }
-        if doc.contains_key("icons") {
-            bail!(
-                "config contains both logos and icons; remove logos after choosing the icons value"
-            );
-        }
-        let (old_key, item) = doc.as_table_mut().remove_entry("logos").unwrap();
-        let mut key = toml_edit::Key::new("icons");
-        *key.leaf_decor_mut() = old_key.leaf_decor().clone();
-        *key.dotted_decor_mut() = old_key.dotted_decor().clone();
-        doc.as_table_mut().insert_formatted(&key, item);
         let updated = doc.to_string();
         Self::parse(&updated)?;
         Ok(Some(updated))
@@ -730,7 +717,17 @@ mod tests {
             "[backup]\nfiles = ['manager/config.toml', 'manager/config.toml']\n"
         )
         .is_err());
-        assert!(Config::parse("[backup]\ndirectory = 'relative'\n").is_err());
+        let legacy = "[backup]\nenabled = true # keep\ndirectory = '/old/snapshots'\nremote = 'https://git.example/herdr.git'\n";
+        assert!(
+            Config::parse(legacy).is_err(),
+            "directory is no longer a setting"
+        );
+        let migrated = Config::migrate_text(legacy).unwrap().unwrap();
+        assert!(!migrated.contains("directory"));
+        assert!(migrated.contains("enabled = true # keep"));
+        let config = Config::parse(&migrated).unwrap();
+        assert!(config.backup.enabled);
+        assert_eq!(config.backup.directory(), paths::pm_home().join("backup"));
         assert!(Config::parse("[backup]\nremote = 'ext::unsafe'\n").is_err());
         assert!(Config::parse("[backup]\nbranch = ''\n").is_err());
     }

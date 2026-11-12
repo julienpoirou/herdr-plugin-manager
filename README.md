@@ -451,7 +451,6 @@ editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
 enabled = false        # opt-in continuous LOCAL snapshots; no automatic push
 branch = "main"
 files = []             # exact plaintext approvals, selected in Settings
-# directory = "/absolute/dedicated/backup" # omitted: manager state/backup
 # remote = "ssh://git@git.example/my-herdr.git"
 
 [auto_update]
@@ -524,11 +523,12 @@ by GHES versions supported by this configuration.
 
 ## GitOps: the same setup on every machine
 
-In Settings (`C`), configure **Backup**: a dedicated local directory, Git
-remote, branch, and the exact configuration files you approve. Enablement
-asks for confirmation: files are **plaintext** and an independent local
-worker will observe changes every two seconds. The approval list starts empty.
-Selecting a directory or remote does not grant access to additional files.
+In Settings (`C`), configure **Backup**: the Git remote, the branch, and the
+exact configuration files you approve. Enablement asks for confirmation: files
+are **plaintext** and an independent local worker will observe changes every
+two seconds. The approval list starts empty. The local snapshot repository is
+kept by the manager in its data directory (`backup/`); setting a remote does
+not grant access to additional files.
 
 ```sh
 herdr-pm push                  # review the diff, commit, then push
@@ -559,10 +559,20 @@ it is never silently presented as a portable code backup.
 The worker updates only the local snapshot. **It never commits or contacts a
 remote.** Push shows a diff, stages only snapshot-owned paths, commits using
 your Git identity when needed, and performs a normal fast-forward push.
-No automatic merge, reset, or force-push. Pull refuses divergent Git history,
-manual/staged snapshot edits, changed local plugin state, or conflicting
-selected configuration. Resolve the reported paths/history explicitly before
-retrying; unrelated plugins and local links are not silently removed.
+No automatic merge, reset, or force-push.
+
+Any machine can push and pull. Pull compares each plugin and each selected
+file with the last sync: changes made only on the remote are applied
+(including removals: an uninstalled plugin is uninstalled here too, keeping
+its configuration files, after the review), changes made only on this
+machine are kept and published by the next push, and only an item changed
+differently on both sides stops the pull, before anything is applied. When
+push says the remote has changes this machine has not pulled, run
+`herdr-pm pull` then `herdr-pm push` again. Pull still refuses divergent Git
+history and manual or staged edits in the local snapshot repository. On the
+very first pull, a selected local file or an installed plugin that differs
+from the remote is a conflict: move the file aside or align the plugin, then
+pull again. Plugins the remote never knew about are kept.
 
 Different machines may approve different files. Unselected remote
 configuration remains in the snapshot but is not applied to live files.
@@ -590,10 +600,11 @@ performed: that experimental mechanism is for replacing Herdr itself, not
 synchronizing configuration.
 
 The worker starts when Backup is enabled or the manager next runs, replaces
-itself after manager updates, and stops cooperatively when disabled. Errors
-and recovery are recorded in `backup-watch.log` in the manager state directory
-(also shown in Settings). Backup does not include terminal sessions, running
-processes or terminal history.
+itself after manager updates, and stops cooperatively when disabled. When it
+fails (Git missing, unreadable file…), Settings shows a `problem` line in the
+Backup section until it recovers by itself; the history is kept in
+`backup-watch.log` in the manager's data directory. Backup does not include
+terminal sessions, running processes or terminal history.
 
 ## A marketplace without a forge API
 

@@ -92,7 +92,6 @@ enum Confirm {
         plan: Vec<String>,
     },
     BackupEnabled {
-        directory: String,
         files: usize,
     },
 }
@@ -1002,6 +1001,9 @@ struct SettingsDialog {
     sel: usize,
     error: Option<String>,
     candidates: Result<Vec<String>, String>,
+    /// Automatic backup's current failure, read when the dialog opens and
+    /// after each change.
+    problem: Option<String>,
 }
 
 fn settings_rows(app: &App) -> Vec<settings::Row> {
@@ -1022,7 +1024,8 @@ fn settings_rows(app: &App) -> Vec<settings::Row> {
                 .map_err(String::as_str)
         })
         .unwrap_or(Ok(&[]));
-    settings::rows(&app.ctx.config, &plugins, candidates)
+    let problem = app.settings.as_ref().and_then(|d| d.problem.as_deref());
+    settings::rows(&app.ctx.config, &plugins, candidates, problem)
 }
 
 /// Applies one change to `config.toml`, or shows why it was refused.
@@ -1070,6 +1073,7 @@ fn apply_setting(app: &mut App, field: &settings::Field, action: settings::Actio
     };
     if let Some(dialog) = app.settings.as_mut() {
         dialog.error = error;
+        dialog.problem = crate::backup::problem();
     }
 }
 
@@ -1136,7 +1140,6 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                     | settings::Field::Editor
                     | settings::Field::MinInterval
                     | settings::Field::LogDir
-                    | settings::Field::BackupDirectory
                     | settings::Field::BackupRemote
                     | settings::Field::BackupBranch
                     | settings::Field::BackupFile(_)
@@ -1151,7 +1154,6 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     }
     if field == settings::Field::BackupEnabled && !app.ctx.config.backup.enabled {
         app.confirm = Some(Confirm::BackupEnabled {
-            directory: app.ctx.config.backup.directory().display().to_string(),
             files: app.ctx.config.backup.files.len(),
         });
         return None;
@@ -1660,6 +1662,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Job> {
                 sel: 0,
                 error: None,
                 candidates: crate::gitops::candidates().map_err(|err| format!("{err:#}")),
+                problem: crate::backup::problem(),
             });
             return None;
         }
@@ -2845,18 +2848,17 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
             ],
             yes_no(),
         ),
-        Confirm::BackupEnabled { directory, files } => (
+        Confirm::BackupEnabled { files } => (
             "Enable local backup",
             vec![
                 "Selected configuration files are copied as PLAINTEXT.".into(),
                 "They may contain passwords, tokens, or private data.".into(),
                 "Only exact files you explicitly approve are copied; none are selected by default."
                     .into(),
-                format!("Snapshot directory: {directory} ({files} approved files)"),
+                format!("{files} file(s) approved so far."),
                 "An independent local background worker watches files and plugin metadata.".into(),
                 "It does not commit or use the network; push/pull are explicit commands.".into(),
                 "Disabling backup stops the worker, but keeps snapshots on disk.".into(),
-                format!("Worker errors: {}", crate::backup::error_log().display()),
                 "Enable local backup?".into(),
             ],
             yes_no(),

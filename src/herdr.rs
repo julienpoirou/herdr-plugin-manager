@@ -551,6 +551,30 @@ pub fn parse_action_keybindings(text: &str) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// Whether the popup may use the mouse. Inside Herdr it follows
+/// `[ui] mouse_capture` in Herdr's `config.toml`, so a keyboard-only Herdr
+/// gets a keyboard-only popup; in a plain terminal it is always on.
+pub fn mouse_enabled() -> bool {
+    let inside = std::env::var("HERDR_ENV").as_deref() == Ok("1")
+        || std::env::var_os("HERDR_PLUGIN_ID").is_some();
+    let text = inside
+        .then(|| std::fs::read_to_string(paths::herdr_config_toml()).ok())
+        .flatten();
+    mouse_capture(inside, text.as_deref())
+}
+
+/// `[ui] mouse_capture` from Herdr's config text when inside Herdr; true
+/// when outside, without a config, or when the value is missing or invalid.
+pub fn mouse_capture(inside_herdr: bool, config: Option<&str>) -> bool {
+    if !inside_herdr {
+        return true;
+    }
+    config
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("ui")?.get("mouse_capture")?.as_bool())
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,6 +626,23 @@ command = "julienpoirou.herdr-plugin-manager.open"
             vec!["prefix+p", "alt+p"]
         );
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn mouse_follows_herdr_mouse_capture() {
+        let off = "[ui]\nmouse_capture = false\n";
+        let on = "[ui]\nmouse_capture = true\n";
+        assert!(!mouse_capture(true, Some(off)));
+        assert!(mouse_capture(true, Some(on)));
+        // Missing file, table, key; a value of the wrong type; broken TOML.
+        assert!(mouse_capture(true, None));
+        assert!(mouse_capture(true, Some("")));
+        assert!(mouse_capture(true, Some("[ui]\ntheme = \"dark\"\n")));
+        assert!(mouse_capture(true, Some("[ui]\nmouse_capture = \"no\"\n")));
+        assert!(mouse_capture(true, Some("[ui\nmouse_capture = false")));
+        // A plain terminal keeps the mouse whatever Herdr's config says.
+        assert!(mouse_capture(false, Some(off)));
+        assert!(mouse_capture(false, None));
     }
 
     #[cfg(unix)]

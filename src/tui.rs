@@ -5,6 +5,8 @@
 //! suspends the UI and runs the same code path as the CLI on the plain
 //! terminal, then returns.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +21,7 @@ use ratatui::crossterm::event::{
     KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::{cursor, execute, terminal};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
@@ -41,6 +43,8 @@ const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
 const MUTED: Color = Color::DarkGray;
 const SELECTED_BG: Color = Color::Indexed(236);
+/// Key caps that can be clicked.
+const BUTTON_BG: Color = Color::Indexed(238);
 
 fn muted() -> Style {
     Style::default().fg(MUTED)
@@ -279,16 +283,13 @@ struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     quit: bool,
-    list_area: Rect,
-    /// Clickable header tabs.
-    tab_areas: Vec<(Rect, View)>,
-    /// Lines above the first marketplace entry (loading/errors).
-    market_header: usize,
+    /// What a click does where, for the frame on screen.
+    hits: RefCell<Hits>,
     load_error: Option<String>,
 }
 
 impl App {
-    fn new(ctx: Ctx) -> App {
+    fn new(ctx: Ctx, mouse: bool) -> App {
         let (tx, rx) = mpsc::channel();
         App {
             ctx,
@@ -327,15 +328,18 @@ impl App {
             rx,
             quit: false,
             task: None,
-            list_area: Rect::default(),
-            tab_areas: Vec::new(),
-            market_header: 0,
+            hits: RefCell::new(Hits::new(mouse)),
             load_error: None,
         }
     }
 
     fn say(&mut self, level: Level, text: impl Into<String>) {
         self.message = Some((level, text.into()));
+    }
+
+    /// False when Herdr runs keyboard-only: no capture, no buttons.
+    fn mouse(&self) -> bool {
+        self.hits.borrow().mouse
     }
 
     // ---- data
@@ -642,39 +646,35 @@ const VT_MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
 #[cfg(windows)]
 const VT_MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 
-fn enter(term: &mut Term) -> Result<()> {
+fn enter(term: &mut Term, mouse: bool) -> Result<()> {
     terminal::enable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        terminal::EnterAlternateScreen,
-        EnableMouseCapture,
-        cursor::Hide
-    )?;
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        let mut out = io::stdout();
-        out.write_all(VT_MOUSE_ON.as_bytes())?;
-        out.flush()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+    if mouse {
+        execute!(io::stdout(), EnableMouseCapture)?;
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            let mut out = io::stdout();
+            out.write_all(VT_MOUSE_ON.as_bytes())?;
+            out.flush()?;
+        }
     }
     term.clear()?;
     Ok(())
 }
 
-fn leave() -> Result<()> {
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        let mut out = io::stdout();
-        let _ = out.write_all(VT_MOUSE_OFF.as_bytes());
-        let _ = out.flush();
+fn leave(mouse: bool) -> Result<()> {
+    if mouse {
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            let mut out = io::stdout();
+            let _ = out.write_all(VT_MOUSE_OFF.as_bytes());
+            let _ = out.flush();
+        }
+        let _ = execute!(io::stdout(), DisableMouseCapture);
     }
-    let _ = execute!(
-        io::stdout(),
-        DisableMouseCapture,
-        terminal::LeaveAlternateScreen,
-        cursor::Show
-    );
+    let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
     terminal::disable_raw_mode()?;
     Ok(())
 }
@@ -685,7 +685,8 @@ pub fn run(ctx: Ctx) -> Result<()> {
             "the interactive manager needs a terminal; see `herdr-pm --help` for commands"
         );
     }
-    let mut app = App::new(ctx);
+    let mut app = App::new(ctx, crate::herdr::mouse_enabled());
+    let mouse = app.mouse();
     app.reload();
     app.start_checks(None);
     app.load_market(false);
@@ -704,14 +705,14 @@ pub fn run(ctx: Ctx) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = leave();
+        let _ = leave(mouse);
         default_hook(info);
     }));
     ops::set_plain();
     if app.ctx.config.icons {
         app.graphics = detect_graphics();
     }
-    enter(&mut term)?;
+    enter(&mut term, mouse)?;
     match ops::claim_auto_update(
         &app.ctx.config,
         Some(crate::config::Hook::Popup),
@@ -722,7 +723,7 @@ pub fn run(ctx: Ctx) -> Result<()> {
         Err(err) => app.say(Level::Error, format!("auto-update: {err:#}")),
     }
     let result = event_loop(&mut app, &mut term);
-    leave()?;
+    leave(mouse)?;
     result
 }
 
@@ -750,20 +751,26 @@ fn event_loop(app: &mut App, term: &mut Term) -> Result<()> {
             Duration::from_millis(500)
         };
         if event::poll(timeout)? {
-            match event::read()? {
+            let job = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if let Some(job) = handle_key(app, key) {
-                        run_job(app, term, job)?;
-                    }
                     dirty = true;
+                    handle_key(app, key)
                 }
-                Event::Mouse(m) => {
-                    if handle_mouse(app, m.kind, m.column, m.row) {
-                        dirty = true;
-                    }
+                // Keyboard-only: whatever reaches us is ignored.
+                Event::Mouse(m) if app.mouse() => {
+                    let (changed, job) = handle_mouse(app, m.kind, m.column, m.row);
+                    dirty |= changed;
+                    job
                 }
-                Event::Resize(_, _) => dirty = true,
-                _ => {}
+                Event::Resize(_, _) => {
+                    dirty = true;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(job) = job {
+                run_job(app, term, job)?;
+                dirty = true;
             }
         }
         if busy && last_tick.elapsed() > Duration::from_millis(120) {
@@ -823,9 +830,9 @@ fn editor_command(config: &Config) -> Vec<String> {
 /// a background task behind a progress dialog.
 fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
     if let Job::EditConfig = job {
-        leave()?;
+        leave(app.mouse())?;
         let result = edit_config(app);
-        enter(term)?;
+        enter(term, app.mouse())?;
         app.reload();
         match result {
             Ok(()) => app.message = None,
@@ -1194,23 +1201,25 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let Some(dialog) = &app.settings else {
         return;
     };
+    let mouse = app.mouse();
+    // A value typed on the prompt line takes the keys: only the buttons
+    // stay clickable, `←` back to the list, `×` out of both.
+    let nested = app.prompt.is_some();
     let rows = settings_rows(app);
     let sel = dialog.sel.min(rows.len().saturating_sub(1));
-    let key =
-        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    let mut body: Vec<Line> = Vec::new();
+    let key = key_style();
+    // Each line, with its row and where its value starts and how wide it is.
+    type ValueSpan = Option<(usize, u16, u16)>;
+    let mut body: Vec<(Line, ValueSpan)> = Vec::new();
     let mut sel_line = 0;
     let mut section = "";
     for (i, row) in rows.iter().enumerate() {
         if row.section != section {
             if !section.is_empty() {
-                body.push(Line::raw(""));
+                body.push((Line::raw(""), None));
             }
             section = row.section;
-            body.push(Line::styled(
-                section,
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
+            body.push((Line::styled(section, key), None));
         }
         if i == sel {
             sel_line = body.len();
@@ -1222,19 +1231,17 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
-        body.push(
-            Line::from(vec![
-                Span::raw(format!("  {}", pad(&util::sanitize(&row.label), 34))),
-                Span::styled(util::sanitize(&row.value), muted()),
-            ])
-            .style(style),
-        );
+        let label = Span::raw(format!("  {}", pad(&util::sanitize(&row.label), 34)));
+        let value = Span::styled(util::sanitize(&row.value), muted());
+        let place = (i, label.width() as u16, value.width() as u16);
+        body.push((Line::from(vec![label, value]).style(style), Some(place)));
     }
     let height = (area.height.saturating_sub(10) as usize).clamp(5, 30);
     let start = sel_line
         .saturating_sub(height / 2)
         .min(body.len().saturating_sub(height));
-    let mut lines: Vec<Line> = body.into_iter().skip(start).take(height).collect();
+    let (mut lines, places): (Vec<Line>, Vec<_>) =
+        body.into_iter().skip(start).take(height).unzip();
     lines.push(Line::raw(""));
     if let Some(err) = &dialog.error {
         lines.push(Line::styled(
@@ -1242,65 +1249,103 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(BAD),
         ));
     }
-    let mut hint = match rows.get(sel).map(|r| r.field.kind()) {
-        Some(Kind::Number) => vec![
-            key("↵"),
-            Span::raw(" type   "),
-            key("←→"),
-            Span::raw(" change   "),
-        ],
-        Some(Kind::Toggle) => vec![key("↵"), Span::raw(" on/off   ")],
-        Some(Kind::Choice) => vec![key("↵ ←→"), Span::raw(" change   ")],
-        Some(Kind::Text) => vec![
-            key("↵"),
-            Span::raw(" type   "),
-            key("d"),
-            Span::raw(" default   "),
-        ],
-        Some(Kind::Alias) => vec![
-            key("↵"),
-            Span::raw(" edit   "),
-            key("d"),
-            Span::raw(" delete   "),
-        ],
-        Some(Kind::AddAlias) | None => vec![key("↵"), Span::raw(" add   ")],
-        Some(Kind::ReadOnly)
-            if matches!(
-                rows.get(sel).map(|row| &row.field),
-                Some(settings::Field::BackupError)
-            ) =>
-        {
-            vec![Span::raw("close and reopen Settings to retry   ")]
+    let field = rows.get(sel).map(|r| &r.field);
+    let enter = [Click::Key(ENTER)];
+    let arrows = [press(KeyCode::Left), press(KeyCode::Right)];
+    let delete = [ch('d')];
+    let mut hint = Hint::new(mouse && !nested);
+    match field.map(settings::Field::kind) {
+        Some(Kind::Number) => {
+            hint.key("↵", key, Span::raw(" type   "), &enter).key(
+                "←→",
+                key,
+                Span::raw(" change   "),
+                &arrows,
+            );
         }
-        Some(Kind::ReadOnly) => vec![Span::raw("read-only   ")],
-    };
-    if matches!(
-        rows.get(sel).map(|r| &r.field),
-        Some(settings::Field::PluginStrategy(_))
-    ) {
-        hint.extend([key("d"), Span::raw(" default   ")]);
+        Some(Kind::Toggle) => {
+            hint.key("↵", key, Span::raw(" on/off   "), &enter);
+        }
+        Some(Kind::Choice) => {
+            hint.cap("↵", key, Some(Click::Key(ENTER)))
+                .cap(" ", key, None)
+                .key("←→", key, Span::raw(" change   "), &arrows);
+        }
+        Some(Kind::Text) => {
+            hint.key("↵", key, Span::raw(" type   "), &enter).key(
+                "d",
+                key,
+                Span::raw(" default   "),
+                &delete,
+            );
+        }
+        Some(Kind::Alias) => {
+            hint.key("↵", key, Span::raw(" edit   "), &enter).key(
+                "d",
+                key,
+                Span::raw(" delete   "),
+                &delete,
+            );
+        }
+        Some(Kind::AddAlias) | None => {
+            hint.key("↵", key, Span::raw(" add   "), &enter);
+        }
+        Some(Kind::ReadOnly) if matches!(field, Some(settings::Field::BackupError)) => {
+            hint.push(Span::raw("close and reopen Settings to retry   "), None);
+        }
+        Some(Kind::ReadOnly) => {
+            hint.push(Span::raw("read-only   "), None);
+        }
     }
-    hint.extend([
-        key("E"),
-        Span::raw(" editor   "),
-        key("Esc"),
+    if matches!(field, Some(settings::Field::PluginStrategy(_))) {
+        hint.key("d", key, Span::raw(" default   "), &delete);
+    }
+    hint.key("E", key, Span::raw(" editor   "), &[ch('E')]).key(
+        "Esc",
+        key,
         Span::raw(" close"),
-    ]);
-    lines.push(Line::from(hint));
+        &[Click::Key(ESC)],
+    );
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
     lines.push(Line::styled(
         util::truncate(&paths::pm_config_file().display().to_string(), 84),
         muted(),
     ));
     let rect = centered(area, 90, lines.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            " Settings ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    let (back, close) = if nested {
+        (Some(Click::Key(ESC)), Click::Keys(ESC, ESC))
+    } else {
+        (None, Click::Key(ESC))
+    };
+    let mut title = Hint::title(mouse, back, Some(close));
+    title.push(
+        Span::styled(" Settings ", Style::default().add_modifier(Modifier::BOLD)),
+        None,
+    );
+    let block = dialog_block(f, app, rect, ACCENT, title);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    if nested {
+        return;
+    }
+    let inner = rect.inner(Margin::new(1, 1));
+    for (index, place) in places.iter().enumerate() {
+        let Some((i, value_at, value_width)) = *place else {
+            continue;
+        };
+        place_row(app, inner, index, 1, Click::Row(List::Settings, i, None));
+        if i == sel {
+            // The value of the selected row does what Enter does.
+            place_line(
+                app,
+                rect,
+                index,
+                &[(value_at, value_width, Click::Key(ENTER))],
+            );
+        }
+    }
+    place_line(app, rect, hint_line, &hint_clicks);
 }
 
 /// The work of a task, run on its worker thread.
@@ -1450,12 +1495,218 @@ fn task_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     None
 }
 
+// ---------------------------------------------------------------- mouse
+
+const ESC: KeyEvent = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+const ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+/// What the main window's close button presses: quit from anywhere.
+const QUIT: KeyEvent = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+const fn press(code: KeyCode) -> Click {
+    Click::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+const fn ch(c: char) -> Click {
+    press(KeyCode::Char(c))
+}
+
+/// The lists whose rows take clicks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum List {
+    Installed,
+    Market,
+    Picker,
+    Cleaner,
+    Settings,
+}
+
+/// What a click on a region does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Click {
+    /// The key the region shows, through the same path as the keyboard.
+    Key(KeyEvent),
+    /// Two keys in a row: leaves a dialog and the one it opened from.
+    Keys(KeyEvent, KeyEvent),
+    Tab(View),
+    /// A row of a list: selects it; on the selected row, presses the key.
+    Row(List, usize, Option<KeyEvent>),
+}
+
+/// The clickable regions of the frame on screen, in drawing order. Empty
+/// when Herdr runs keyboard-only.
+struct Hits {
+    mouse: bool,
+    regions: Vec<(Rect, Click)>,
+}
+
+impl Hits {
+    fn new(mouse: bool) -> Hits {
+        Hits {
+            mouse,
+            regions: Vec::new(),
+        }
+    }
+
+    /// A new frame, or a dialog drawn on top: what lies below takes no
+    /// more clicks.
+    fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    fn add(&mut self, rect: Rect, click: Click) {
+        if self.mouse && !rect.is_empty() {
+            self.regions.push((rect, click));
+        }
+    }
+
+    /// The pieces of a `Hint` drawn from (`x`, `y`), cut at column `right`.
+    fn place(&mut self, clicks: &[(u16, u16, Click)], x: u16, y: u16, right: u16) {
+        for &(start, width, click) in clicks {
+            let left = x.saturating_add(start);
+            let end = left.saturating_add(width).min(right);
+            if left < end {
+                self.add(Rect::new(left, y, end - left, 1), click);
+            }
+        }
+    }
+
+    /// What a click at this cell does: the region drawn last wins.
+    fn at(&self, col: u16, row: u16) -> Option<Click> {
+        let cell = Position::new(col, row);
+        self.regions
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(cell))
+            .map(|&(_, click)| click)
+    }
+}
+
+/// A line of text whose pieces stand for keys: hints and window buttons.
+/// Without the mouse it is the plain keyboard text and records nothing.
+struct Hint {
+    mouse: bool,
+    spans: Vec<Span<'static>>,
+    /// Start column, width, and what a click there does.
+    clicks: Vec<(u16, u16, Click)>,
+    width: u16,
+}
+
+impl Hint {
+    fn new(mouse: bool) -> Hint {
+        Hint {
+            mouse,
+            spans: Vec::new(),
+            clicks: Vec::new(),
+            width: 0,
+        }
+    }
+
+    /// A window title starting with its back `←` and close `×` buttons
+    /// (with the mouse only).
+    fn title(mouse: bool, back: Option<Click>, close: Option<Click>) -> Hint {
+        let mut hint = Hint::new(mouse);
+        if mouse {
+            for (glyph, click) in [("←", back), ("×", close)] {
+                if let Some(click) = click {
+                    hint.push(Span::raw(" "), None);
+                    hint.push(Span::styled(glyph, key_style()), Some(click));
+                }
+            }
+        }
+        hint
+    }
+
+    /// Text; with a click, the text up to its trailing spaces takes it.
+    fn push(&mut self, span: Span<'static>, click: Option<Click>) -> &mut Hint {
+        let width = span.width() as u16;
+        if let (true, Some(click)) = (self.mouse, click) {
+            let trailing = span.content.chars().rev().take_while(|c| *c == ' ').count() as u16;
+            let used = width.saturating_sub(trailing);
+            if used > 0 {
+                self.clicks.push((self.width, used, click));
+            }
+        }
+        self.width = self.width.saturating_add(width);
+        self.spans.push(span);
+        self
+    }
+
+    /// A key cap, drawn as a button when it can be clicked.
+    fn cap(
+        &mut self,
+        cap: impl Into<Cow<'static, str>>,
+        style: Style,
+        click: Option<Click>,
+    ) -> &mut Hint {
+        let style = if self.mouse && click.is_some() {
+            style.bg(BUTTON_BG)
+        } else {
+            style
+        };
+        self.push(Span::styled(cap, style), click)
+    }
+
+    /// A key cap and its label: a click on either presses the key. With
+    /// several keys (`←→`) each character of the cap is one of them and the
+    /// label takes none.
+    fn key(
+        &mut self,
+        cap: &'static str,
+        style: Style,
+        label: Span<'static>,
+        keys: &[Click],
+    ) -> &mut Hint {
+        if let [click] = keys {
+            self.cap(cap, style, Some(*click));
+            return self.push(label, Some(*click));
+        }
+        for ((at, glyph), click) in cap.char_indices().zip(keys) {
+            self.cap(&cap[at..at + glyph.len_utf8()], style, Some(*click));
+        }
+        self.push(label, None)
+    }
+
+    fn into_parts(self) -> (Line<'static>, Vec<(u16, u16, Click)>) {
+        (Line::from(self.spans), self.clicks)
+    }
+}
+
+fn key_style() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+/// What a click does, through the same paths as the keyboard.
+fn click_on(app: &mut App, click: Click) -> Option<Job> {
+    match click {
+        Click::Key(key) => handle_key(app, key),
+        Click::Keys(first, then) => handle_key(app, first).or_else(|| handle_key(app, then)),
+        Click::Tab(view) => {
+            switch_view(app, view);
+            None
+        }
+        Click::Row(list, index, then) => {
+            let sel = match list {
+                List::Installed => &mut app.sel,
+                List::Market => &mut app.market.sel,
+                List::Picker => &mut app.picker.as_mut()?.sel,
+                List::Cleaner => &mut app.cleaner.as_mut()?.sel,
+                List::Settings => &mut app.settings.as_mut()?.sel,
+            };
+            if *sel != index {
+                *sel = index;
+                return None;
+            }
+            handle_key(app, then?)
+        }
+    }
+}
+
 // ---------------------------------------------------------------- input
 
-fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool {
-    let inside = |area: Rect| {
-        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
-    };
+/// The wheel moves the selection of what is on top; a left click does what
+/// the region under it stands for. Returns whether to redraw, and the job
+/// the click started.
+fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> (bool, Option<Job>) {
     match kind {
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
             let delta = if kind == MouseEventKind::ScrollDown {
@@ -1485,49 +1736,16 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> bool
             } else {
                 move_sel(app, delta);
             }
-            true
-        }
-        MouseEventKind::Down(MouseButton::Left)
-            if app.help
-                || app.picker.is_some()
-                || app.cleaner.is_some()
-                || app.settings.is_some()
-                || app.task.is_some() =>
-        {
-            false
+            (true, None)
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(&(_, view)) = app.tab_areas.iter().find(|(area, _)| inside(*area)) {
-                switch_view(app, view);
-                return true;
+            let click = app.hits.borrow().at(col, row);
+            match click {
+                Some(click) => (true, click_on(app, click)),
+                None => (false, None),
             }
-            let area = app.list_area;
-            if !inside(area) {
-                return false;
-            }
-            let line = (row - area.y) as usize;
-            match app.view {
-                View::Installed => {
-                    let idx = app.offset + line;
-                    if idx < app.items.len() {
-                        app.sel = idx;
-                    }
-                }
-                View::Market => {
-                    let page_start = (app.market.sel / app.market.page_size.max(1))
-                        * app.market.page_size.max(1);
-                    let Some(line) = line.checked_sub(app.market_header) else {
-                        return false;
-                    };
-                    let idx = page_start + line / 2;
-                    if idx < app.market.entries.len() {
-                        app.market.sel = idx;
-                    }
-                }
-            }
-            true
         }
-        _ => false,
+        _ => (false, None),
     }
 }
 
@@ -2046,6 +2264,7 @@ fn pad(text: &str, width: usize) -> String {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.hits.borrow_mut().clear();
     let area = f.area();
     let detail_height = if area.height >= 24 {
         6
@@ -2080,6 +2299,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, app, status);
     draw_footer(f, app, footer);
+    // Overlays: the one that reads keys first is drawn last, and each
+    // takes the clicks of what it covers.
     if app.help {
         draw_help(f, app, area);
     }
@@ -2092,15 +2313,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.settings.is_some() {
         draw_settings(f, app, area);
     }
-    if let Some(confirm) = &app.confirm {
-        draw_confirm(f, confirm, area);
+    if app.prompt.is_some() {
+        draw_prompt(f, app, status);
+    }
+    if app.confirm.is_some() {
+        draw_confirm(f, app, area);
     }
     if app.task.is_some() {
         draw_task(f, app, area);
     }
 }
 
-fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let tab = |label: String, active: bool| {
         if active {
             Span::styled(
@@ -2129,32 +2353,24 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         tab(installed_label, app.view == View::Installed),
         tab(market_label, app.view == View::Market),
     ];
-    let mut spans = Vec::new();
-    let mut x = area.x;
-    app.tab_areas.clear();
+    // Esc goes back from the marketplace, or clears the filter.
+    let back = (app.view == View::Market || !app.filter.is_empty()).then_some(Click::Key(ESC));
+    let mut hint = Hint::title(app.mouse(), back, Some(Click::Key(QUIT)));
     for (span, view) in tabs.into_iter().zip([View::Installed, View::Market]) {
-        let width = span.content.chars().count() as u16;
-        app.tab_areas.push((
-            Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            view,
-        ));
-        x += width + 1;
-        spans.push(span);
-        spans.push(Span::raw(" "));
+        hint.push(span, Some(Click::Tab(view)));
+        hint.push(Span::raw(" "), None);
     }
     if app.ctx.dry_run {
         let right = "DRY RUN";
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let gap = (area.width as usize).saturating_sub(used + right.len() + 1);
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(right, Style::default().fg(WARN)));
+        let gap = (area.width as usize).saturating_sub(hint.width as usize + right.len() + 1);
+        hint.push(Span::raw(" ".repeat(gap)), None);
+        hint.push(Span::styled(right, Style::default().fg(WARN)), None);
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let (line, clicks) = hint.into_parts();
+    app.hits
+        .borrow_mut()
+        .place(&clicks, area.x, area.y, area.right());
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn status_span(app: &App, row: &Row) -> Span<'static> {
@@ -2196,7 +2412,6 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(muted());
     let inner = block.inner(area);
     f.render_widget(block, area);
-    app.list_area = inner;
     let height = inner.height as usize;
     if let Some(err) = &app.load_error {
         let p = Paragraph::new(vec![
@@ -2291,6 +2506,13 @@ fn draw_installed(f: &mut Frame, app: &mut App, area: Rect) {
         // Width in cells: 📌 takes two.
         let used_now: usize = spans.iter().map(Span::width).sum();
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used_now))));
+        place_row(
+            app,
+            inner,
+            lines.len(),
+            1,
+            Click::Row(List::Installed, pos, None),
+        );
         lines.push(Line::from(spans).style(base));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -2446,7 +2668,6 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
         .title(Span::styled(title, muted()));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    app.list_area = inner;
     let height = inner.height as usize;
 
     let mut lines: Vec<Line> = Vec::new();
@@ -2515,6 +2736,14 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
             " ".repeat(width.saturating_sub(used + right_w + 1)),
         ));
         spans.push(Span::styled(right, Style::default().fg(WARN)));
+        // Selected again, an entry installs: through its trust preview.
+        place_row(
+            app,
+            inner,
+            lines.len(),
+            2,
+            Click::Row(List::Market, idx, Some(ENTER)),
+        );
         lines.push(Line::from(spans).style(base));
         let desc = if entry.description.is_empty() {
             "—".to_string()
@@ -2543,7 +2772,6 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::styled(footer, muted()));
     }
     f.render_widget(Paragraph::new(lines), inner);
-    app.market_header = header_lines;
     app.market.page_size = page_size;
 }
 
@@ -2710,29 +2938,57 @@ fn request_logo(app: &mut App) {
     });
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    if let Some((kind, buffer)) = &app.prompt {
-        let label = match kind {
-            Prompt::Install => {
-                "install (url, owner/repo, alias:path [--ref R] [--subdir D]): ".to_string()
-            }
-            Prompt::Switch(id) => format!("switch {id} to branch/tag/commit: "),
-            Prompt::Purge(id) => format!("type {id} to delete it and its directory: "),
-            Prompt::Setting(field) => field
-                .prompt(&app.ctx.config)
-                .map(|(label, _)| label)
-                .unwrap_or_default(),
-            Prompt::Filter => "filter: ".to_string(),
-            Prompt::Search => "search marketplace: ".to_string(),
-        };
-        let line = Line::from(vec![
-            Span::styled(label, Style::default().fg(ACCENT)),
-            Span::raw(buffer.clone()),
-            Span::styled("▏", Style::default().fg(ACCENT)),
-        ]);
-        f.render_widget(Paragraph::new(line), pad_rect(area));
+/// The line where a value is typed, with clickable `↵`/`Esc` at its right.
+/// It takes the clicks of the window it was opened from, except the
+/// buttons of a Settings dialog.
+fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some((kind, buffer)) = &app.prompt else {
         return;
+    };
+    let label = match kind {
+        Prompt::Install => {
+            "install (url, owner/repo, alias:path [--ref R] [--subdir D]): ".to_string()
+        }
+        Prompt::Switch(id) => format!("switch {id} to branch/tag/commit: "),
+        Prompt::Purge(id) => format!("type {id} to delete it and its directory: "),
+        Prompt::Setting(field) => field
+            .prompt(&app.ctx.config)
+            .map(|(label, _)| label)
+            .unwrap_or_default(),
+        Prompt::Filter => "filter: ".to_string(),
+        Prompt::Search => "search marketplace: ".to_string(),
+    };
+    let area = pad_rect(area);
+    let mut spans = vec![
+        Span::styled(label, Style::default().fg(ACCENT)),
+        Span::raw(buffer.clone()),
+        Span::styled("▏", Style::default().fg(ACCENT)),
+    ];
+    if app.settings.is_none() {
+        app.hits.borrow_mut().clear();
     }
+    let mut hint = Hint::new(app.mouse());
+    hint.key("↵", key_style(), Span::raw(" ok   "), &[Click::Key(ENTER)])
+        .key("Esc", key_style(), Span::raw(" cancel"), &[Click::Key(ESC)]);
+    let used: usize = spans.iter().map(Span::width).sum();
+    if app.mouse() && used + hint.width as usize + 2 <= area.width as usize {
+        let at = area.width - hint.width;
+        spans.push(Span::raw(" ".repeat(at as usize - used)));
+        let (line, clicks) = hint.into_parts();
+        spans.extend(line.spans);
+        app.hits
+            .borrow_mut()
+            .place(&clicks, area.x + at, area.y, area.right());
+    }
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    if app.prompt.is_some() {
+        return; // draw_prompt
+    }
+    let line_area = pad_rect(area);
     let line = match &app.message {
         Some((level, text)) => {
             let color = match level {
@@ -2747,52 +3003,72 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             )
         }
         None if !app.filter.is_empty() && app.view == View::Installed => {
-            Line::styled(format!("filter: {}  (Esc clears)", app.filter), muted())
+            let mut hint = Hint::new(app.mouse());
+            hint.push(
+                Span::styled(format!("filter: {}  (", app.filter), muted()),
+                None,
+            )
+            .cap("Esc", muted(), Some(Click::Key(ESC)))
+            .push(Span::styled(" clears", muted()), Some(Click::Key(ESC)))
+            .push(Span::styled(")", muted()), None);
+            let (line, clicks) = hint.into_parts();
+            app.hits
+                .borrow_mut()
+                .place(&clicks, line_area.x, line_area.y, line_area.right());
+            line
         }
         None => Line::raw(""),
     };
-    f.render_widget(Paragraph::new(line), pad_rect(area));
+    f.render_widget(Paragraph::new(line), line_area);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let keys: &[(&str, &str)] = match app.view {
-        View::Installed => &[
-            ("u", "update"),
-            ("U", "update all"),
-            ("e", "enable/disable"),
-            ("A", "auto-update"),
-            ("x", "remove"),
-            ("i", "install"),
-            ("m", "marketplace"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        View::Market => &[
-            ("↵", "install"),
-            ("/", "search"),
-            ("←→", "page"),
-            ("s", "sort"),
-            ("f", "switch source"),
-            ("o", "open"),
-            ("r", "refresh"),
-            ("q", "back"),
-        ],
+    const INSTALLED: &[(&str, &str, &[Click])] = &[
+        ("u", "update", &[ch('u')]),
+        ("U", "update all", &[ch('U')]),
+        ("e", "enable/disable", &[ch('e')]),
+        ("A", "auto-update", &[ch('A')]),
+        ("x", "remove", &[ch('x')]),
+        ("i", "install", &[ch('i')]),
+        ("m", "marketplace", &[ch('m')]),
+        ("?", "help", &[ch('?')]),
+        ("q", "quit", &[ch('q')]),
+    ];
+    const MARKET: &[(&str, &str, &[Click])] = &[
+        ("↵", "install", &[Click::Key(ENTER)]),
+        ("/", "search", &[ch('/')]),
+        ("←→", "page", &[press(KeyCode::Left), press(KeyCode::Right)]),
+        ("s", "sort", &[ch('s')]),
+        ("f", "switch source", &[ch('f')]),
+        ("o", "open", &[ch('o')]),
+        ("r", "refresh", &[ch('r')]),
+        ("q", "back", &[ch('q')]),
+    ];
+    let keys = match app.view {
+        View::Installed => INSTALLED,
+        View::Market => MARKET,
     };
-    let mut spans = Vec::new();
+    let mut hint = Hint::new(app.mouse());
     let mut used = 0usize;
-    for (k, label) in keys {
+    for &(k, label, clicks) in keys {
         let piece = k.chars().count() + label.chars().count() + 3;
         if used + piece > area.width as usize {
             break;
         }
         used += piece;
-        spans.push(Span::styled(
-            k.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(format!(" {label}  "), muted()));
+        hint.key(
+            k,
+            key_style(),
+            Span::styled(format!(" {label}  "), muted()),
+            clicks,
+        );
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), pad_rect(area));
+    let area = pad_rect(area);
+    let (line, clicks) = hint.into_parts();
+    app.hits
+        .borrow_mut()
+        .place(&clicks, area.x, area.y, area.right());
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -2806,8 +3082,56 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
-    let (title, body, hint): (&str, Vec<String>, Vec<Span>) = match confirm {
+/// Starts a dialog over what is drawn: clears the area and the clicks
+/// below it, and frames it with `title` (its buttons first).
+fn dialog_block(
+    f: &mut Frame,
+    app: &App,
+    rect: Rect,
+    border: Color,
+    title: Hint,
+) -> Block<'static> {
+    f.render_widget(Clear, rect);
+    let (title, clicks) = title.into_parts();
+    let mut hits = app.hits.borrow_mut();
+    hits.clear();
+    hits.place(
+        &clicks,
+        rect.x.saturating_add(1),
+        rect.y,
+        rect.right().saturating_sub(1),
+    );
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(title)
+}
+
+/// Makes line `index` of a dialog's text clickable, when it is on screen.
+fn place_line(app: &App, rect: Rect, index: usize, clicks: &[(u16, u16, Click)]) {
+    let inner = rect.inner(Margin::new(1, 1));
+    if index < inner.height as usize {
+        app.hits
+            .borrow_mut()
+            .place(clicks, inner.x, inner.y + index as u16, inner.right());
+    }
+}
+
+/// Makes `height` lines of `inner` from line `index` a row of a list.
+fn place_row(app: &App, inner: Rect, index: usize, height: u16, click: Click) {
+    let top = inner.y.saturating_add(index as u16);
+    if top < inner.bottom() {
+        let rect = Rect::new(inner.x, top, inner.width, height.min(inner.bottom() - top));
+        app.hits.borrow_mut().add(rect, click);
+    }
+}
+
+fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some(confirm) = &app.confirm else {
+        return;
+    };
+    let mouse = app.mouse();
+    let (title, body, hint): (&str, Vec<String>, Hint) = match confirm {
         Confirm::Remove { id, origin, path } => {
             let (keep, delete) = match origin {
                 Origin::Local => (
@@ -2830,14 +3154,20 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                     format!("  u  {keep}"),
                     format!("  d  {delete}"),
                 ],
-                vec![
-                    Span::styled("u", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
-                    Span::raw(" remove   "),
-                    Span::styled("d", Style::default().fg(BAD).add_modifier(Modifier::BOLD)),
-                    Span::raw(" delete completely   "),
-                    Span::styled("any other key", muted()),
-                    Span::raw(" cancels"),
-                ],
+                {
+                    let mut hint = Hint::new(mouse);
+                    let bold = Style::default().add_modifier(Modifier::BOLD);
+                    hint.key("u", bold.fg(OK), Span::raw(" remove   "), &[ch('u')])
+                        .key(
+                            "d",
+                            bold.fg(BAD),
+                            Span::raw(" delete completely   "),
+                            &[ch('d')],
+                        )
+                        .cap("any other key", muted(), Some(Click::Key(ESC)))
+                        .push(Span::raw(" cancels"), Some(Click::Key(ESC)));
+                    hint
+                },
             )
         }
         Confirm::AutoUpdateOn { name, .. } => (
@@ -2846,7 +3176,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                 format!("Updates of {name} will be installed without review"),
                 "when Herdr starts. Turn auto-update on?".to_string(),
             ],
-            yes_no(),
+            yes_no(mouse),
         ),
         Confirm::BackupEnabled { files } => (
             "Enable local backup",
@@ -2861,7 +3191,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                 "Disabling backup stops the worker, but keeps snapshots on disk.".into(),
                 "Enable local backup?".into(),
             ],
-            yes_no(),
+            yes_no(mouse),
         ),
         Confirm::Integration { skill, on, plan } => {
             let mut b = plan.clone();
@@ -2874,7 +3204,7 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                     "herdr-pm on PATH"
                 },
                 b,
-                yes_no(),
+                yes_no(mouse),
             )
         }
         Confirm::UpdateAll(ids) => {
@@ -2884,127 +3214,196 @@ fn draw_confirm(f: &mut Frame, confirm: &Confirm, area: Rect) {
                 b.push(format!("  … {} more", ids.len() - 8));
             }
             b.push("Each one still shows its preview before anything runs.".into());
-            ("Update all", b, yes_no())
+            ("Update all", b, yes_no(mouse))
         }
     };
     let width = body
         .iter()
         .map(|l| l.chars().count())
-        .chain(std::iter::once(hint.iter().map(Span::width).sum()))
+        .chain(std::iter::once(hint.width as usize))
         .max()
         .unwrap_or(20)
         .max(30) as u16
         + 4;
     let rect = centered(area, width, body.len() as u16 + 4);
-    f.render_widget(Clear, rect);
     let mut lines: Vec<Line> = body
         .into_iter()
         .map(|l| Line::raw(util::sanitize(&l)))
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::from(hint));
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
+    // Opened from Settings: `←` goes back there, `×` closes both.
+    let (back, close) = if app.settings.is_some() {
+        (Some(Click::Key(ESC)), Click::Keys(ESC, ESC))
+    } else {
+        (None, Click::Key(ESC))
+    };
+    let mut heading = Hint::title(mouse, back, Some(close));
+    heading.push(
+        Span::styled(
             format!(" {title} "),
             Style::default().add_modifier(Modifier::BOLD),
-        ));
+        ),
+        None,
+    );
+    let block = dialog_block(f, app, rect, ACCENT, heading);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    place_line(app, rect, hint_line, &hint_clicks);
 }
 
-fn yes_no() -> Vec<Span<'static>> {
-    vec![
-        Span::styled("y", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
+fn yes_no(mouse: bool) -> Hint {
+    let mut hint = Hint::new(mouse);
+    hint.key(
+        "y",
+        Style::default().fg(OK).add_modifier(Modifier::BOLD),
         Span::raw(" yes   "),
-        Span::styled("any other key", muted()),
-        Span::raw(" no"),
-    ]
+        &[ch('y')],
+    )
+    .cap("any other key", muted(), Some(Click::Key(ESC)))
+    .push(Span::raw(" no"), Some(Click::Key(ESC)));
+    hint
 }
 
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
+    let mouse = app.mouse();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
     let section = |t: &str| {
-        Line::styled(
-            t.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        (
+            Line::styled(t.to_string(), key_style()),
+            Vec::<(u16, u16, Click)>::new(),
         )
     };
-    let key = |k: &str, d: &str| {
-        Line::from(vec![
-            Span::styled(
-                format!("  {k:<7}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(d.to_string()),
-        ])
+    // A key's line, which a click closes the help and presses the key from.
+    let key = |k: &'static str, d: &'static str, click: Option<Click>| {
+        let mut hint = Hint::new(mouse);
+        hint.push(Span::styled("  ", bold), None)
+            .cap(k, bold, click)
+            .push(
+                Span::styled(" ".repeat(7usize.saturating_sub(k.chars().count())), bold),
+                None,
+            )
+            .push(Span::raw(d), click);
+        hint.into_parts()
     };
+    let then = |code: KeyCode| Some(Click::Keys(ESC, KeyEvent::new(code, KeyModifiers::NONE)));
+    let installed = |c: char| then(KeyCode::Char(c)).filter(|_| app.view == View::Installed);
+    let market = |code: KeyCode| then(code).filter(|_| app.view == View::Market);
+    let close = Some(Click::Key(ESC));
     let mut lines = vec![
         section("Installed"),
-        key("u", "update the selected plugin"),
-        key("U", "update all outdated plugins"),
-        key("A", "auto-update on/off (when Herdr starts)"),
-        key("e", "enable or disable"),
-        key("x", "remove, or delete completely"),
-        key("X", "pick removed plugins whose leftovers to delete"),
-        key("i", "install from a URL, owner/repo or alias:path"),
-        key("p", "pick a version to pin (or unpin)"),
-        key("t", "take a GitHub plugin over from herdr (git-managed)"),
-        key("s", "switch to another branch, tag or commit"),
-        key("z", "roll back to the previous installation"),
-        key("o", "open the source in a browser"),
-        key("C", "settings: this manager's config.toml"),
-        key("E", "open config.toml in your editor"),
-        key("/", "filter the list"),
-        key("r", "refresh and re-check updates"),
-        Line::raw(""),
+        key("u", "update the selected plugin", installed('u')),
+        key("U", "update all outdated plugins", installed('U')),
+        key(
+            "A",
+            "auto-update on/off (when Herdr starts)",
+            installed('A'),
+        ),
+        key("e", "enable or disable", installed('e')),
+        key("x", "remove, or delete completely", installed('x')),
+        key(
+            "X",
+            "pick removed plugins whose leftovers to delete",
+            installed('X'),
+        ),
+        key(
+            "i",
+            "install from a URL, owner/repo or alias:path",
+            installed('i'),
+        ),
+        key("p", "pick a version to pin (or unpin)", installed('p')),
+        key(
+            "t",
+            "take a GitHub plugin over from herdr (git-managed)",
+            installed('t'),
+        ),
+        key(
+            "s",
+            "switch to another branch, tag or commit",
+            installed('s'),
+        ),
+        key(
+            "z",
+            "roll back to the previous installation",
+            installed('z'),
+        ),
+        key("o", "open the source in a browser", installed('o')),
+        key("C", "settings: this manager's config.toml", installed('C')),
+        key("E", "open config.toml in your editor", installed('E')),
+        key("/", "filter the list", installed('/')),
+        key("r", "refresh and re-check updates", installed('r')),
+        (Line::raw(""), Vec::new()),
         section("Marketplace"),
-        key("↵", "install the selection (preview first)"),
-        key("/", "search"),
-        key("s", "sort"),
-        key("f", "switch source"),
-        key("←", "previous page"),
-        key("→", "next page"),
-        key("o", "open in browser"),
-        key("r", "refresh listings"),
-        Line::raw(""),
+        key(
+            "↵",
+            "install the selection (preview first)",
+            market(KeyCode::Enter),
+        ),
+        key("/", "search", market(KeyCode::Char('/'))),
+        key("s", "sort", market(KeyCode::Char('s'))),
+        key("f", "switch source", market(KeyCode::Char('f'))),
+        key("←", "previous page", market(KeyCode::Left)),
+        key("→", "next page", market(KeyCode::Right)),
+        key("o", "open in browser", market(KeyCode::Char('o'))),
+        key("r", "refresh listings", market(KeyCode::Char('r'))),
+        (Line::raw(""), Vec::new()),
         section("Anywhere"),
-        key("↑ ↓", "move"),
-        key("m", "switch views"),
-        key("Tab", "switch views"),
-        key("q", "back or close"),
-        key("Esc", "back or close"),
-        key("?", "this help"),
-        key("wheel", "move the selection"),
-        key("click", "select a row, or switch views on a tab"),
-        Line::raw(""),
-        Line::styled(format!("config: {}", Config::path().display()), muted()),
+        key("↑ ↓", "move", None),
+        key("m", "switch views", then(KeyCode::Char('m'))),
+        key("Tab", "switch views", then(KeyCode::Tab)),
+        key("q", "back or close", close),
+        key("Esc", "back or close", close),
+        key("?", "this help", close),
     ];
+    if mouse {
+        lines.extend([
+            key("wheel", "move the selection", None),
+            key("click", "a key, a tab, × or ←: what that key does", None),
+            key("click", "a row selects it; again, what ↵ does there", None),
+        ]);
+    }
+    lines.extend([
+        (Line::raw(""), Vec::new()),
+        (
+            Line::styled(format!("config: {}", Config::path().display()), muted()),
+            Vec::new(),
+        ),
+    ]);
     let rect = centered(area, 72, lines.len() as u16 + 2);
     let visible = rect.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     app.help_scroll = app.help_scroll.min(max_scroll);
     let first = app.help_scroll;
     let last = (first + visible).min(lines.len());
-    let title = if max_scroll == 0 {
-        " keys · ? closes ".to_string()
+    let mut title = Hint::title(mouse, None, close);
+    if max_scroll == 0 {
+        title.push(Span::styled(" keys · ", bold), None);
     } else {
-        format!(
-            " keys {}–{}/{} · ↑↓ scroll · ? closes ",
-            first + 1,
-            last,
-            lines.len()
-        )
-    };
-    let shown: Vec<Line> = lines.drain(first..last).collect();
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        title
+            .push(
+                Span::styled(
+                    format!(" keys {}–{}/{} · ", first + 1, last, lines.len()),
+                    bold,
+                ),
+                None,
+            )
+            .key(
+                "↑↓",
+                bold,
+                Span::styled(" scroll · ", bold),
+                &[press(KeyCode::Up), press(KeyCode::Down)],
+            );
+    }
+    title
+        .cap("?", bold, Some(ch('?')))
+        .push(Span::styled(" closes ", bold), Some(ch('?')));
+    let (shown, clicks): (Vec<Line>, Vec<_>) = lines.drain(first..last).unzip();
+    let block = dialog_block(f, app, rect, ACCENT, title);
     f.render_widget(Paragraph::new(shown).block(block), rect);
+    for (index, clicks) in clicks.iter().enumerate() {
+        place_line(app, rect, index, clicks);
+    }
 }
 
 // ---------------------------------------------------------------- version picker
@@ -3174,6 +3573,8 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         .sel
         .saturating_sub(height / 2)
         .min(picker.picks.len().saturating_sub(height));
+    // Line of each pick shown, and its index.
+    let mut shown = Vec::new();
     for (i, pick) in picker.picks.iter().enumerate().skip(start).take(height) {
         let installed = match pick {
             Pick::Current(_) => true,
@@ -3204,6 +3605,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        shown.push((lines.len(), i));
         lines.push(
             Line::from(vec![
                 Span::styled(if installed { "● " } else { "  " }, Style::default().fg(OK)),
@@ -3215,32 +3617,46 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         );
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "↵",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" pin   "),
-        Span::styled(
+    let mut hint = Hint::new(app.mouse());
+    hint.key("↵", key_style(), Span::raw(" pin   "), &[Click::Key(ENTER)])
+        .key(
             "Esc",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" close   "),
-        Span::styled(
-            "another version is installed first, with its preview",
-            muted(),
-        ),
-    ]));
+            key_style(),
+            Span::raw(" close   "),
+            &[Click::Key(ESC)],
+        )
+        .push(
+            Span::styled(
+                "another version is installed first, with its preview",
+                muted(),
+            ),
+            None,
+        );
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
     let rect = centered(area, 76, lines.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
+    let mut title = Hint::title(app.mouse(), None, Some(Click::Key(ESC)));
+    title.push(
+        Span::styled(
             format!(" Pin {} ", util::sanitize(&picker.name)),
             Style::default().add_modifier(Modifier::BOLD),
-        ));
+        ),
+        None,
+    );
+    let block = dialog_block(f, app, rect, ACCENT, title);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    let inner = rect.inner(Margin::new(1, 1));
+    for (index, i) in shown {
+        place_row(
+            app,
+            inner,
+            index,
+            1,
+            Click::Row(List::Picker, i, Some(ENTER)),
+        );
+    }
+    place_line(app, rect, hint_line, &hint_clicks);
 }
 
 // ---------------------------------------------------------------- leftovers
@@ -3330,8 +3746,7 @@ fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
     let Some(cleaner) = &app.cleaner else {
         return;
     };
-    let key =
-        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let key = key_style();
     let mut lines: Vec<Line> = Vec::new();
     if cleaner.loading {
         lines.push(Line::styled(
@@ -3350,6 +3765,8 @@ fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
         .sel
         .saturating_sub(height / 2)
         .min(cleaner.orphans.len().saturating_sub(height));
+    // Line of each leftover shown, and its index.
+    let mut shown = Vec::new();
     for (i, orphan) in cleaner.orphans.iter().enumerate().skip(start).take(height) {
         let chosen = cleaner.chosen.get(i).copied().unwrap_or(false);
         let style = if i == cleaner.sel {
@@ -3359,6 +3776,7 @@ fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        shown.push((lines.len(), i));
         lines.push(
             Line::from(vec![
                 Span::styled(
@@ -3374,30 +3792,50 @@ fn draw_cleaner(f: &mut Frame, app: &App, area: Rect) {
     }
     let count = cleaner.chosen.iter().filter(|c| **c).count();
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        key("Space"),
-        Span::raw(" select   "),
-        key("a"),
-        Span::raw(" all   "),
-        key("↵"),
-        Span::raw(if count == 0 {
-            " clean highlighted   ".to_string()
-        } else {
-            format!(" clean {count} selected   ")
-        }),
-        key("Esc"),
-        Span::raw(" close"),
-    ]));
+    let mut hint = Hint::new(app.mouse());
+    hint.key("Space", key, Span::raw(" select   "), &[ch(' ')])
+        .key("a", key, Span::raw(" all   "), &[ch('a')])
+        .key(
+            "↵",
+            key,
+            Span::raw(if count == 0 {
+                " clean highlighted   ".to_string()
+            } else {
+                format!(" clean {count} selected   ")
+            }),
+            &[Click::Key(ENTER)],
+        )
+        .key("Esc", key, Span::raw(" close"), &[Click::Key(ESC)]);
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
     let rect = centered(area, 86, lines.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
+    let mut title = Hint::title(app.mouse(), None, Some(Click::Key(ESC)));
+    title.push(
+        Span::styled(
             " Leftovers of removed plugins ",
             Style::default().add_modifier(Modifier::BOLD),
-        ));
+        ),
+        None,
+    );
+    let block = dialog_block(f, app, rect, ACCENT, title);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    let inner = rect.inner(Margin::new(1, 1));
+    for (index, i) in shown {
+        // Selected again, a row is cleaned (after its review); its box
+        // is checked or unchecked like Space does.
+        place_row(
+            app,
+            inner,
+            index,
+            1,
+            Click::Row(List::Cleaner, i, Some(ENTER)),
+        );
+        if i == cleaner.sel {
+            place_line(app, rect, index, &[(0, 3, ch(' '))]);
+        }
+    }
+    place_line(app, rect, hint_line, &hint_clicks);
 }
 
 // ---------------------------------------------------------------- task dialogs
@@ -3480,34 +3918,37 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
     } else {
         " show output"
     };
-    let mut hint = vec![
-        Span::styled(
-            "l",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(toggle, muted()),
-    ];
+    let mut hint = Hint::new(app.mouse());
+    hint.key("l", key_style(), Span::styled(toggle, muted()), &[ch('l')]);
     if task.done.is_some() {
-        hint.push(Span::styled("   any other key closes", muted()));
+        hint.push(Span::styled("   ", muted()), None)
+            .cap("any other key", muted(), Some(Click::Key(ESC)))
+            .push(Span::styled(" closes", muted()), Some(Click::Key(ESC)));
     }
-    lines.push(Line::from(hint));
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
     let rect = centered(area, width, lines.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(
+    // A running task cannot be closed; a finished one closes on any key.
+    let close = task.done.is_some().then_some(Click::Key(ESC));
+    let mut title = Hint::title(app.mouse(), None, close);
+    title.push(
+        Span::styled(
             format!(" {} ", util::sanitize(&task.title)),
             Style::default().add_modifier(Modifier::BOLD),
-        ));
+        ),
+        None,
+    );
+    let block = dialog_block(f, app, rect, color, title);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    place_line(app, rect, hint_line, &hint_clicks);
     if let Some(review) = &task.review {
-        draw_review(f, review, task.batch, area);
+        draw_review(f, app, review, task.batch, area);
     }
 }
 
 /// The trust preview of an operation, waiting for y/n.
-fn draw_review(f: &mut Frame, review: &Review, batch: bool, area: Rect) {
+fn draw_review(f: &mut Frame, app: &App, review: &Review, batch: bool, area: Rect) {
     let width: u16 = 100.min(area.width.saturating_sub(2));
     let inner = width.saturating_sub(2) as usize;
     let max_height = area.height.saturating_sub(2) as usize;
@@ -3524,34 +3965,136 @@ fn draw_review(f: &mut Frame, review: &Review, batch: bool, area: Rect) {
         util::sanitize(&review.question),
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    let key =
-        |k: &'static str| Span::styled(k, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    let mut hint = vec![
-        key("y"),
-        Span::raw(" yes   "),
-        key("n"),
+    let key = key_style();
+    let mut hint = Hint::new(app.mouse());
+    hint.key("y", key, Span::raw(" yes   "), &[ch('y')]).key(
+        "n",
+        key,
         Span::raw(" no   "),
-    ];
+        &[ch('n')],
+    );
     if batch {
-        hint.push(key("a"));
-        hint.push(Span::raw(" yes to all   "));
+        hint.key("a", key, Span::raw(" yes to all   "), &[ch('a')]);
     }
     if max_scroll > 0 {
-        hint.push(key("↑↓"));
-        hint.push(Span::styled(
-            format!(" scroll {}–{last}/{}", first + 1, review.lines.len()),
-            muted(),
-        ));
+        hint.key(
+            "↑↓",
+            key,
+            Span::styled(
+                format!(" scroll {}–{last}/{}", first + 1, review.lines.len()),
+                muted(),
+            ),
+            &[press(KeyCode::Up), press(KeyCode::Down)],
+        );
     }
-    lines.push(Line::from(hint));
+    let hint_line = lines.len();
+    let (line, hint_clicks) = hint.into_parts();
+    lines.push(line);
     let rect = centered(area, width, lines.len() as u16 + 2);
-    f.render_widget(Clear, rect);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(WARN))
-        .title(Span::styled(
+    // Esc answers no.
+    let mut title = Hint::title(app.mouse(), None, Some(Click::Key(ESC)));
+    title.push(
+        Span::styled(
             format!(" {} ", util::sanitize(&review.title)),
             Style::default().add_modifier(Modifier::BOLD),
-        ));
+        ),
+        None,
+    );
+    let block = dialog_block(f, app, rect, WARN, title);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    place_line(app, rect, hint_line, &hint_clicks);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn topmost_region_wins() {
+        let mut hits = Hits::new(true);
+        hits.add(Rect::new(0, 0, 20, 1), ch('a'));
+        hits.add(Rect::new(5, 0, 3, 1), ch('b'));
+        assert_eq!(hits.at(6, 0), Some(ch('b')));
+        assert_eq!(hits.at(4, 0), Some(ch('a')));
+        assert_eq!(hits.at(8, 0), Some(ch('a')));
+        assert_eq!(hits.at(6, 1), None);
+        assert_eq!(hits.at(25, 0), None);
+    }
+
+    #[test]
+    fn a_dialog_takes_the_clicks_of_what_it_covers() {
+        let mut hits = Hits::new(true);
+        // The footer and a list row under the dialog…
+        hits.add(Rect::new(0, 9, 40, 1), ch('u'));
+        hits.add(Rect::new(0, 2, 40, 1), Click::Row(List::Installed, 0, None));
+        // …then the dialog, drawn on top with one button.
+        hits.clear();
+        hits.add(Rect::new(10, 3, 1, 1), Click::Key(ESC));
+        assert_eq!(hits.at(0, 9), None);
+        assert_eq!(hits.at(0, 2), None);
+        assert_eq!(hits.at(10, 3), Some(Click::Key(ESC)));
+    }
+
+    #[test]
+    fn keyboard_only_registers_nothing() {
+        let mut hits = Hits::new(false);
+        hits.add(Rect::new(0, 0, 10, 1), ch('a'));
+        assert_eq!(hits.at(0, 0), None);
+
+        let mut hint = Hint::title(false, Some(Click::Key(ESC)), Some(Click::Key(QUIT)));
+        hint.key("u", key_style(), Span::raw(" update  "), &[ch('u')]);
+        let (line, clicks) = hint.into_parts();
+        assert!(clicks.is_empty());
+        // No buttons: just the hint.
+        assert_eq!(line.width(), "u update  ".len());
+    }
+
+    #[test]
+    fn hint_pieces_land_on_their_text() {
+        let mut hint = Hint::title(true, Some(Click::Key(ESC)), Some(Click::Key(QUIT)));
+        hint.push(Span::raw(" Title "), None);
+        hint.key("u", key_style(), Span::raw(" update  "), &[ch('u')])
+            .key(
+                "←→",
+                key_style(),
+                Span::raw(" page"),
+                &[press(KeyCode::Left), press(KeyCode::Right)],
+            );
+        let (_, clicks) = hint.into_parts();
+        let mut hits = Hits::new(true);
+        hits.place(&clicks, 10, 0, 100);
+        // " ← × Title u update  ←→ page"
+        assert_eq!(hits.at(11, 0), Some(Click::Key(ESC)));
+        assert_eq!(hits.at(12, 0), None);
+        assert_eq!(hits.at(13, 0), Some(Click::Key(QUIT)));
+        assert_eq!(hits.at(16, 0), None);
+        // `u` and its label, not the spaces after it.
+        for col in 21..29 {
+            assert_eq!(hits.at(col, 0), Some(ch('u')), "column {col}");
+        }
+        assert_eq!(hits.at(29, 0), None);
+        assert_eq!(hits.at(31, 0), Some(press(KeyCode::Left)));
+        assert_eq!(hits.at(32, 0), Some(press(KeyCode::Right)));
+        assert_eq!(hits.at(34, 0), None);
+    }
+
+    #[test]
+    fn regions_stop_at_the_right_edge() {
+        let mut hint = Hint::new(true);
+        hint.key(
+            "q",
+            key_style(),
+            Span::raw(" quit"),
+            &[Click::Keys(ESC, key('q'))],
+        );
+        let (_, clicks) = hint.into_parts();
+        let mut hits = Hits::new(true);
+        hits.place(&clicks, 0, 0, 3);
+        assert_eq!(hits.at(2, 0), Some(Click::Keys(ESC, key('q'))));
+        assert_eq!(hits.at(3, 0), None);
+    }
 }

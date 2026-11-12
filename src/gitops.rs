@@ -42,7 +42,7 @@ struct LocalOnly {
     reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Metadata {
     schema: u32,
@@ -57,6 +57,9 @@ struct Metadata {
 struct Snapshot {
     metadata: Metadata,
     files: BTreeMap<String, Vec<u8>>,
+    /// Whether `metadata.plugins`/`local_only` hold this machine's plugins.
+    /// False when `plugins.toml` is off here: the snapshot's entries are kept.
+    plugins_included: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,6 +90,11 @@ struct State {
     preserved_files: BTreeSet<String>,
     #[serde(default)]
     removed: BTreeSet<String>,
+    /// Plugins were left out of a capture/pull since the last successful
+    /// plugin sync, so the baseline's plugin part no longer describes this
+    /// machine: once back on, plugins follow first-sync rules until a pull.
+    #[serde(default)]
+    plugins_off: bool,
 }
 
 struct Session {
@@ -668,8 +676,49 @@ impl Session {
         .ok()
     }
 
-    fn capture(&mut self, snapshot: &Snapshot) -> Result<Metadata> {
+    /// The committed `plugins.toml` at HEAD: the snapshot last pulled or pushed.
+    fn head_metadata(&self, git: Git) -> Result<Option<Vec<u8>>> {
+        let Some(head) = self.head(git) else {
+            return Ok(None);
+        };
+        let tree = tree(git, self.git_directory(), &head)?;
+        let Some(value) = tree.get("plugins.toml") else {
+            return Ok(None);
+        };
+        configuration_blob(git, self.git_directory(), value, "plugins.toml").map(Some)
+    }
+
+    fn capture(&mut self, git: Git, snapshot: &Snapshot) -> Result<Metadata> {
+        let previous = if snapshot.plugins_included {
+            None
+        } else {
+            self.head_metadata(git)?
+        };
+        self.write_snapshot(snapshot, previous.as_deref())
+    }
+
+    /// `previous` is the committed `plugins.toml`, consulted only when this
+    /// machine's plugins are not included: its plugin entries are kept, and
+    /// its exact bytes when nothing else changed. Without one, no entries
+    /// are written; push refuses to publish that over an existing remote.
+    fn write_snapshot(&mut self, snapshot: &Snapshot, previous: Option<&[u8]>) -> Result<Metadata> {
         let mut metadata = snapshot.metadata.clone();
+        let previous = match previous {
+            Some(bytes) if !snapshot.plugins_included => {
+                let parsed = parse_metadata(bytes)?;
+                metadata.plugins = parsed.plugins.clone();
+                metadata.local_only = parsed.local_only.clone();
+                Some((bytes, parsed))
+            }
+            _ => {
+                if !snapshot.plugins_included {
+                    // Never publish this machine's plugins while off.
+                    metadata.plugins.clear();
+                    metadata.local_only.clear();
+                }
+                None
+            }
+        };
         let mut files: BTreeSet<String> = metadata.files.iter().cloned().collect();
         files.extend(self.state.preserved_files.iter().cloned());
         let mut portable = BTreeSet::new();
@@ -679,7 +728,10 @@ impl Session {
             }
         }
         metadata.files = files.into_iter().collect();
-        let encoded = toml::to_string_pretty(&metadata)?.into_bytes();
+        let encoded = match previous {
+            Some((bytes, parsed)) if parsed == metadata => bytes.to_vec(),
+            _ => toml::to_string_pretty(&metadata)?.into_bytes(),
+        };
         let retained: BTreeSet<&str> = self
             .state
             .preserved_files
@@ -740,6 +792,7 @@ impl Session {
         self.state
             .removed
             .retain(|path| !desired.contains_key(path.as_str()));
+        self.state.plugins_off |= !snapshot.plugins_included;
         self.save()?;
         Ok(metadata)
     }
@@ -816,7 +869,13 @@ fn remove_file(path: &Path) -> Result<()> {
 fn collect(herdr: &Herdr, config: &Config) -> Result<Snapshot> {
     let mut plugins = Vec::new();
     let mut local_only = Vec::new();
-    for row in ops::rows(herdr)? {
+    // With `plugins.toml` off, this machine's plugins are not even read.
+    let rows = if config.backup.plugins {
+        ops::rows(herdr)?
+    } else {
+        Vec::new()
+    };
+    for row in rows {
         let id = row.plugin.plugin_id.clone();
         plugin_id(&id)?;
         let Some((url, _)) = row.remote() else {
@@ -892,23 +951,12 @@ fn collect(herdr: &Herdr, config: &Config) -> Result<Snapshot> {
             local_only,
         },
         files,
+        plugins_included: config.backup.plugins,
     })
 }
 
 fn summary(snapshot: &Snapshot) -> Summary {
-    Summary {
-        plugins: snapshot
-            .metadata
-            .plugins
-            .iter()
-            .map(|plugin| (plugin.id.clone(), plugin.clone()))
-            .collect(),
-        local_only: snapshot
-            .metadata
-            .local_only
-            .iter()
-            .map(|plugin| (plugin.id.clone(), plugin.reason.clone()))
-            .collect(),
+    let mut result = Summary {
         files: snapshot
             .metadata
             .files
@@ -924,7 +972,23 @@ fn summary(snapshot: &Snapshot) -> Summary {
                 )
             })
             .collect(),
-    }
+        ..Summary::default()
+    };
+    plugin_summary(&mut result, &snapshot.metadata);
+    result
+}
+
+fn plugin_summary(summary: &mut Summary, metadata: &Metadata) {
+    summary.plugins = metadata
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.id.clone(), plugin.clone()))
+        .collect();
+    summary.local_only = metadata
+        .local_only
+        .iter()
+        .map(|plugin| (plugin.id.clone(), plugin.reason.clone()))
+        .collect();
 }
 
 fn validate_plugin(plugin: &PluginState) -> Result<()> {
@@ -969,7 +1033,7 @@ pub fn capture(herdr: &Herdr, config: &Config) -> Result<()> {
     let mut session = Session::open(config)?;
     let snapshot = collect(herdr, config)?;
     session.initialize(Git::BACKGROUND, &config.backup.branch)?;
-    session.capture(&snapshot).map(|_| ())
+    session.capture(Git::BACKGROUND, &snapshot).map(|_| ())
 }
 
 fn operation_git(ctx: &Ctx) -> Git {
@@ -1019,6 +1083,14 @@ fn unsupported_lines(snapshot: &Snapshot, lines: &mut Vec<String>) {
     }
 }
 
+fn plugin_scope_line(snapshot: &Snapshot) -> String {
+    if snapshot.plugins_included {
+        "  plugin state: included (plugins.toml on: sources, versions, enabled, auto-update)".into()
+    } else {
+        "  plugin state: NOT included (plugins.toml off on this machine); the snapshot's plugin entries are kept unchanged".into()
+    }
+}
+
 /// Capture and review a real Git commit, then perform a normal fast-forward push.
 pub fn push(ctx: &Ctx) -> Result<()> {
     let remote = remote(&ctx.config)?;
@@ -1028,13 +1100,21 @@ pub fn push(ctx: &Ctx) -> Result<()> {
     session.branch(git, &ctx.config.backup.branch)?;
     let snapshot = collect(&ctx.herdr, &ctx.config)?;
     push_preflight(git, &session, remote, &ctx.config.backup.branch)?;
+    if snapshot.plugins_included && session.state.plugins_off && session.head(git).is_some() {
+        bail!("plugins.toml was turned back on after this machine skipped plugin sync, so its plugins were never reconciled with the snapshot. Run `herdr-pm pull` first (as on a first sync: differing plugins stop the pull, missing ones are installed after review, extra local ones are kept), then run `herdr-pm push` again. No local commit was created");
+    }
     if ctx.dry_run {
         let mut lines = vec![
-            format!(
-                "  capture {} reproducible plugins and {} selected files",
-                snapshot.metadata.plugins.len(),
-                snapshot.files.len()
-            ),
+            if snapshot.plugins_included {
+                format!(
+                    "  capture {} reproducible plugins and {} selected files",
+                    snapshot.metadata.plugins.len(),
+                    snapshot.files.len()
+                )
+            } else {
+                format!("  capture {} selected files", snapshot.files.len())
+            },
+            plugin_scope_line(&snapshot),
             format!(
                 "  push to {} ({})",
                 util::sanitize(remote),
@@ -1045,7 +1125,7 @@ pub fn push(ctx: &Ctx) -> Result<()> {
         approval(ctx, "GitOps push (dry run)", &lines, "Push this snapshot?")?;
         return Ok(());
     }
-    let captured_metadata = session.capture(&snapshot)?;
+    let captured_metadata = session.capture(git, &snapshot)?;
     // Never absorb a user's staged files into a snapshot commit.
     let staged = git.run(
         Some(&session.directory),
@@ -1100,6 +1180,7 @@ pub fn push(ctx: &Ctx) -> Result<()> {
         format!("  repository {}", session.directory.display()),
         format!("  remote {}", util::sanitize(remote)),
         format!("  branch {}", ctx.config.backup.branch),
+        plugin_scope_line(&snapshot),
     ];
     lines.extend(diff.lines().map(util::sanitize));
     lines.extend(patch.lines().map(util::sanitize));
@@ -1159,17 +1240,25 @@ pub fn push(ctx: &Ctx) -> Result<()> {
     ctx.report.step("pushing snapshot (fast-forward only)");
     git.run(Some(&session.directory), &["push", "--", remote, &refspec], true)
         .with_context(|| format!("snapshot push failed; the local commit is retained in {}. If the remote advanced during review, resolve the Git history manually in this backup repository before retrying; pull will not merge divergent commits. No force push was attempted", session.directory.display()))?;
+    let mut synced = summary(&snapshot);
+    if !snapshot.plugins_included {
+        // Not published from here: the baseline holds the snapshot's plugins.
+        plugin_summary(&mut synced, &captured_metadata);
+    }
     session.state.baseline = Some(Baseline {
         remote: remote.into(),
         branch: ctx.config.backup.branch.clone(),
         commit,
-        summary: summary(&snapshot),
+        summary: synced,
     });
     session
         .state
         .preserved_files
         .extend(captured_metadata.files);
     session.state.removed.clear();
+    // Refused above while re-enabled with history, so a plugin push here
+    // published this machine's plugins as the first to sync them.
+    session.state.plugins_off = !snapshot.plugins_included;
     session.save()?;
     ctx.report.line("Snapshot pushed. Only explicitly selected configuration files were included; local-only plugin code was not backed up.");
     Ok(())
@@ -1404,26 +1493,7 @@ fn load_snapshot(git: Git, directory: &Path, tree: &Tree) -> Result<Snapshot> {
         bail!("plugins.toml must be a non-executable regular file");
     }
     let bytes = configuration_blob(git, directory, metadata_blob, "plugins.toml")?;
-    let metadata: Metadata = toml::from_str(std::str::from_utf8(&bytes)?)?;
-    if metadata.schema != SCHEMA {
-        bail!(
-            "unsupported plugins.toml schema {}; expected {SCHEMA}",
-            metadata.schema
-        );
-    }
-    let mut ids = BTreeSet::new();
-    for plugin in &metadata.plugins {
-        validate_plugin(plugin)?;
-        if !ids.insert(plugin.id.clone()) {
-            bail!("duplicate plugin id {}", plugin.id);
-        }
-    }
-    for plugin in &metadata.local_only {
-        plugin_id(&plugin.id)?;
-        if !ids.insert(plugin.id.clone()) {
-            bail!("duplicate local-only plugin id {}", plugin.id);
-        }
-    }
+    let metadata = parse_metadata(&bytes)?;
     let mut selections = BTreeSet::new();
     let mut casefold = BTreeSet::new();
     let mut files = BTreeMap::new();
@@ -1457,7 +1527,36 @@ fn load_snapshot(git: Git, directory: &Path, tree: &Tree) -> Result<Snapshot> {
             }
         }
     }
-    Ok(Snapshot { metadata, files })
+    Ok(Snapshot {
+        metadata,
+        files,
+        plugins_included: true,
+    })
+}
+
+/// Parse and validate `plugins.toml` metadata (files are checked by callers).
+fn parse_metadata(bytes: &[u8]) -> Result<Metadata> {
+    let metadata: Metadata = toml::from_str(std::str::from_utf8(bytes)?)?;
+    if metadata.schema != SCHEMA {
+        bail!(
+            "unsupported plugins.toml schema {}; expected {SCHEMA}",
+            metadata.schema
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for plugin in &metadata.plugins {
+        validate_plugin(plugin)?;
+        if !ids.insert(plugin.id.clone()) {
+            bail!("duplicate plugin id {}", plugin.id);
+        }
+    }
+    for plugin in &metadata.local_only {
+        plugin_id(&plugin.id)?;
+        if !ids.insert(plugin.id.clone()) {
+            bail!("duplicate local-only plugin id {}", plugin.id);
+        }
+    }
+    Ok(metadata)
 }
 
 /// How one plugin or selected file is reconciled from its state at the last
@@ -1533,12 +1632,22 @@ fn kept(base: bool, local: bool) -> &'static str {
     }
 }
 
-/// Three-way reconciliation of this machine (`local`) with the fetched
-/// snapshot (`remote`) against the last sync. Without a baseline (first
-/// pull) everything counts as new on both sides, and a selected local file
-/// that differs from the remote conflicts instead of being kept.
-fn reconcile(local: &Summary, baseline: Option<&Summary>, remote: &Summary) -> Plan {
-    let mut plan = Plan::default();
+/// How plugins take part in a pull on this machine.
+#[derive(Clone, Copy)]
+enum Plugins<'a> {
+    /// `plugins.toml` off here: nothing installed, updated or uninstalled.
+    Off,
+    /// Three-way against this plugin baseline; `None` means first-sync rules.
+    Sync(Option<&'a Summary>),
+}
+
+/// The plugin part of `reconcile`.
+fn reconcile_plugins(
+    plan: &mut Plan,
+    local: &Summary,
+    baseline: Option<&Summary>,
+    remote: &Summary,
+) {
     let empty = Summary::default();
     let base = baseline.unwrap_or(&empty);
     let ids: BTreeSet<&String> = base
@@ -1612,6 +1721,30 @@ fn reconcile(local: &Summary, baseline: Option<&Summary>, remote: &Summary) -> P
             }),
         }
     }
+}
+
+/// Three-way reconciliation of this machine (`local`) with the fetched
+/// snapshot (`remote`) against the last sync. Without a baseline (first
+/// pull) everything counts as new on both sides, and a selected local file
+/// that differs from the remote conflicts instead of being kept. Plugins
+/// use their own baseline, which is absent after `plugins.toml` was off.
+fn reconcile(
+    local: &Summary,
+    baseline: Option<&Summary>,
+    remote: &Summary,
+    plugins: Plugins,
+) -> Plan {
+    let mut plan = Plan::default();
+    match plugins {
+        Plugins::Off => plan.lines.push(
+            "  plugins not synchronized on this machine (plugins.toml off): none installed, updated or uninstalled".into(),
+        ),
+        Plugins::Sync(plugin_baseline) => {
+            reconcile_plugins(&mut plan, local, plugin_baseline, remote)
+        }
+    }
+    let empty = Summary::default();
+    let base = baseline.unwrap_or(&empty);
     for (path, current) in &local.files {
         let Some(incoming) = remote.files.get(path) else {
             // An unselected remote path is not a deletion instruction.
@@ -1752,10 +1885,20 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
         "backup Git worktree/index has changes not generated by capture",
         worktree_conflicts(git, &session)?,
     )?;
+    let baseline_summary = baseline.map(|baseline| &baseline.summary);
+    let plugins = if !ctx.config.backup.plugins {
+        Plugins::Off
+    } else if session.state.plugins_off {
+        // Plugins skipped since the baseline: reconcile them as a first sync.
+        Plugins::Sync(None)
+    } else {
+        Plugins::Sync(baseline_summary)
+    };
     let plan = reconcile(
         &local_summary,
-        baseline.map(|baseline| &baseline.summary),
+        baseline_summary,
         &summary(&incoming),
+        plugins,
     );
     if !plan.conflicts.is_empty() {
         bail!("GitOps conflict: changed differently on this machine and in the remote snapshot\n  {}\nNothing was installed, removed or written. For each item, make this machine match the remote version, or restore it to its state at the last sync so the remote version is taken, then pull again. To publish your own version instead, pull that way, re-apply your change, then push. No automatic merge or overwrite is performed.", plan.conflicts.join("\n  "));
@@ -1832,7 +1975,9 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     if plan.install.is_empty() && plan.uninstall.is_empty() && apply.is_empty() {
         lines.push("  nothing to take from the remote snapshot".into());
     }
-    unsupported_lines(&incoming, &mut lines);
+    if ctx.config.backup.plugins {
+        unsupported_lines(&incoming, &mut lines);
+    }
     // All manifests are reviewed up front, not only after preceding plugins
     // have already changed. install_git retains its own authoritative review.
     for plugin in &plan.install {
@@ -2032,10 +2177,12 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
         commit,
         summary: summary(&incoming),
     });
+    // Plugins were reconciled by this pull unless plugins.toml is off here.
+    session.state.plugins_off = !ctx.config.backup.plugins;
     session.save()?;
     // Re-capture so local changes kept by this pull become capture-generated
     // snapshot changes, which the next push publishes as a fast-forward.
-    session.capture(&collect(&ctx.herdr, &refreshed_config)?)?;
+    session.capture(git, &collect(&ctx.herdr, &refreshed_config)?)?;
     ctx.report.line("Snapshot applied. Unrelated plugins were kept; backup settings and log_dir remained machine-local.");
     ctx.report.line("CLI/skill links were refreshed for new invocations. Existing plugin processes, open shell PATH values and already-loaded agent contexts are not restarted or rewritten.");
     Ok(())
@@ -2308,7 +2455,12 @@ mod tests {
             "herdr/config.toml".into(),
             Some(digest(b"theme = 'remote'\n")),
         );
-        let plan = reconcile(&local, Some(&baseline), &remote);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
         assert_eq!(plan.files, vec!["herdr/config.toml".to_owned()]);
         assert!(plan.install.is_empty() && plan.uninstall.is_empty());
@@ -2326,14 +2478,25 @@ mod tests {
         remote_plugin.commit = "b".repeat(40);
         remote.plugins = plugins(&[remote_plugin.clone()]);
         assert_eq!(
-            reconcile(&local, Some(&baseline), &remote).install,
+            reconcile(
+                &local,
+                Some(&baseline),
+                &remote,
+                Plugins::Sync(Some(&baseline))
+            )
+            .install,
             vec![remote_plugin]
         );
         let mut local_plugin = value.clone();
         local_plugin.enabled = false;
         local.plugins = plugins(&[local_plugin]);
         remote.plugins = baseline.plugins.clone();
-        let plan = reconcile(&local, Some(&baseline), &remote);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty() && plan.install.is_empty());
         assert!(plan
             .lines
@@ -2361,7 +2524,12 @@ mod tests {
             Some(digest(b"theme = 'remote'\n")),
         );
         remote.plugins.get_mut(&value.id).unwrap().enabled = false;
-        let plan = reconcile(&local, Some(&baseline), &remote);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert_eq!(plan.conflicts.len(), 2);
         assert!(plan
             .conflicts
@@ -2372,7 +2540,12 @@ mod tests {
             .iter()
             .any(|conflict| conflict.contains("test.plugin")));
         // The same change made on both sides is no conflict.
-        let plan = reconcile(&local, Some(&baseline), &local);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &local,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty() && plan.files.is_empty() && plan.install.is_empty());
     }
 
@@ -2389,7 +2562,12 @@ mod tests {
             files: files(&[(path, None)]),
             ..Summary::default()
         };
-        let plan = reconcile(&baseline, Some(&baseline), &remote);
+        let plan = reconcile(
+            &baseline,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.uninstall, vec![value.id.clone()]);
         assert_eq!(plan.files, vec![path.to_owned()]);
@@ -2405,18 +2583,33 @@ mod tests {
         let mut local = baseline.clone();
         local.plugins.get_mut(&value.id).unwrap().auto_update = true;
         local.files.insert(path.into(), Some(digest(b"a = 2\n")));
-        let plan = reconcile(&local, Some(&baseline), &remote);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert_eq!(plan.conflicts.len(), 2);
         // A remote local-only entry is not an instruction to uninstall.
         let remote = Summary {
             local_only: BTreeMap::from([(value.id.clone(), "local developer link".into())]),
             ..remote
         };
-        assert!(reconcile(&baseline, Some(&baseline), &remote)
-            .uninstall
-            .is_empty());
+        assert!(reconcile(
+            &baseline,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline))
+        )
+        .uninstall
+        .is_empty());
         // A path no longer selected remotely is not a deletion instruction.
-        let plan = reconcile(&baseline, Some(&baseline), &Summary::default());
+        let plan = reconcile(
+            &baseline,
+            Some(&baseline),
+            &Summary::default(),
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.files.is_empty());
     }
 
@@ -2430,7 +2623,12 @@ mod tests {
             files: files(&[(path, Some("theme = 'same'\n"))]),
             ..Summary::default()
         };
-        let plan = reconcile(&added, Some(&baseline), &added);
+        let plan = reconcile(
+            &added,
+            Some(&baseline),
+            &added,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty() && plan.install.is_empty() && plan.files.is_empty());
         let mut other = added.clone();
         other.plugins.get_mut(&value.id).unwrap().commit = "b".repeat(40);
@@ -2438,7 +2636,14 @@ mod tests {
             .files
             .insert(path.into(), Some(digest(b"theme = 'other'\n")));
         assert_eq!(
-            reconcile(&added, Some(&baseline), &other).conflicts.len(),
+            reconcile(
+                &added,
+                Some(&baseline),
+                &other,
+                Plugins::Sync(Some(&baseline))
+            )
+            .conflicts
+            .len(),
             2
         );
         // Added on one side only: kept locally, or taken from the remote.
@@ -2446,7 +2651,12 @@ mod tests {
             files: files(&[(path, None)]),
             ..Summary::default()
         };
-        let plan = reconcile(&added, Some(&baseline), &remote);
+        let plan = reconcile(
+            &added,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert!(plan.conflicts.is_empty() && plan.install.is_empty() && plan.files.is_empty());
         assert!(plan
             .lines
@@ -2456,7 +2666,12 @@ mod tests {
             files: files(&[(path, None)]),
             ..Summary::default()
         };
-        let plan = reconcile(&local, Some(&baseline), &added);
+        let plan = reconcile(
+            &local,
+            Some(&baseline),
+            &added,
+            Plugins::Sync(Some(&baseline)),
+        );
         assert_eq!(plan.install, vec![value]);
         assert_eq!(plan.files, vec![path.to_owned()]);
     }
@@ -2490,7 +2705,7 @@ mod tests {
             ..Summary::default()
         };
         for baseline in [None, Some(&local), Some(&remote)] {
-            let plan = reconcile(&local, baseline, &remote);
+            let plan = reconcile(&local, baseline, &remote, Plugins::Sync(baseline));
             assert!(plan.install.is_empty());
             assert!(plan.conflicts.iter().any(
                 |conflict| conflict.contains("local-only link") && conflict.contains(&value.id)
@@ -2588,8 +2803,9 @@ mod tests {
                 local_only: vec![],
             },
             files: BTreeMap::new(),
+            plugins_included: true,
         };
-        let metadata = session.capture(&snapshot).unwrap();
+        let metadata = session.write_snapshot(&snapshot, None).unwrap();
         assert!(metadata.files.iter().any(|selected| selected == path));
         assert_eq!(
             fs::read(session.directory.join(path)).unwrap().as_slice(),
@@ -2599,9 +2815,153 @@ mod tests {
         // Selecting an absent live file explicitly authorizes its deletion;
         // merely omitting it from this machine's allowlist did not.
         snapshot.metadata.files.push(path.into());
-        session.capture(&snapshot).unwrap();
+        session.write_snapshot(&snapshot, None).unwrap();
         assert!(!session.directory.join(path).exists());
         assert!(session.state.removed.contains(path));
+    }
+
+    #[test]
+    fn capture_with_plugins_off_keeps_the_snapshot_plugin_entries() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = trusted_root(&std::env::temp_dir()).unwrap().join(format!(
+            "herdr-pm-plugins-off-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let scratch = PreviewRepo { directory };
+        let mut session = Session {
+            _lock: None,
+            directory: scratch.directory.join("snapshot"),
+            state_path: scratch.directory.join("state.json"),
+            state: State::default(),
+            preview: None,
+        };
+        // Committed by another machine, in a layout this one would not write.
+        let committed = format!(
+            "schema = 1\n# published elsewhere\n\n[[plugins]]\nid = \"test.plugin\"\nurl = \"https://example.org/plugin.git\"\ncommit = \"{}\"\nversion = \"1.0.0\"\nfollow_ref = \"main\"\nenabled = true\nauto_update = false\n\n[[local_only]]\nid = \"dev.link\"\nreason = \"local developer link\"\n",
+            "a".repeat(40)
+        );
+        let remote = parse_metadata(committed.as_bytes()).unwrap();
+        // This machine's own plugins are never published while off.
+        let mut own = plugin();
+        own.id = "own.plugin".into();
+        let mut snapshot = Snapshot {
+            metadata: Metadata {
+                schema: SCHEMA,
+                files: vec![],
+                plugins: vec![own],
+                local_only: vec![],
+            },
+            files: BTreeMap::new(),
+            plugins_included: false,
+        };
+        let metadata = session
+            .write_snapshot(&snapshot, Some(committed.as_bytes()))
+            .unwrap();
+        assert_eq!(metadata.plugins, remote.plugins);
+        assert_eq!(metadata.local_only, remote.local_only);
+        assert_eq!(
+            fs::read(session.directory.join("plugins.toml")).unwrap(),
+            committed.as_bytes()
+        );
+        assert!(session.state.plugins_off);
+        // A changed file selection rewrites plugins.toml with the same entries.
+        let path = "herdr/config.toml";
+        snapshot.metadata.files.push(path.into());
+        snapshot
+            .files
+            .insert(path.into(), b"theme = 'local'\n".to_vec());
+        session
+            .write_snapshot(&snapshot, Some(committed.as_bytes()))
+            .unwrap();
+        let written =
+            parse_metadata(&fs::read(session.directory.join("plugins.toml")).unwrap()).unwrap();
+        assert_eq!(written.plugins, remote.plugins);
+        assert_eq!(written.local_only, remote.local_only);
+        assert_eq!(written.files, vec![path.to_owned()]);
+        // Without a previous snapshot no plugin entries are written.
+        let metadata = session.write_snapshot(&snapshot, None).unwrap();
+        assert!(metadata.plugins.is_empty() && metadata.local_only.is_empty());
+    }
+
+    #[test]
+    fn pull_with_plugins_off_plans_no_plugin_changes() {
+        let value = plugin();
+        let path = "herdr/config.toml";
+        let baseline = Summary {
+            plugins: plugins(std::slice::from_ref(&value)),
+            files: files(&[(path, Some("theme = 'old'\n"))]),
+            ..Summary::default()
+        };
+        // Off: this machine's plugins are not collected at all.
+        let local = Summary {
+            files: baseline.files.clone(),
+            ..Summary::default()
+        };
+        let mut added = plugin();
+        added.id = "added.plugin".into();
+        let mut changed = value.clone();
+        changed.commit = "b".repeat(40);
+        for remote_plugins in [vec![], vec![added.clone()], vec![changed, added]] {
+            let remote = Summary {
+                plugins: plugins(&remote_plugins),
+                files: files(&[(path, Some("theme = 'remote'\n"))]),
+                ..Summary::default()
+            };
+            let plan = reconcile(&local, Some(&baseline), &remote, Plugins::Off);
+            assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+            assert!(plan.install.is_empty() && plan.uninstall.is_empty());
+            assert_eq!(plan.files, vec![path.to_owned()]);
+            assert_eq!(
+                plan.lines
+                    .iter()
+                    .filter(|line| line.contains("plugin"))
+                    .collect::<Vec<_>>(),
+                vec!["  plugins not synchronized on this machine (plugins.toml off): none installed, updated or uninstalled"]
+            );
+        }
+    }
+
+    #[test]
+    fn plugins_turned_back_on_follow_first_sync_rules() {
+        let value = plugin();
+        let mut missing = plugin();
+        missing.id = "missing.plugin".into();
+        let mut extra = plugin();
+        extra.id = "extra.plugin".into();
+        // The baseline holds the remote plugins seen while off.
+        let remote = Summary {
+            plugins: plugins(&[value.clone(), missing.clone()]),
+            ..Summary::default()
+        };
+        let baseline = remote.clone();
+        let mut differing = value.clone();
+        differing.enabled = false;
+        let local = Summary {
+            plugins: plugins(&[differing, extra]),
+            ..Summary::default()
+        };
+        // A stale baseline would silently keep the difference and publish
+        // the missing plugin's removal on the next push.
+        let stale = reconcile(
+            &local,
+            Some(&baseline),
+            &remote,
+            Plugins::Sync(Some(&baseline)),
+        );
+        assert!(stale.conflicts.is_empty() && stale.install.is_empty());
+        let plan = reconcile(&local, Some(&baseline), &remote, Plugins::Sync(None));
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].contains("existing plugin test.plugin differs from remote"));
+        assert_eq!(plan.install, vec![missing]);
+        assert!(plan.uninstall.is_empty());
+        assert!(plan
+            .lines
+            .iter()
+            .any(|line| line.contains("keep unrelated local plugin extra.plugin")));
     }
 
     #[cfg(unix)]
@@ -2688,6 +3048,7 @@ mod tests {
                 "manager/config.toml".into(),
                 portable_manager(b"[backup]\nenabled = false\n").unwrap(),
             )]),
+            plugins_included: true,
         };
         let incoming = Snapshot {
             metadata: Metadata {
@@ -2697,15 +3058,27 @@ mod tests {
                 local_only: vec![],
             },
             files: BTreeMap::from([("manager/config.toml".into(), b"icons = false\n".to_vec())]),
+            plugins_included: true,
         };
-        let plan = reconcile(&summary(&local), None, &summary(&incoming));
+        let plan = reconcile(
+            &summary(&local),
+            None,
+            &summary(&incoming),
+            Plugins::Sync(None),
+        );
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.files, vec!["manager/config.toml".to_owned()]);
         let mut local = local;
         local
             .files
             .insert("herdr/config.toml".into(), b"theme = 'local'\n".to_vec());
-        let conflicts = reconcile(&summary(&local), None, &summary(&incoming)).conflicts;
+        let conflicts = reconcile(
+            &summary(&local),
+            None,
+            &summary(&incoming),
+            Plugins::Sync(None),
+        )
+        .conflicts;
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].contains("herdr/config.toml"));
     }

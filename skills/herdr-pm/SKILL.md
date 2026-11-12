@@ -54,7 +54,9 @@ There are no export/import commands.
 Set up `[backup]` through Settings (`C`): remote, branch, and
 exact plaintext file approvals (empty by default). Its enabled worker captures
 local changes every two seconds; it never commits or pushes automatically.
-`plugins.toml` records source/commit/ref/version/pin/enabled/auto-update.
+`plugins.toml` records source/commit/ref/version/pin/enabled/auto-update;
+`backup.plugins = false` (Settings: `plugins.toml` off) stops a machine from
+publishing or applying plugins while its approved files still sync.
 Only locally approved config files are applied. `[backup]` and `log_dir` stay
 machine-local; local-only code, binaries, caches, logs and sessions are not backed up.
 A failing worker shows a `problem` line in the Backup section of Settings.

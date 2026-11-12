@@ -36,6 +36,8 @@ pub enum Field {
     BackupEnabled,
     BackupRemote,
     BackupBranch,
+    /// Whether `plugins.toml`'s plugin list is backed up and applied here.
+    BackupPlugins,
     BackupFile(String),
     BackupError,
     /// What keeps automatic backup from working; shown only then.
@@ -76,6 +78,7 @@ impl Field {
             | Field::GithubViaGit
             | Field::Icons
             | Field::BackupEnabled
+            | Field::BackupPlugins
             | Field::BackupFile(_)
             | Field::Market(_)
             | Field::CliOnPath
@@ -405,6 +408,16 @@ pub fn rows(
             Field::BackupProblem,
         ));
     }
+    rows.push(row(
+        "Backup approvals (plaintext files off by default)",
+        "plugins.toml",
+        if config.backup.plugins {
+            "on: plugin sources, versions, enabled, auto-update".to_string()
+        } else {
+            "off: plugins are neither published nor applied here".to_string()
+        },
+        Field::BackupPlugins,
+    ));
     match candidates {
         Ok(candidates) => {
             let mut files: Vec<&String> = candidates.iter().chain(&config.backup.files).collect();
@@ -414,7 +427,7 @@ pub fn rows(
                 let selected = config.backup.files.contains(file);
                 let available = candidates.contains(file);
                 rows.push(row(
-                    "Plaintext file approvals (empty by default)",
+                    "Backup approvals (plaintext files off by default)",
                     file,
                     format!(
                         "{}{}",
@@ -431,14 +444,14 @@ pub fn rows(
         }
         Err(err) => {
             rows.push(row(
-                "Plaintext file approvals (empty by default)",
+                "Backup approvals (plaintext files off by default)",
                 "files unavailable",
                 err.to_string(),
                 Field::BackupError,
             ));
             for file in &config.backup.files {
                 rows.push(row(
-                    "Plaintext file approvals (empty by default)",
+                    "Backup approvals (plaintext files off by default)",
                     file,
                     "on (listing unavailable; may revoke)".into(),
                     Field::BackupFile(file.clone()),
@@ -621,6 +634,16 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
                 _ => {}
             }
         }
+        Field::BackupPlugins => match action {
+            // The default (on) is the absence of the key.
+            Action::Delete => {
+                table(&mut doc, "backup")?.remove("plugins");
+            }
+            _ => put(
+                &mut table(&mut doc, "backup")?["plugins"],
+                flag(action, config.backup.plugins),
+            ),
+        },
         Field::BackupFile(file) => {
             let mut files = config.backup.files.clone();
             let selected = files.contains(file);
@@ -807,6 +830,31 @@ mod tests {
             Action::Delete,
         );
         assert!(Config::parse(&text).unwrap().backup.files.is_empty());
+    }
+
+    #[test]
+    fn plugin_list_backup_is_on_by_default_and_toggles_like_file_approvals() {
+        let value = |text: &str| {
+            let config = Config::parse(text).unwrap();
+            let rows = rows(&config, &[], Ok(&[]), None);
+            let first = rows
+                .iter()
+                .position(|row| row.section.starts_with("Backup approvals"))
+                .unwrap();
+            assert_eq!(rows[first].field, Field::BackupPlugins);
+            assert_eq!(rows[first].label, "plugins.toml");
+            rows[first].value.clone()
+        };
+        assert!(value("").starts_with("on: plugin sources, versions, enabled, auto-update"));
+        let text = apply("", Field::BackupPlugins, Action::Next);
+        assert!(!Config::parse(&text).unwrap().backup.plugins);
+        assert!(value(&text).starts_with("off"));
+        let text = apply(&text, Field::BackupPlugins, Action::Next);
+        assert!(Config::parse(&text).unwrap().backup.plugins);
+        let off = apply(&text, Field::BackupPlugins, Action::Set("false".into()));
+        let reset = apply(&off, Field::BackupPlugins, Action::Delete);
+        assert!(Config::parse(&reset).unwrap().backup.plugins);
+        assert!(!reset.contains("plugins ="));
     }
 
     #[test]

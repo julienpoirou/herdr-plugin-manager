@@ -456,6 +456,7 @@ editor = "code --wait"  # for E (VISUAL, EDITOR, then vi/notepad otherwise)
 [backup]
 enabled = false        # opt-in continuous LOCAL snapshots; no automatic push
 branch = "main"
+plugins = true         # publish/apply the plugin list (plugins.toml)
 files = []             # exact plaintext approvals, selected in Settings
 # remote = "ssh://git@git.example/my-herdr.git"
 
@@ -561,6 +562,15 @@ notices. Each reproducible plugin records its source URL, subdirectory,
 exact commit, displayed version, followed ref, optional pin, enabled state
 and auto-update flag. Local hand-linked code is reported as local-only;
 it is never silently presented as a portable code backup.
+
+The plugin list can be turned off per machine (`plugins.toml` at the top of
+the Backup approvals in Settings, or `plugins = false`). That machine then
+neither publishes nor applies plugins: its pushes keep the plugin entries
+already in the snapshot unchanged, and its pulls install, update and
+uninstall nothing, while approved files still sync. Turning it back on makes
+the next pull reconcile plugins like a first sync (a differing installed
+plugin is a conflict, missing ones are installed after review, extra local
+ones are kept); push refuses until that pull has run.
 
 The worker updates only the local snapshot. **It never commits or contacts a
 remote.** Push shows a diff, stages only snapshot-owned paths, commits using

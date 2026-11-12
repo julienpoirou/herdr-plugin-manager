@@ -288,6 +288,9 @@ pub struct Backup {
     pub remote: Option<String>,
     pub branch: String,
     pub files: Vec<String>,
+    /// Whether this machine publishes and applies the plugin list of the
+    /// snapshot (`plugins.toml`). Off: plugins are left alone both ways.
+    pub plugins: bool,
 }
 
 impl Default for Backup {
@@ -297,6 +300,7 @@ impl Default for Backup {
             remote: None,
             branch: "main".to_string(),
             files: Vec::new(),
+            plugins: true,
         }
     }
 }
@@ -693,6 +697,14 @@ mod tests {
         assert!(enabled.backup.remote.is_none());
         assert!(enabled.backup.files.is_empty());
         assert_eq!(enabled.backup.branch, "main");
+        // Existing configurations keep synchronizing their plugin list.
+        assert!(defaults.backup.plugins && enabled.backup.plugins);
+        assert!(
+            !Config::parse("[backup]\nplugins = false\n")
+                .unwrap()
+                .backup
+                .plugins
+        );
         assert!(Config::parse("[backup]\nunknown = true\n").is_err());
     }
 

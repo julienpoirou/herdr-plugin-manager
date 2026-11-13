@@ -2801,13 +2801,9 @@ fn draw_market(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             entry.description.clone()
         };
-        lines.push(
-            Line::styled(
-                format!("        {}", util::truncate(&desc, width.saturating_sub(9))),
-                muted(),
-            )
-            .style(base),
-        );
+        // Padded like the first line, so the selection spans the same width.
+        let desc = format!("        {}", pad(&desc, width.saturating_sub(9)));
+        lines.push(Line::styled(desc, muted()).style(base));
     }
     if total > 0 {
         let pages = total.div_ceil(page_size);

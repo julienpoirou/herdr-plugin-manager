@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.0...v0.18.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **tui:** Larger back and close buttons with a margin on their left ([#60](https://github.com/julienpoirou/herdr-plugin-manager/issues/60)) ([a7df419](https://github.com/julienpoirou/herdr-plugin-manager/commit/a7df419f59968e71a134f578d0878c171bf4ca62))
+
 ## [0.18.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.17.1...v0.18.0) (2026-11-12)
 
 

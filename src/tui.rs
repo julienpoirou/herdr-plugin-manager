@@ -1641,16 +1641,20 @@ impl Hint {
         hint
     }
 
-    /// The `←×` buttons side by side, preceded by a space: the line, its
-    /// clicks and its width. `None` without buttons.
+    /// The `←` and `×` buttons for the top right corner, after a margin:
+    /// each glyph is padded to a three-cell button that is clickable as a
+    /// whole. Returns the line, its clicks and its width; `None` without
+    /// buttons.
     fn take_buttons(&mut self) -> Option<(Line<'static>, Clicks, u16)> {
         if self.buttons.is_empty() {
             return None;
         }
         let mut buttons = Hint::new(self.mouse);
-        buttons.push(Span::raw(" "), None);
+        buttons.push(Span::raw("  "), None);
         for (glyph, click) in std::mem::take(&mut self.buttons) {
-            buttons.push(Span::styled(glyph, key_style()), Some(click));
+            let at = buttons.width;
+            buttons.push(Span::styled(format!(" {glyph} "), key_style()), None);
+            buttons.clicks.push((at, buttons.width - at, click));
         }
         let width = buttons.width;
         let (line, clicks) = buttons.into_parts();
@@ -4109,13 +4113,19 @@ mod tests {
     fn hint_pieces_land_on_their_text() {
         let mut hint = Hint::title(true, Some(Click::Key(ESC)), Some(Click::Key(QUIT)));
         let (buttons, button_clicks, width) = hint.take_buttons().unwrap();
-        // " ←×": side by side, for the top right corner.
-        assert_eq!((buttons.width(), width), (3, 3));
+        // "   ←  × ": a two-cell margin, then two three-cell buttons.
+        assert_eq!((buttons.width(), width), (8, 8));
         let mut hits = Hits::new(true);
-        hits.place(&button_clicks, 97, 0, 100);
-        assert_eq!(hits.at(97, 0), None);
-        assert_eq!(hits.at(98, 0), Some(Click::Key(ESC)));
-        assert_eq!(hits.at(99, 0), Some(Click::Key(QUIT)));
+        hits.place(&button_clicks, 92, 0, 100);
+        for col in 92..94 {
+            assert_eq!(hits.at(col, 0), None, "margin column {col}");
+        }
+        for col in 94..97 {
+            assert_eq!(hits.at(col, 0), Some(Click::Key(ESC)), "column {col}");
+        }
+        for col in 97..100 {
+            assert_eq!(hits.at(col, 0), Some(Click::Key(QUIT)), "column {col}");
+        }
         hint.push(Span::raw(" Title "), None);
         hint.key("u", key_style(), Span::raw(" update  "), &[ch('u')])
             .key(

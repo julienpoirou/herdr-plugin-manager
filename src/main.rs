@@ -1,16 +1,21 @@
-//! GitBridge (`herdr-pm`): manage Herdr plugins from a popup or the command
-//! line, from GitHub or any git server.
+//! Herdr Plugin Manager (`herdr-pm`): manage Herdr plugins from a popup or
+//! the command line, from GitHub or any git server.
 
+mod backup;
 mod config;
-mod detach;
 mod git;
+mod gitops;
 mod herdr;
 mod index;
+mod integrate;
+mod logos;
 mod manifest;
 mod market;
+mod migration;
 mod ops;
 mod paths;
 mod registry;
+mod settings;
 mod source;
 mod tui;
 mod util;
@@ -30,7 +35,7 @@ use crate::ops::{Ctx, InstallRequest, Origin, Status};
 #[command(
     name = "herdr-pm",
     version,
-    about = "GitBridge for Herdr: reviewed installs from any Git transport, rollback, and multi-forge discovery.",
+    about = "Herdr Plugin Manager: reviewed installs from any Git transport, rollback, and multi-forge discovery.",
     after_help = "Run without a command to open the interactive manager.\n\
                   Sources: owner/repo (GitHub), https://… ssh://… git@host:path git://… file://… /local/path, \
                   alias:path (see `herdr-pm config init`). Append //subdir to pick a plugin inside a repository."
@@ -42,6 +47,10 @@ struct Cli {
     /// Print what would change without changing anything.
     #[arg(long, global = true, env = "HERDR_PM_DRY_RUN")]
     dry_run: bool,
+
+    /// Print the agent skill shipped with this version (SKILL.md).
+    #[arg(long)]
+    skill: bool,
 }
 
 #[derive(Args, Clone)]
@@ -99,10 +108,22 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Uninstall a plugin (linked plugins are only unlinked).
+    /// Uninstall a plugin (linked plugins are only unlinked unless --purge).
     #[command(alias = "remove", alias = "rm")]
     Uninstall {
         id: String,
+        /// Also delete what it leaves on disk: config directory, leftover
+        /// checkouts, cached repository and, for a local link, its directory.
+        #[arg(long)]
+        purge: bool,
+        #[command(flatten)]
+        yes: YesFlag,
+    },
+    /// Delete what removed plugins left behind: config and state
+    /// directories, Herdr's old checkouts, and their settings here.
+    Clean {
+        /// Only these removed plugins (all of them when omitted).
+        ids: Vec<String>,
         #[command(flatten)]
         yes: YesFlag,
     },
@@ -110,6 +131,15 @@ enum Cmd {
     Enable { id: String },
     /// Disable a plugin.
     Disable { id: String },
+    /// Update the plugins with auto-update on, without previews, or turn
+    /// auto-update on or off for one plugin. `--hook` is what Herdr runs:
+    /// it updates only when `[auto_update] trigger` says so.
+    AutoUpdate {
+        #[command(subcommand)]
+        command: Option<AutoUpdateCmd>,
+        #[arg(long, value_enum)]
+        hook: Option<HookArg>,
+    },
     /// Show everything known about a plugin.
     Info {
         id: String,
@@ -135,6 +165,14 @@ enum Cmd {
         id: String,
         #[arg(value_name = "REF")]
         reference: Option<String>,
+        #[command(flatten)]
+        yes: YesFlag,
+    },
+    /// Move a plugin Herdr installed from GitHub to this manager's git
+    /// pipeline, at its current commit, so `herdr plugin update` leaves it
+    /// alone.
+    TakeOver {
+        id: String,
         #[command(flatten)]
         yes: YesFlag,
     },
@@ -171,25 +209,31 @@ enum Cmd {
         #[command(subcommand)]
         command: IndexCmd,
     },
-    /// Write installed plugins to a file.
-    Export {
-        /// Output file (stdout when omitted).
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    /// Install the plugins of an export.
-    Import {
-        file: PathBuf,
-        /// Only these plugin ids.
-        ids: Vec<String>,
+    /// Capture the selected configuration, commit and push it to the backup remote.
+    Push {
         #[command(flatten)]
         yes: YesFlag,
     },
-    /// Recent changes made by this manager.
-    History {
+    /// Preview and apply the backup remote; stop on local conflicts.
+    Pull {
+        #[command(flatten)]
+        yes: YesFlag,
+    },
+    #[command(hide = true)]
+    BackupWatch,
+    /// Changes made by this manager, newest last; `-f` keeps printing new
+    /// ones as they happen.
+    Logs {
         id: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// text (a table), jsonl (this manager's fields) or ecs (Elastic
+        /// Common Schema).
+        #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+        format: LogFormat,
+        /// Keep running and print changes as they are logged.
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
     /// Check herdr, git, config, plugins, key bindings and marketplaces.
     Doctor,
@@ -198,10 +242,51 @@ enum Cmd {
         #[command(subcommand)]
         command: Option<ConfigCmd>,
     },
+    /// Migrate an existing manager installation to its namespaced plugin id.
+    Migrate {
+        /// Checkout or release bundle containing the new herdr-plugin.toml and skill.
+        root: PathBuf,
+        /// Fresh herdr-pm binary (defaults to ROOT/bin/herdr-pm).
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        #[command(flatten)]
+        yes: YesFlag,
+    },
     /// Open the manager as a Herdr popup (what the `open` action runs).
     Open,
-    #[command(hide = true, name = "__invoke-after-exit")]
-    InvokeAfterExit { pid: u32, action: String },
+    /// Keep `herdr-pm` on your PATH, following updates, or stop.
+    Path {
+        #[command(subcommand)]
+        command: Toggle,
+    },
+    /// Link the `herdr-pm` agent skill for the coding agents found (and put
+    /// `herdr-pm` on PATH), or unlink it.
+    Skill {
+        #[command(subcommand)]
+        command: Toggle,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum Toggle {
+    Enable,
+    Disable,
+}
+
+#[derive(Subcommand)]
+enum AutoUpdateCmd {
+    /// Update this plugin automatically, enabled or not.
+    Enable { id: String },
+    /// Stop updating this plugin automatically.
+    Disable { id: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HookArg {
+    /// The Herdr server started.
+    Startup,
+    /// A tab or pane was created.
+    Event,
 }
 
 #[derive(Subcommand)]
@@ -244,8 +329,20 @@ enum ConfigCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let refresh_backup = !cli.dry_run
+        && !cli.skill
+        && !matches!(&cli.command, Some(Cmd::BackupWatch | Cmd::Logs { .. }));
     match run(cli) {
-        Ok(code) => code,
+        Ok(code) => {
+            if refresh_backup {
+                let result = Config::load_read_only()
+                    .and_then(|config| backup::refresh(&Herdr::detect(false), &config));
+                if let Err(err) = result {
+                    eprintln!("warning: automatic backup needs attention: {err:#}");
+                }
+            }
+            code
+        }
         Err(err) => {
             eprintln!("{} {err:#}", ops::red("error:"));
             ExitCode::from(1)
@@ -256,8 +353,13 @@ fn main() -> ExitCode {
 fn ctx(dry_run: bool, yes: bool) -> Result<Ctx> {
     Ok(Ctx {
         herdr: Herdr::detect(dry_run),
-        config: Config::load()?,
+        config: if dry_run {
+            Config::load_read_only()?
+        } else {
+            Config::load()?
+        },
         yes,
+        report: std::sync::Arc::new(ops::TerminalReport),
         dry_run,
     })
 }
@@ -272,10 +374,41 @@ fn code(failures: usize) -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let dry = cli.dry_run;
+    if !matches!(&cli.command, Some(Cmd::Migrate { .. }))
+        && !(cli.command.is_none() && cli.skill)
+        && migration::required()?
+    {
+        bail!(
+            "the manager still uses its old plugin id; use a fresh herdr-pm binary and run \
+             `herdr-pm migrate <new-checkout> --binary <fresh-binary> --yes` first"
+        );
+    }
     let Some(command) = cli.command else {
+        if cli.skill {
+            print!("{}", integrate::SKILL);
+            return Ok(ExitCode::SUCCESS);
+        }
         return tui::run(ctx(dry, false)?).map(|_| ExitCode::SUCCESS);
     };
     match command {
+        Cmd::Migrate { root, binary, yes } => {
+            let herdr = Herdr::detect(dry);
+            let preview = migration::plan(&root, binary.as_deref())?;
+            let accepted = ops::Report::review(
+                &ops::TerminalReport,
+                "Plugin identity migration",
+                &preview,
+                (!dry && !yes.yes).then_some("Migrate the manager installation and its settings?"),
+            )?;
+            if !accepted {
+                println!("cancelled");
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !dry {
+                migration::run(&herdr, &root, binary.as_deref(), false)?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Tui => tui::run(ctx(dry, false)?).map(|_| ExitCode::SUCCESS),
         Cmd::List { check, json } => list(&ctx(dry, false)?, check, json),
         Cmd::Install {
@@ -309,15 +442,54 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Update { ids, yes } => Ok(code(ops::update(&ctx(dry, yes.yes)?, &ids)?)),
         Cmd::Outdated { json } => outdated(&ctx(dry, false)?, json),
-        Cmd::Uninstall { id, yes } => {
-            ops::uninstall(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
+        Cmd::Uninstall { id, purge, yes } => {
+            ops::uninstall(&ctx(dry, yes.yes)?, &id, purge).map(|_| ExitCode::SUCCESS)
         }
+        Cmd::Clean { ids, yes } => ops::clean(&ctx(dry, yes.yes)?, &ids).map(|_| ExitCode::SUCCESS),
         Cmd::Enable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, true).map(|_| ExitCode::SUCCESS)
         }
         Cmd::Disable { id } => {
             ops::set_enabled(&ctx(dry, false)?, &id, false).map(|_| ExitCode::SUCCESS)
         }
+        Cmd::AutoUpdate {
+            command: None,
+            hook,
+        } => {
+            let hook = hook.map(|h| match h {
+                HookArg::Startup => config::Hook::Startup,
+                HookArg::Event => config::Hook::Event,
+            });
+            let config = Config::load_read_only()?;
+            if matches!(hook, Some(config::Hook::Startup)) && !dry {
+                // An update may have moved the installation since.
+                let _ = integrate::refresh(
+                    &Herdr::detect(false),
+                    config.cli_on_path,
+                    config.agent_skill,
+                );
+            }
+            if !ops::claim_auto_update(&config, hook, dry)? {
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(code(ops::auto_update(&ctx(dry, true)?)?))
+        }
+        Cmd::Path { command } => {
+            ops::set_cli_on_path(&ctx(dry, false)?, matches!(command, Toggle::Enable))
+                .map(|_| ExitCode::SUCCESS)
+        }
+        Cmd::Skill { command } => {
+            ops::set_agent_skill(&ctx(dry, false)?, matches!(command, Toggle::Enable))
+                .map(|_| ExitCode::SUCCESS)
+        }
+        Cmd::AutoUpdate {
+            command: Some(AutoUpdateCmd::Enable { id }),
+            ..
+        } => auto_update_setting(&ctx(dry, false)?, &id, true),
+        Cmd::AutoUpdate {
+            command: Some(AutoUpdateCmd::Disable { id }),
+            ..
+        } => auto_update_setting(&ctx(dry, false)?, &id, false),
         Cmd::Info { id, json } => info(&ctx(dry, false)?, &id, json),
         Cmd::Rollback { id, yes } => {
             ops::rollback(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
@@ -327,6 +499,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Unpin { id, reference, yes } => {
             ops::unpin(&ctx(dry, yes.yes)?, &id, reference.as_deref()).map(|_| ExitCode::SUCCESS)
+        }
+        Cmd::TakeOver { id, yes } => {
+            ops::take_over(&ctx(dry, yes.yes)?, &id).map(|_| ExitCode::SUCCESS)
         }
         Cmd::Switch { id, reference, yes } => {
             ops::switch(&ctx(dry, yes.yes)?, &id, &reference).map(|_| ExitCode::SUCCESS)
@@ -339,7 +514,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             limit,
         } => search(
-            &Config::load()?,
+            &Config::load_read_only()?,
             &query.join(" "),
             source.as_deref(),
             &sort,
@@ -347,17 +522,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
             limit,
         ),
-        Cmd::Sources => sources(&Config::load()?),
+        Cmd::Sources => sources(&Config::load_read_only()?),
         Cmd::Index { command } => index_cmd(command),
-        Cmd::Export { output } => export(&Herdr::detect(dry), output),
-        Cmd::Import { file, ids, yes } => {
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("could not read {}", file.display()))?;
-            let parsed: ops::ExportFile =
-                serde_json::from_str(&text).context("not a valid export file")?;
-            Ok(code(ops::import(&ctx(dry, yes.yes)?, &parsed, &ids)?))
-        }
-        Cmd::History { id, limit } => history(id.as_deref(), limit),
+        Cmd::Push { yes } => gitops::push(&ctx(dry, yes.yes)?).map(|_| ExitCode::SUCCESS),
+        Cmd::Pull { yes } => gitops::pull(&ctx(dry, yes.yes)?).map(|_| ExitCode::SUCCESS),
+        Cmd::BackupWatch => backup::watch().map(|_| ExitCode::SUCCESS),
+        Cmd::Logs {
+            id,
+            limit,
+            format,
+            follow,
+        } => logs(id.as_deref(), limit, format, follow),
         Cmd::Doctor => Ok(code(ops::doctor(&ctx(dry, false)?))),
         Cmd::Config { command } => config_cmd(command),
         Cmd::Open => {
@@ -365,11 +540,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             herdr.open_popup(paths::PLUGIN_ID, "manager")?;
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::InvokeAfterExit { pid, action } => {
-            detach::invoke_after_exit(&Herdr::detect(false), pid, &action);
-            Ok(ExitCode::SUCCESS)
-        }
     }
+}
+
+fn auto_update_setting(ctx: &Ctx, id: &str, on: bool) -> Result<ExitCode> {
+    ops::set_auto_update(ctx, id, on)?;
+    let state = if on { "on" } else { "off" };
+    if ctx.dry_run {
+        println!("[dry-run] would turn auto-update {state} for {id}");
+    } else {
+        println!("{} Auto-update {state} for {id}", ops::green("✓"));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
@@ -389,6 +571,7 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
                     "name": row.plugin.name,
                     "version": row.plugin.version,
                     "enabled": row.plugin.enabled,
+                    "auto_update": row.auto_update,
                     "origin": row.origin,
                     "source": row.source_display(),
                     "ref": row.requested_ref(),
@@ -420,6 +603,11 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
         let status_text = match status {
             None => String::new(),
             Some(Status::Current) => ops::green("up to date"),
+            Some(Status::Moved { pin }) => ops::yellow(&format!(
+                "⚠ moved off pin {} (herdr-pm update {} restores it)",
+                util::short_sha(pin),
+                row.plugin.plugin_id
+            )),
             Some(Status::Available { commit, version }) => ops::yellow(&format!(
                 "↑ {}",
                 util::sanitize(
@@ -439,7 +627,7 @@ fn list(ctx: &Ctx, check: bool, json: bool) -> Result<ExitCode> {
             row.plugin.plugin_id,
             util::truncate(&util::sanitize(&row.plugin.version), 9),
             row.origin.label(),
-            ops::dim(&util::truncate(&util::sanitize(&row.source_display()), 60)),
+            ops::dim(&util::truncate(&util::sanitize(&row.source_label()), 60)),
             status_text,
         );
     }
@@ -487,6 +675,8 @@ fn outdated(ctx: &Ctx, json: bool) -> Result<ExitCode> {
     for (row, status) in rows.iter().zip(statuses) {
         match status {
             Some(Status::Available { commit, version }) => found.push((row, commit, version)),
+            // Restoring the pin is the pending change.
+            Some(Status::Moved { pin }) => found.push((row, pin, Some("pinned".into()))),
             Some(Status::Error { message }) => {
                 errors += 1;
                 eprintln!("{} {}: {message}", ops::red("✗"), row.plugin.plugin_id);
@@ -553,6 +743,11 @@ fn info(ctx: &Ctx, id: &str, json: bool) -> Result<ExitCode> {
                 ops::yellow(&format!("update available ({})", util::short_sha(&commit)))
             }
             Status::Pinned => "pinned".into(),
+            Status::Moved { pin } => ops::yellow(&format!(
+                "moved off its pin {} by herdr; `herdr-pm update {}` restores it",
+                util::short_sha(&pin),
+                row.plugin.plugin_id
+            )),
             Status::Error { message } => ops::red(&message),
             _ => "-".into(),
         };
@@ -599,7 +794,7 @@ fn search(
     }
     let shown = entries.len().min(limit);
     for e in entries.iter().take(limit) {
-        let stars = e.stars.map(|s| format!("★{s}")).unwrap_or_default();
+        let stars = e.stars.map(|s| format!("★ {s}")).unwrap_or_default();
         let version = e
             .version
             .as_deref()
@@ -647,10 +842,15 @@ fn sources(config: &Config) -> Result<ExitCode> {
             },
             util::sanitize(&s.name),
             s.kind.label(),
-            util::sanitize(s.url.as_deref().unwrap_or("https://api.github.com")),
+            util::sanitize(s.url.as_deref().unwrap_or(match s.kind {
+                config::MarketKind::Herdr => market::HERDR_INDEX_URL,
+                _ => "https://api.github.com",
+            })),
             if matches!(
                 s.kind,
-                config::MarketKind::Index | config::MarketKind::GitIndex
+                config::MarketKind::Herdr
+                    | config::MarketKind::Index
+                    | config::MarketKind::GitIndex
             ) {
                 String::new()
             } else {
@@ -751,56 +951,107 @@ fn index_cmd(command: IndexCmd) -> Result<ExitCode> {
     }
 }
 
-fn export(herdr: &Herdr, output: Option<PathBuf>) -> Result<ExitCode> {
-    let (file, skipped) = ops::export(herdr)?;
-    for s in &skipped {
-        eprintln!("{} skipped {s}", ops::dim("•"));
-    }
-    let text = serde_json::to_string_pretty(&file)?;
-    match output {
-        Some(path) => {
-            std::fs::write(&path, format!("{text}\n"))?;
-            eprintln!(
-                "{} exported {} plugin(s) to {}",
-                ops::green("✓"),
-                file.plugins.len(),
-                path.display()
-            );
-        }
-        None => println!("{text}"),
-    }
-    Ok(ExitCode::SUCCESS)
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Jsonl,
+    Ecs,
 }
 
-fn history(id: Option<&str>, limit: usize) -> Result<ExitCode> {
-    let events = registry::read_events(id, limit);
-    if events.is_empty() {
-        println!("No recorded changes.");
+fn log_line(e: &registry::Event, format: LogFormat) -> String {
+    match format {
+        LogFormat::Jsonl => serde_json::to_string(e).unwrap_or_default(),
+        LogFormat::Ecs => registry::to_ecs(e).to_string(),
+        LogFormat::Text => {
+            let change = match (&e.from, &e.to) {
+                (Some(f), Some(t)) => format!("{} → {}", util::short_sha(f), util::short_sha(t)),
+                (None, Some(t)) => util::short_sha(t).to_string(),
+                (Some(f), None) => format!("{} → -", util::short_sha(f)),
+                _ => String::new(),
+            };
+            format!(
+                "{} {} {:<10} {:<28} {}{}",
+                ops::dim(&util::format_unix(e.unix)),
+                if e.ok {
+                    ops::green("✓")
+                } else {
+                    ops::red("✗")
+                },
+                e.action,
+                e.plugin_id,
+                change,
+                e.detail
+                    .as_ref()
+                    .map(|d| ops::dim(&format!("  {}", util::truncate(&util::sanitize(d), 80))))
+                    .unwrap_or_default()
+            )
+        }
     }
-    for e in events {
-        let change = match (&e.from, &e.to) {
-            (Some(f), Some(t)) => format!("{} → {}", util::short_sha(f), util::short_sha(t)),
-            (None, Some(t)) => util::short_sha(t).to_string(),
-            (Some(f), None) => format!("{} → -", util::short_sha(f)),
-            _ => String::new(),
+}
+
+/// Prints the last `limit` changes (oldest first, like a log), then with
+/// `follow` new ones as they are written. A closed pipe (`| head`) ends it
+/// quietly.
+fn logs(id: Option<&str>, limit: usize, format: LogFormat, follow: bool) -> Result<ExitCode> {
+    let mut out = std::io::stdout().lock();
+    let mut reader = registry::EventReader::default();
+    let mut events = reader.read_new()?;
+    events.retain(|e| id.is_none_or(|id| e.plugin_id == id));
+    let keep = events.len().saturating_sub(limit);
+    events.drain(..keep);
+    if events.is_empty() && !follow && matches!(format, LogFormat::Text) {
+        let off = Config::load_read_only().is_ok_and(|c| c.history == config::HistoryFormat::Off);
+        let note = if off {
+            "No recorded changes (history = \"off\" in config.toml)."
+        } else {
+            "No recorded changes."
         };
-        println!(
-            "{} {} {:<10} {:<28} {}{}",
-            ops::dim(&util::format_unix(e.unix)),
-            if e.ok {
-                ops::green("✓")
-            } else {
-                ops::red("✗")
-            },
-            e.action,
-            e.plugin_id,
-            change,
-            e.detail
-                .map(|d| ops::dim(&format!("  {}", util::truncate(&util::sanitize(&d), 80))))
-                .unwrap_or_default()
-        );
+        if !write_log(&mut out, note)? {
+            return Ok(ExitCode::SUCCESS);
+        }
     }
-    Ok(ExitCode::SUCCESS)
+    for e in &events {
+        if !write_log(&mut out, &log_line(e, format))? {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    if !flush_log(&mut out)? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let fresh = reader.read_new()?;
+        for e in fresh
+            .iter()
+            .filter(|e| id.is_none_or(|id| e.plugin_id == id))
+        {
+            if !write_log(&mut out, &log_line(e, format))? {
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+        if !flush_log(&mut out)? {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+}
+
+fn write_log(out: &mut impl std::io::Write, line: &str) -> std::io::Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn flush_log(out: &mut impl std::io::Write) -> std::io::Result<bool> {
+    match out.flush() {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn config_cmd(command: Option<ConfigCmd>) -> Result<ExitCode> {
@@ -814,7 +1065,7 @@ fn config_cmd(command: Option<ConfigCmd>) -> Result<ExitCode> {
                 println!("{} already exists", path.display());
             }
         }
-        ConfigCmd::Show => println!("{}", toml::to_string_pretty(&Config::load()?)?),
+        ConfigCmd::Show => println!("{}", toml::to_string_pretty(&Config::load_read_only()?)?),
     }
     Ok(ExitCode::SUCCESS)
 }

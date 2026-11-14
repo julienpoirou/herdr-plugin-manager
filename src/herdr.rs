@@ -228,6 +228,11 @@ impl Herdr {
         // Keep Herdr from treating these calls as coming from a plugin pane's
         // own environment when that would change behavior.
         command.env_remove("HERDR_PLUGIN_ACTION_ID");
+        #[cfg(windows)]
+        if std::env::var_os("HERDR_PM_BACKUP_GENERATION").is_some() {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
         command
     }
 
@@ -288,6 +293,15 @@ impl Herdr {
         Ok(envelope.result.plugins)
     }
 
+    /// Applies config changes to a live server; offline config is used at startup.
+    pub fn reload_config(&self) -> Result<()> {
+        match self.mutate(&["server", "reload-config"]) {
+            Ok(_) => Ok(()),
+            Err(err) if is_server_not_running(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Registers (or re-registers) a plugin directory. Re-linking an id that
     /// is already registered replaces it in place, which is how updates and
     /// rollbacks of git-managed plugins switch installations atomically.
@@ -314,11 +328,6 @@ impl Herdr {
             Err(err) if is_server_not_running(&err) => set_enabled_offline(plugin_id, enabled),
             Err(err) => Err(err),
         }
-    }
-
-    pub fn invoke(&self, action_id: &str) -> Result<()> {
-        self.mutate(&["plugin", "action", "invoke", action_id])
-            .map(|_| ())
     }
 
     /// Opens one of a plugin's panes as a focused popup.
@@ -380,6 +389,41 @@ impl Herdr {
         }
         self.interactive(&args)
     }
+
+    /// Runs a herdr command without a terminal, handing its output to
+    /// `on_line`. Callers have already shown their own review.
+    fn quiet(&self, args: &[&str], on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
+        if self.dry_run {
+            on_line(&format!("[dry-run] {}", self.display(args)));
+            return Ok(success_status());
+        }
+        let mut command = self.command();
+        command.args(args);
+        util::stream_command(&mut command, on_line)
+            .with_context(|| format!("could not run {}", self.bin.display()))
+    }
+
+    pub fn install_github_quiet(
+        &self,
+        spec: &str,
+        reference: Option<&str>,
+        on_line: &dyn Fn(&str),
+    ) -> Result<ExitStatus> {
+        let mut args = vec!["plugin", "install", spec, "--yes"];
+        if let Some(reference) = reference {
+            args.push("--ref");
+            args.push(reference);
+        }
+        self.quiet(&args, on_line)
+    }
+
+    pub fn update_github_quiet(
+        &self,
+        plugin_id: &str,
+        on_line: &dyn Fn(&str),
+    ) -> Result<ExitStatus> {
+        self.quiet(&["plugin", "update", plugin_id, "--yes"], on_line)
+    }
 }
 
 #[cfg(unix)]
@@ -415,7 +459,7 @@ pub fn is_server_not_running(err: &anyhow::Error) -> bool {
 
 /// Resolves a registry symlink even when its final target does not exist
 /// yet, matching Herdr's stow-friendly write behavior.
-fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_write_target(path: &Path) -> Result<PathBuf> {
     let mut target = path.to_path_buf();
     for _ in 0..40 {
         let metadata = match std::fs::symlink_metadata(&target) {
@@ -507,6 +551,30 @@ pub fn parse_action_keybindings(text: &str) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// Whether the popup may use the mouse. Inside Herdr it follows
+/// `[ui] mouse_capture` in Herdr's `config.toml`, so a keyboard-only Herdr
+/// gets a keyboard-only popup; in a plain terminal it is always on.
+pub fn mouse_enabled() -> bool {
+    let inside = std::env::var("HERDR_ENV").as_deref() == Ok("1")
+        || std::env::var_os("HERDR_PLUGIN_ID").is_some();
+    let text = inside
+        .then(|| std::fs::read_to_string(paths::herdr_config_toml()).ok())
+        .flatten();
+    mouse_capture(inside, text.as_deref())
+}
+
+/// `[ui] mouse_capture` from Herdr's config text when inside Herdr; true
+/// when outside, without a config, or when the value is missing or invalid.
+pub fn mouse_capture(inside_herdr: bool, config: Option<&str>) -> bool {
+    if !inside_herdr {
+        return true;
+    }
+    config
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("ui")?.get("mouse_capture")?.as_bool())
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +608,7 @@ mouse_capture = true
 [[keys.command]]
 key = "prefix+p"
 type = "plugin_action"
-command = "gitbridge.open"
+command = "julienpoirou.herdr-plugin-manager.open"
 
 [[keys.command]]
 key = "prefix+g"
@@ -550,11 +618,31 @@ command = "lazygit"
 [[keys.command]]
 key = "alt+p"
 type = "plugin_action"
-command = "gitbridge.open"
+command = "julienpoirou.herdr-plugin-manager.open"
 "#;
         let keys = parse_action_keybindings(toml);
-        assert_eq!(keys["gitbridge.open"], vec!["prefix+p", "alt+p"]);
+        assert_eq!(
+            keys["julienpoirou.herdr-plugin-manager.open"],
+            vec!["prefix+p", "alt+p"]
+        );
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn mouse_follows_herdr_mouse_capture() {
+        let off = "[ui]\nmouse_capture = false\n";
+        let on = "[ui]\nmouse_capture = true\n";
+        assert!(!mouse_capture(true, Some(off)));
+        assert!(mouse_capture(true, Some(on)));
+        // Missing file, table, key; a value of the wrong type; broken TOML.
+        assert!(mouse_capture(true, None));
+        assert!(mouse_capture(true, Some("")));
+        assert!(mouse_capture(true, Some("[ui]\ntheme = \"dark\"\n")));
+        assert!(mouse_capture(true, Some("[ui]\nmouse_capture = \"no\"\n")));
+        assert!(mouse_capture(true, Some("[ui\nmouse_capture = false")));
+        // A plain terminal keeps the mouse whatever Herdr's config says.
+        assert!(mouse_capture(false, Some(off)));
+        assert!(mouse_capture(false, None));
     }
 
     #[cfg(unix)]

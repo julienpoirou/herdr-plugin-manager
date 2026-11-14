@@ -1,12 +1,12 @@
-id = "gitbridge"
-name = "GitBridge for Herdr"
-version = "0.1.0"
+id = "julienpoirou.herdr-plugin-manager"
+name = "Herdr Plugin Manager"
+# x-release-please-start-version
+version = "0.18.3"
+# x-release-please-end
 min_herdr_version = "0.7.4"
-description = "GitBridge installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."
+description = "Installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."
 platforms = ["linux", "macos", "windows"]
 
-# Builds bin/herdr-pm from source (needs a Rust toolchain), unless a
-# matching prebuilt bin/herdr-pm is already in the checkout.
 [[build]]
 platforms = ["linux", "macos"]
 command = ["sh", "scripts/build.sh"]
@@ -17,7 +17,7 @@ command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"
 
 [[panes]]
 id = "manager"
-title = "GitBridge"
+title = "Herdr Plugin Manager"
 placement = "popup"
 width = "85%"
 height = "85%"
@@ -28,3 +28,14 @@ id = "open"
 title = "Open plugin manager"
 contexts = ["workspace"]
 command = ["./bin/herdr-pm", "open"]
+
+[[startup]]
+command = ["./bin/herdr-pm", "auto-update", "--hook", "startup"]
+
+[[events]]
+on = "tab.created"
+command = ["./bin/herdr-pm", "auto-update", "--hook", "event"]
+
+[[events]]
+on = "pane.created"
+command = ["./bin/herdr-pm", "auto-update", "--hook", "event"]

@@ -272,6 +272,24 @@ pub fn parse(input: &str, aliases: &BTreeMap<String, String>) -> Result<Source> 
     )
 }
 
+/// `owner/repo[/subdir]` for a GitHub https remote, the way GitHub
+/// shorthands are written; None for any other remote.
+pub fn github_label(url: &str, subdir: Option<&str>) -> Option<String> {
+    let path = url
+        .strip_prefix("https://github.com/")?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(match subdir.filter(|s| !s.is_empty()) {
+        Some(s) => format!("{owner}/{repo}/{s}"),
+        None => format!("{owner}/{repo}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +401,25 @@ mod tests {
                 subdir: Some("s".into())
             }
         );
+    }
+
+    #[test]
+    fn github_remotes_read_as_shorthands() {
+        let label = |url, subdir| github_label(url, subdir);
+        assert_eq!(
+            label(
+                "https://github.com/eugenioenko/ttt.git",
+                Some("herdr-plugin")
+            )
+            .as_deref(),
+            Some("eugenioenko/ttt/herdr-plugin")
+        );
+        assert_eq!(
+            label("https://github.com/o/r", None).as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(label("https://github.com/o/r/tree/main", None), None);
+        assert_eq!(label("https://gitlab.com/o/r.git", None), None);
+        assert_eq!(label("git@github.com:o/r.git", None), None);
     }
 }

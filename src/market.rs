@@ -1,14 +1,20 @@
 //! Marketplace: one listing assembled from several sources.
 //!
-//! * `github`    — repository search by topic (the herdr.dev/plugins index)
+//! * `herdr`     — the official herdr.dev index: every public GitHub
+//!   repository tagged `herdr-plugin`, one entry per manifest
+//! * `github`    — repository search by topic (GitHub Enterprise, custom topics)
 //! * `gitea`     — Gitea / Forgejo topic search
 //! * `gitlab`    — GitLab projects by topic
 //! * `index`     — a static index JSON over http(s) or from a file
 //! * `git-index` — a static index JSON inside any git repository, so a plain
 //!   git server with no web API at all can still publish a catalog
 //!
-//! Listings are cached on disk for `market_ttl` seconds.
+//! Every source except `github` returns its whole catalog: it is cached on
+//! disk once and searched locally. A cached listing is fresh for
+//! `market_ttl` seconds; static indexes are then revalidated with a
+//! conditional request, so an unchanged catalog costs a 304.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -50,6 +56,9 @@ pub struct Entry {
     pub platforms: Option<Vec<String>>,
     #[serde(default)]
     pub min_herdr_version: Option<String>,
+    /// Project or owner picture, shown where the terminal draws images.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 impl Entry {
@@ -85,12 +94,17 @@ impl Entry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Listing {
     pub entries: Vec<Entry>,
     /// What the source reported as its total, if more than were fetched.
     pub total: Option<u64>,
     pub fetched_unix: u64,
+    /// HTTP validators of a downloaded index, for conditional refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +226,7 @@ fn agent_for(url: &str) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout(Duration::from_secs(20))
-        .user_agent(concat!("gitbridge/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("herdr-plugin-manager/", env!("CARGO_PKG_VERSION")));
     if let Some(proxy) = proxy_for(url).and_then(|p| ureq::Proxy::new(p).ok()) {
         builder = builder.proxy(proxy);
     }
@@ -261,6 +275,14 @@ pub fn http_get_text(url: &str, token: Option<&str>, timeout: Duration) -> Resul
     Ok(text)
 }
 
+/// A small binary download (pictures), at most `limit` bytes.
+pub fn http_get_bytes(url: &str, timeout: Duration, limit: u64) -> Result<Vec<u8>> {
+    let response = http_get(url, &[], timeout)?;
+    let mut bytes = Vec::new();
+    response.into_reader().take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn http_get_json(
     url: &str,
     headers: &[(&str, String)],
@@ -278,6 +300,48 @@ fn http_get_json(
     let value =
         serde_json::from_str(&text).with_context(|| format!("{url} did not return JSON"))?;
     Ok((value, total))
+}
+
+/// A static file fetched with the validators of the cached copy.
+enum Download {
+    NotModified,
+    Body {
+        text: String,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
+fn http_get_static(
+    url: &str,
+    headers: &[(&str, String)],
+    cached: Option<&Listing>,
+) -> Result<Download> {
+    let mut headers = headers.to_vec();
+    if let Some(cached) = cached {
+        if let Some(etag) = &cached.etag {
+            headers.push(("If-None-Match", etag.clone()));
+        }
+        if let Some(modified) = &cached.last_modified {
+            headers.push(("If-Modified-Since", modified.clone()));
+        }
+    }
+    let response = http_get(url, &headers, Duration::from_secs(30))?;
+    if response.status() == 304 {
+        return Ok(Download::NotModified);
+    }
+    let etag = response.header("etag").map(str::to_string);
+    let last_modified = response.header("last-modified").map(str::to_string);
+    let mut text = String::new();
+    response
+        .into_reader()
+        .take(32 * 1024 * 1024)
+        .read_to_string(&mut text)?;
+    Ok(Download::Body {
+        text,
+        etag,
+        last_modified,
+    })
 }
 
 fn enc(value: &str) -> String {
@@ -394,6 +458,7 @@ fn fetch_github(source: &MarketSource, query: &str, config: &Config) -> Result<L
                 web_url: repo["html_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(&repo, &["/owner/avatar_url"], None),
             });
         }
         // The search API stops at 1000 results.
@@ -407,7 +472,33 @@ fn fetch_github(source: &MarketSource, query: &str, config: &Config) -> Result<L
         entries,
         total,
         fetched_unix: util::now_unix(),
+        ..Listing::default()
     })
+}
+
+/// GitHub serves every account's picture at a stable address.
+pub fn github_avatar(owner: &str) -> String {
+    format!("https://github.com/{owner}.png?size=96")
+}
+
+/// The first non-empty picture URL among `pointers` (JSON pointers),
+/// made absolute against `base` when the forge returns a path.
+fn image_at(value: &serde_json::Value, pointers: &[&str], base: Option<&str>) -> Option<String> {
+    let url = pointers
+        .iter()
+        .filter_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+        .find(|s| !s.trim().is_empty())?;
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_string())
+    } else {
+        base.map(|b| {
+            format!(
+                "{}/{}",
+                b.trim_end_matches('/'),
+                url.trim_start_matches('/')
+            )
+        })
+    }
 }
 
 fn clone_url(
@@ -425,7 +516,7 @@ fn clone_url(
     }
 }
 
-fn fetch_gitea(source: &MarketSource, query: &str) -> Result<Listing> {
+fn fetch_gitea(source: &MarketSource) -> Result<Listing> {
     let base = source
         .url
         .as_deref()
@@ -478,6 +569,7 @@ fn fetch_gitea(source: &MarketSource, query: &str) -> Result<Listing> {
                 web_url: repo["html_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(&repo, &["/avatar_url", "/owner/avatar_url"], Some(base)),
             });
         }
         if count < limit {
@@ -485,16 +577,15 @@ fn fetch_gitea(source: &MarketSource, query: &str) -> Result<Listing> {
         }
         page += 1;
     }
-    filter_local(&mut entries, query);
-    entries.truncate(source.max);
     Ok(Listing {
         entries,
         total,
         fetched_unix: util::now_unix(),
+        ..Listing::default()
     })
 }
 
-fn fetch_gitlab(source: &MarketSource, query: &str) -> Result<Listing> {
+fn fetch_gitlab(source: &MarketSource) -> Result<Listing> {
     let base = source
         .url
         .as_deref()
@@ -548,6 +639,11 @@ fn fetch_gitlab(source: &MarketSource, query: &str) -> Result<Listing> {
                 web_url: project["web_url"].as_str().map(str::to_string),
                 platforms: None,
                 min_herdr_version: None,
+                image: image_at(
+                    &project,
+                    &["/avatar_url", "/namespace/avatar_url", "/owner/avatar_url"],
+                    Some(base),
+                ),
             });
         }
         if count < per_page {
@@ -555,17 +651,16 @@ fn fetch_gitlab(source: &MarketSource, query: &str) -> Result<Listing> {
         }
         page += 1;
     }
-    filter_local(&mut entries, query);
-    entries.truncate(source.max);
     Ok(Listing {
         entries,
         total,
         fetched_unix: util::now_unix(),
+        ..Listing::default()
     })
 }
 
-fn index_entries(source: &MarketSource, index: Index, query: &str) -> Listing {
-    let mut entries: Vec<Entry> = index
+fn index_entries(source: &MarketSource, index: Index) -> Vec<Entry> {
+    index
         .plugins
         .into_iter()
         .map(|p| Entry {
@@ -582,35 +677,43 @@ fn index_entries(source: &MarketSource, index: Index, query: &str) -> Listing {
             updated_unix: p.updated_unix,
             platforms: p.platforms,
             min_herdr_version: p.min_herdr_version,
+            image: None,
         })
-        .collect();
-    filter_local(&mut entries, query);
-    entries.truncate(source.max);
-    Listing {
-        entries,
-        total: None,
-        fetched_unix: util::now_unix(),
-    }
+        .collect()
 }
 
-fn fetch_index(source: &MarketSource, query: &str) -> Result<Listing> {
+fn fetch_index(source: &MarketSource, cached: Option<&Listing>) -> Result<Option<Listing>> {
     let url = source.url.as_deref().unwrap_or_default();
-    let text = if url.starts_with("http://") || url.starts_with("https://") {
-        http_get_text(
-            url,
-            source.resolve_token().as_deref(),
-            Duration::from_secs(20),
-        )?
+    let (text, etag, last_modified) = if url.starts_with("http://") || url.starts_with("https://") {
+        let headers: Vec<(&str, String)> = source
+            .resolve_token()
+            .map(|t| vec![("Authorization", format!("Bearer {t}"))])
+            .unwrap_or_default();
+        match http_get_static(url, &headers, cached)? {
+            Download::NotModified => return Ok(None),
+            Download::Body {
+                text,
+                etag,
+                last_modified,
+            } => (text, etag, last_modified),
+        }
     } else {
         let path = url.strip_prefix("file://").unwrap_or(url);
-        std::fs::read_to_string(Path::new(path))
-            .with_context(|| format!("could not read index {path}"))?
+        let text = std::fs::read_to_string(Path::new(path))
+            .with_context(|| format!("could not read index {path}"))?;
+        (text, None, None)
     };
     let index = Index::parse(&text)?;
-    Ok(index_entries(source, index, query))
+    Ok(Some(Listing {
+        entries: index_entries(source, index),
+        total: None,
+        fetched_unix: util::now_unix(),
+        etag,
+        last_modified,
+    }))
 }
 
-fn fetch_git_index(source: &MarketSource, query: &str) -> Result<Listing> {
+fn fetch_git_index(source: &MarketSource) -> Result<Listing> {
     let url = source.url.as_deref().unwrap_or_default();
     let git = Git::BACKGROUND;
     let mirror = git.sync(url)?;
@@ -620,7 +723,138 @@ fn fetch_git_index(source: &MarketSource, query: &str) -> Result<Listing> {
         .show_file(&mirror, &sha, path)?
         .ok_or_else(|| anyhow!("{url} has no {path} (generate one with `herdr-pm index build`)"))?;
     let index = Index::parse(&text)?;
-    Ok(index_entries(source, index, query))
+    Ok(Listing {
+        entries: index_entries(source, index),
+        fetched_unix: util::now_unix(),
+        ..Listing::default()
+    })
+}
+
+/// The catalog behind herdr.dev/plugins.
+pub const HERDR_INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HerdrIndex {
+    schema_version: u64,
+    #[serde(default)]
+    plugin_count: Option<u64>,
+    plugins: Vec<HerdrRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HerdrRepo {
+    full_name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    stars: Option<u64>,
+    #[serde(default)]
+    pushed_at: Option<String>,
+    #[serde(default)]
+    manifests: Vec<HerdrManifest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HerdrManifest {
+    path: String,
+    id: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    platforms: Option<Vec<String>>,
+    #[serde(default)]
+    min_herdr_version: Option<String>,
+}
+
+/// One entry per manifest. Entries whose repository or manifest directory
+/// would not make a valid `owner/repo[/subdir]` install are dropped.
+fn herdr_entries(source: &MarketSource, text: &str) -> Result<(Vec<Entry>, Option<u64>)> {
+    let index: HerdrIndex = serde_json::from_str(text).context("not a herdr.dev plugin index")?;
+    if index.schema_version != 1 {
+        bail!(
+            "unsupported herdr.dev index schema {}",
+            index.schema_version
+        );
+    }
+    let mut entries = Vec::new();
+    for repo in index.plugins {
+        for manifest in repo.manifests {
+            let Some(dir) = manifest.path.strip_suffix("herdr-plugin.toml") else {
+                continue;
+            };
+            let dir = crate::source::normalize_subdir(dir);
+            let subdir = (!dir.is_empty()).then_some(dir);
+            let spec = match &subdir {
+                Some(dir) => format!("{}/{dir}", repo.full_name),
+                None => repo.full_name.clone(),
+            };
+            if crate::source::parse(&spec, &Default::default()).is_err() {
+                continue;
+            }
+            let web_url = match &subdir {
+                Some(dir) => format!("https://github.com/{}/tree/HEAD/{dir}", repo.full_name),
+                None => format!("https://github.com/{}", repo.full_name),
+            };
+            entries.push(Entry {
+                market: source.name.clone(),
+                title: util::sanitize(&spec),
+                plugin_id: Some(util::sanitize(&manifest.id)),
+                version: manifest
+                    .version
+                    .as_deref()
+                    .map(util::sanitize)
+                    .filter(|v| !v.is_empty()),
+                description: util::sanitize(
+                    manifest
+                        .description
+                        .as_deref()
+                        .or(repo.description.as_deref())
+                        .unwrap_or(""),
+                ),
+                install: repo.full_name.clone(),
+                subdir,
+                git_ref: None,
+                stars: repo.stars,
+                updated_unix: repo
+                    .pushed_at
+                    .as_deref()
+                    .and_then(util::parse_iso8601)
+                    .unwrap_or(0),
+                web_url: Some(web_url),
+                platforms: manifest.platforms,
+                min_herdr_version: manifest.min_herdr_version,
+                image: repo.full_name.split('/').next().map(github_avatar),
+            });
+        }
+    }
+    Ok((entries, index.plugin_count))
+}
+
+fn fetch_herdr(source: &MarketSource, cached: Option<&Listing>) -> Result<Option<Listing>> {
+    let url = source.url.as_deref().unwrap_or(HERDR_INDEX_URL);
+    let headers = [("Accept", "application/json".to_string())];
+    match http_get_static(url, &headers, cached)? {
+        Download::NotModified => Ok(None),
+        Download::Body {
+            text,
+            etag,
+            last_modified,
+        } => {
+            let (entries, total) = herdr_entries(source, &text)?;
+            Ok(Some(Listing {
+                entries,
+                total,
+                fetched_unix: util::now_unix(),
+                etag,
+                last_modified,
+            }))
+        }
+    }
 }
 
 fn filter_local(entries: &mut Vec<Entry>, query: &str) {
@@ -643,38 +877,78 @@ fn cache_file(source: &MarketSource, query: &str) -> std::path::PathBuf {
     paths::market_cache_dir().join(format!("{}.json", util::fnv1a64(&key)))
 }
 
-/// Fetches one source, using the cache unless `refresh`.
+/// GitHub search runs the query on the server; every other source lists its
+/// whole catalog once and is searched locally.
+fn cache_query<'a>(source: &MarketSource, query: &'a str) -> &'a str {
+    if source.kind == MarketKind::Github {
+        query
+    } else {
+        ""
+    }
+}
+
+fn read_cache(path: &Path) -> Option<Listing> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn narrowed(source: &MarketSource, mut listing: Listing, query: &str) -> Listing {
+    if source.kind != MarketKind::Github {
+        filter_local(&mut listing.entries, query);
+    }
+    listing.entries.truncate(source.max);
+    listing
+}
+
+/// The cached listing of one source, at any age.
+pub fn cached(source: &MarketSource, query: &str) -> Option<Listing> {
+    let listing = read_cache(&cache_file(source, cache_query(source, query)))?;
+    Some(narrowed(source, listing, query))
+}
+
+/// Fetches one source, using the cache while it is fresh unless `refresh`.
 pub fn fetch(
     source: &MarketSource,
     query: &str,
     refresh: bool,
     config: &Config,
 ) -> Result<Listing> {
-    let cache = cache_file(source, query);
+    let cache = cache_file(source, cache_query(source, query));
+    let previous = read_cache(&cache);
     if !refresh {
-        if let Ok(text) = std::fs::read_to_string(&cache) {
-            if let Ok(listing) = serde_json::from_str::<Listing>(&text) {
-                if util::now_unix().saturating_sub(listing.fetched_unix) < config.market_ttl {
-                    return Ok(listing);
-                }
-            }
+        if let Some(listing) = previous
+            .as_ref()
+            .filter(|l| util::now_unix().saturating_sub(l.fetched_unix) < config.market_ttl)
+        {
+            return Ok(narrowed(source, listing.clone(), query));
         }
     }
-    let listing = match source.kind {
-        MarketKind::Github => fetch_github(source, query, config),
-        MarketKind::Gitea => fetch_gitea(source, query),
-        MarketKind::Gitlab => fetch_gitlab(source, query),
-        MarketKind::Index => fetch_index(source, query),
-        MarketKind::GitIndex => fetch_git_index(source, query),
+    let downloaded = match source.kind {
+        MarketKind::Herdr => fetch_herdr(source, previous.as_ref()),
+        MarketKind::Github => fetch_github(source, query, config).map(Some),
+        MarketKind::Gitea => fetch_gitea(source).map(Some),
+        MarketKind::Gitlab => fetch_gitlab(source).map(Some),
+        MarketKind::Index => fetch_index(source, previous.as_ref()),
+        MarketKind::GitIndex => fetch_git_index(source).map(Some),
     }
     .with_context(|| format!("marketplace {:?}", source.name))?;
+    let listing = match (downloaded, previous) {
+        (Some(listing), _) => listing,
+        (None, Some(mut unchanged)) => {
+            unchanged.fetched_unix = util::now_unix();
+            unchanged
+        }
+        (None, None) => bail!(
+            "marketplace {:?}: not modified, but nothing is cached",
+            source.name
+        ),
+    };
     if let Some(parent) = cache.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string(&listing) {
         let _ = std::fs::write(&cache, text);
     }
-    Ok(listing)
+    Ok(narrowed(source, listing, query))
 }
 
 pub struct SourceResult {
@@ -718,9 +992,80 @@ pub fn search_all(
     })
 }
 
+/// Every enabled source's cached listing, at any age, without a request.
+pub fn cached_all(config: &Config, query: &str, only: Option<&str>) -> Vec<(String, Listing)> {
+    config
+        .marketplace
+        .iter()
+        .filter(|s| s.enabled && only.is_none_or(|o| o == s.name))
+        .filter_map(|s| cached(s, query).map(|l| (s.name.clone(), l)))
+        .collect()
+}
+
+/// What a refresh changed, keyed by source and install spec.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    pub added: usize,
+    pub removed: usize,
+    pub updated: usize,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.added == 0 && self.removed == 0 && self.updated == 0
+    }
+}
+
+pub fn changes(old: &[Entry], new: &[Entry]) -> Changes {
+    let key = |e: &Entry| (e.market.clone(), e.install_spec());
+    let before: HashMap<_, &Entry> = old.iter().map(|e| (key(e), e)).collect();
+    let after: HashSet<_> = new.iter().map(key).collect();
+    let mut changes = Changes::default();
+    for entry in new {
+        match before.get(&key(entry)) {
+            None => changes.added += 1,
+            Some(o) if o.version != entry.version || o.updated_unix != entry.updated_unix => {
+                changes.updated += 1
+            }
+            Some(_) => {}
+        }
+    }
+    changes.removed = before.keys().filter(|k| !after.contains(*k)).count();
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_come_from_the_first_listed_field_made_absolute() {
+        let gitlab = serde_json::json!({
+            "avatar_url": null,
+            "namespace": { "avatar_url": "/uploads/-/system/group/avatar/1/a.png" }
+        });
+        assert_eq!(
+            image_at(
+                &gitlab,
+                &["/avatar_url", "/namespace/avatar_url"],
+                Some("https://gitlab.com/")
+            ),
+            Some("https://gitlab.com/uploads/-/system/group/avatar/1/a.png".into())
+        );
+        let gitea = serde_json::json!({
+            "avatar_url": "",
+            "owner": { "avatar_url": "https://codeberg.org/avatars/abc" }
+        });
+        assert_eq!(
+            image_at(
+                &gitea,
+                &["/avatar_url", "/owner/avatar_url"],
+                Some("https://codeberg.org")
+            ),
+            Some("https://codeberg.org/avatars/abc".into())
+        );
+        assert_eq!(image_at(&gitea, &["/missing"], None), None);
+    }
 
     fn entry(title: &str, stars: u64, updated: u64) -> Entry {
         Entry {
@@ -737,6 +1082,7 @@ mod tests {
             web_url: None,
             platforms: None,
             min_herdr_version: None,
+            image: None,
         }
     }
 
@@ -786,5 +1132,54 @@ mod tests {
     #[test]
     fn url_encoding() {
         assert_eq!(enc("topic:herdr-plugin foo"), "topic%3Aherdr-plugin%20foo");
+    }
+
+    fn herdr_source() -> MarketSource {
+        crate::config::Config::default().marketplace.remove(0)
+    }
+
+    #[test]
+    fn herdr_index_lists_every_manifest_as_an_installable_entry() {
+        let text = r#"{
+          "schemaVersion": 1, "pluginCount": 4,
+          "plugins": [
+            {"fullName": "acme/tools", "description": "repo text", "stars": 7,
+             "pushedAt": "2026-11-03T05:46:33Z",
+             "manifests": [
+               {"path": "herdr-plugin.toml", "id": "acme.root", "version": "1.0.0"},
+               {"path": "plugins/notify/herdr-plugin.toml", "id": "acme.notify",
+                "description": "notify text", "platforms": ["linux"], "minHerdrVersion": "0.9.5"},
+               {"path": "../escape/herdr-plugin.toml", "id": "bad.escape"}
+             ]},
+            {"fullName": "not a repo", "manifests": [{"path": "herdr-plugin.toml", "id": "bad.repo"}]}
+          ]}"#;
+        let (entries, total) = herdr_entries(&herdr_source(), text).unwrap();
+        assert_eq!(total, Some(4));
+        let specs: Vec<String> = entries.iter().map(Entry::install_spec).collect();
+        assert_eq!(specs, ["acme/tools", "acme/tools/plugins/notify"]);
+        assert_eq!(entries[0].description, "repo text");
+        assert_eq!(entries[1].description, "notify text");
+        assert_eq!(entries[1].plugin_id.as_deref(), Some("acme.notify"));
+        assert_eq!(entries[1].min_herdr_version.as_deref(), Some("0.9.5"));
+        assert_eq!(entries[1].stars, Some(7));
+        assert!(entries[1].updated_unix > 0);
+        assert!(herdr_entries(&herdr_source(), r#"{"schemaVersion": 2, "plugins": []}"#).is_err());
+    }
+
+    #[test]
+    fn changes_between_listings() {
+        let old = vec![entry("a", 1, 10), entry("b", 1, 10), entry("c", 1, 10)];
+        let mut bumped = entry("b", 1, 20);
+        bumped.version = Some("2.0.0".into());
+        let new = vec![entry("a", 9, 10), bumped, entry("d", 0, 5)];
+        assert_eq!(
+            changes(&old, &new),
+            Changes {
+                added: 1,
+                removed: 1,
+                updated: 1
+            }
+        );
+        assert!(changes(&new, &new).is_empty());
     }
 }

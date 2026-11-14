@@ -1,0 +1,8 @@
+{
+  "name": "herdr-plugin-manager-commitlint",
+  "private": true,
+  "devDependencies": {
+    "@commitlint/cli": "20.1.0",
+    "@commitlint/config-conventional": "20.0.0"
+  }
+}

@@ -12,7 +12,9 @@ HPM="${1:-$(pwd)/target/debug/herdr-pm}"
 command -v herdr >/dev/null || { echo "e2e: herdr is not on PATH" >&2; exit 2; }
 [ -x "$HPM" ] || { echo "e2e: $HPM not found (cargo build first)" >&2; exit 2; }
 
-T="$(mktemp -d -t hpm-e2e.XXXXXX)"
+# Unix socket names are length-limited (especially on macOS); keep the
+# sandbox root short instead of inheriting a long per-user TMPDIR.
+T="$(mktemp -d /tmp/hpm-e2e.XXXXXX)"
 trap 'herdr server stop >/dev/null 2>&1 || true; [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null; rm -rf "$T"' EXIT
 export XDG_CONFIG_HOME="$T/cfg" XDG_STATE_HOME="$T/state" XDG_CACHE_HOME="$T/cache"
 export NO_COLOR=1 HERDR_PM_NO_TOKEN=1
@@ -111,9 +113,40 @@ contains "$out" "pinned"
 ok "pinned plugin is skipped"
 expect "unpin" "$HPM" unpin team.hello
 expect "update after unpin" "$HPM" update team.hello --yes
-out="$("$HPM" history team.hello)"
+out="$("$HPM" logs team.hello)"
 contains "$out" "rollback"
 ok "history records changes"
+
+# --- auto-update: disabled plugins too, no preview, then off again
+expect "auto-update enable on a disabled plugin" "$HPM" auto-update enable team.b
+out="$("$HPM" info team.b)"
+contains "$out" "auto-update"
+contains "$out" "on"
+sed -i.bak 's/0.2.0/0.3.0/g' "$T/work/mono/plugins/b/herdr-plugin.toml" && rm -f "$T/work/mono/plugins/b/herdr-plugin.toml.bak"
+git -C "$T/work/mono" commit -q -am "b 0.3.0"
+git -C "$T/work/mono" push -q "$SRV/team/mono.git" main
+out="$("$HPM" auto-update < /dev/null 2>&1)"
+contains "$out" "Updated team.b 0.3.0"
+out="$("$HPM" list)"
+contains "$out" "○ team.b"
+ok "auto-update applies without a preview and keeps the plugin disabled"
+out="$("$HPM" auto-update --hook event 2>&1)"
+[ -z "$out" ] || fail "the event hook updated with trigger = startup: $out"
+CFG="$("$HPM" config path)"
+mkdir -p "$(dirname "$CFG")"
+printf '[auto_update]\ntrigger = "min-interval"\nmin_interval = "1h"\n' > "$CFG"
+out="$("$HPM" auto-update --hook event 2>&1)"
+[ -z "$out" ] || fail "min-interval ran again within the interval: $out"
+REG="$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager/registry.json"
+sed -i.bak 's/"last_auto_update": [0-9]*/"last_auto_update": 0/' "$REG" && rm -f "$REG.bak"
+out="$("$HPM" auto-update --hook event 2>&1)"
+contains "$out" "team.b"
+rm -f "$CFG"
+ok "auto-update hooks follow the trigger"
+expect "auto-update disable" "$HPM" auto-update disable team.b
+out="$("$HPM" auto-update 2>&1)"
+contains "$out" "No plugin has auto-update turned on"
+expect_fail "auto-update refuses an unknown plugin" "$HPM" auto-update enable does.not.exist
 
 # --- abbreviated commit ids remain checkable
 SHORT="$(git -C "$T/work/hello" rev-parse --short HEAD)"
@@ -131,11 +164,22 @@ expect_fail "deleted tag is pruned from the mirror" "$HPM" switch team.hello v-t
 expect "restore default branch after tag test" "$HPM" unpin team.hello
 
 # --- a corrupt private registry must not masquerade as local links
-REG="$XDG_STATE_HOME/herdr/plugins/gitbridge/registry.json"
+REG="$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager/registry.json"
 cp "$REG" "$T/registry.good"
 printf 'not json\n' > "$REG"
 expect_fail "corrupt registry is reported" "$HPM" list
 mv "$T/registry.good" "$REG"
+
+# --- Git for Windows defaults to core.autocrlf=true: checkouts must still
+# --- carry the committed bytes, or the reviewed-manifest check fails
+plugin "$T/work/crlf" team.crlf Crlf 0.1.0
+publish "$T/work/crlf" crlf
+expect "install with core.autocrlf=true" env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.autocrlf GIT_CONFIG_VALUE_0=true "$HPM" install "$SRV/team/crlf.git" --yes
+root="$("$HPM" info team.crlf | sed -n 's/^root  *//p')"
+[ -f "$root/herdr-plugin.toml" ] || fail "no manifest under $root"
+if grep -q "$(printf '\r')" "$root/herdr-plugin.toml"; then fail "checkout rewrote line endings"; fi
+ok "checkouts keep the committed line endings"
+"$HPM" uninstall team.crlf --yes >/dev/null
 
 # --- refusals
 plugin "$T/work/newer" team.newer Newer 0.0.1
@@ -155,17 +199,12 @@ out="$("$HPM" list)"
 case "$out" in *team.quiet*) fail "installed without confirmation" ;; esac
 ok "refuses a non-interactive install without --yes"
 
-# --- path traversal and hostile import transports
+# --- path traversal and hostile Git transports
 expect_fail "rejects parent components in --subdir" "$HPM" install "$MONO" --subdir ../hello --yes
 MARKER="$T/ext-transport-ran"
-cat > "$T/hostile-import.json" <<EOF
-{"format":"gitbridge-export","version":1,"exported_unix":0,"plugins":[{"id":"hostile","kind":"git","source":"ext::touch $MARKER","enabled":true},{"id":"hostile-ansi","kind":"git","source":"https://example.invalid/repo\u001b[2K","enabled":true}]}
-EOF
-expect_fail "rejects ext transport in an import" env GIT_ALLOW_PROTOCOL=ext "$HPM" import "$T/hostile-import.json" --yes
-case "$out" in *"$(printf '\033')"*) fail "source URL escape reached the terminal" ;; esac
-ok "hostile source URLs are sanitized"
+expect_fail "rejects ext transport" env GIT_ALLOW_PROTOCOL=ext "$HPM" install "ext::touch $MARKER" --yes
 [ ! -e "$MARKER" ] || fail "ext transport executed before confirmation"
-ok "hostile import executes nothing"
+ok "hostile transport executes nothing"
 
 # --- terminal control sequences cannot rewrite the trust preview
 plugin "$T/work/ansi" team.ansi Ansi 0.1.0
@@ -205,8 +244,19 @@ srv = "$SRV/"
 name = "e2e"
 kind = "git-index"
 url = "$SRV/team/index.git"
+
+[[marketplace]]
+name = "herdr.dev"
+enabled = false
+
+[[marketplace]]
+name = "gitlab.com"
+enabled = false
 EOF
+out="$("$HPM" sources)"
+contains "$out" "e2e"
 out="$("$HPM" search)"
+if printf '%s' "$out" | grep -q "herdr.dev\|gitlab.com"; then fail "a disabled built-in source was searched"; fi
 contains "$out" "herdr-pm install file://$SRV/team/mono.git//plugins/b"
 ok "git-index marketplace lists monorepo plugins with subdirs"
 out="$("$HPM" search B --json)"
@@ -217,29 +267,198 @@ ok "search filters"
 "$HPM" uninstall team.b --yes >/dev/null
 expect "install through an alias" "$HPM" install "srv:team/mono.git//plugins/b" --yes
 
-# --- export / import into a fresh herdr
-"$HPM" export -o "$T/export.json" 2>/dev/null
-XDG_CONFIG_HOME="$T/cfg2" XDG_STATE_HOME="$T/state2" "$HPM" import "$T/export.json" --yes >/dev/null 2>&1 || fail "import"
-out="$(XDG_CONFIG_HOME="$T/cfg2" XDG_STATE_HOME="$T/state2" "$HPM" list)"
-contains "$out" "team.hello"
-contains "$out" "team.a"
-ok "import reproduces the plugin set"
-
 # --- git daemon transport (optional)
 if git daemon --help >/dev/null 2>&1; then
   port=$((20000 + $$ % 20000))
   git daemon --reuseaddr --base-path="$SRV" --export-all --port="$port" "$SRV" >/dev/null 2>&1 &
   DAEMON_PID=$!
-  sleep 1
+  # Wait until the daemon accepts connections (a fixed sleep raced on CI).
+  tries=0
+  until git ls-remote "git://127.0.0.1:$port/team/mono.git" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || fail "git daemon did not start"
+    sleep 0.2
+  done
   "$HPM" uninstall team.a --yes >/dev/null
   expect "install over git://" "$HPM" install "git://127.0.0.1:$port/team/mono.git//plugins/a" --yes
 fi
 
+# --- pinning the installed commit records it without reinstalling
+CUR="$("$HPM" info team.a | sed -n 's/^commit  *//p')"
+out="$("$HPM" pin team.a "$CUR" < /dev/null 2>&1)"
+contains "$out" "Pinned team.a"
+case "$out" in *preview*) fail "pinning the installed commit reinstalled it" ;; esac
+contains "$("$HPM" info team.a)" "pinned"
+expect "unpin" "$HPM" unpin team.a
+
+# --- delete completely
+CFG="$XDG_CONFIG_HOME/herdr/plugins/config/team.a"
+mkdir -p "$CFG" && touch "$CFG/settings.toml"
+expect "purge a git-managed plugin" "$HPM" uninstall team.a --purge --yes
+[ ! -e "$CFG" ] || fail "config directory survived --purge"
+ok "purge deletes the plugin's config directory"
+plugin "$T/dev/gone" team.gone Gone 0.1.0
+herdr plugin link "$T/dev/gone" >/dev/null
+expect "purge a local link" "$HPM" uninstall team.gone --purge --yes
+[ ! -e "$T/dev/gone" ] || fail "linked directory survived --purge"
+ok "purge deletes a local link's directory"
+
+# --- clean removes leftovers of removed plugins only, one or all
+GHOST="$XDG_CONFIG_HOME/herdr/plugins/config/team.ghost"
+OTHER="$XDG_CONFIG_HOME/herdr/plugins/config/team.other"
+KEEP="$XDG_CONFIG_HOME/herdr/plugins/config/team.hello"
+mkdir -p "$GHOST" "$OTHER" "$KEEP" "$XDG_STATE_HOME/herdr/plugins/team.ghost"
+expect "clean one" "$HPM" clean team.ghost --yes
+[ ! -e "$GHOST" ] || fail "clean kept the named plugin's config"
+[ ! -e "$XDG_STATE_HOME/herdr/plugins/team.ghost" ] || fail "clean kept the named plugin's state"
+[ -d "$OTHER" ] || fail "clean team.ghost deleted another removed plugin's config"
+if "$HPM" clean team.hello --yes >/dev/null 2>&1; then fail "clean accepted an installed plugin"; fi
+expect "clean all" "$HPM" clean --yes
+[ ! -e "$OTHER" ] || fail "clean without ids kept a removed plugin's config"
+[ -d "$KEEP" ] || fail "clean deleted an installed plugin's config"
+[ -d "$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager" ] || fail "clean deleted the manager's own data"
+ok "clean deletes only what the chosen removed plugins left"
+
+# --- explicit identity migration from a disabled v0.15 installation
+# The old installation paths include another plugin; none may move or be deleted.
+PROJECT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+(
+  export XDG_CONFIG_HOME="$T/migration-cfg" XDG_STATE_HOME="$T/migration-state"
+  export HERDR_PM_CLI_DIR="$T/migration-cli"
+  OLDHOME="$XDG_STATE_HOME/herdr/plugins/herdr-plugin-manager"
+  NEWHOME="$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager"
+  OLDCFG="$XDG_CONFIG_HOME/herdr/plugins/config/herdr-plugin-manager"
+  NEWCFG="$XDG_CONFIG_HOME/herdr/plugins/config/julienpoirou.herdr-plugin-manager"
+  OLDROOT="$OLDHOME/installs/manager/src"
+  EDITOR="$OLDHOME/installs/editor/src"
+  plugin "$OLDROOT" herdr-plugin-manager Manager 0.15.0
+  plugin "$EDITOR" ttt.editor Editor 1.0.0
+  printf 'untouched\n' > "$EDITOR/keep.txt"
+  herdr plugin link "$OLDROOT" --disabled >/dev/null
+  herdr plugin link "$EDITOR" >/dev/null
+  plugin "$T/work/manager" herdr-plugin-manager Manager 0.15.0
+  publish "$T/work/manager" manager
+  OLD_SHA="$(git -C "$T/work/manager" rev-parse HEAD)"
+  mkdir -p "$OLDCFG"
+  cat > "$T/migration-config.toml" <<EOF
+logos = false
+cli_on_path = false
+agent_skill = false
+history = "ecs"
+[auto_update]
+strategy = "latest"
+trigger = "startup"
+min_interval = "3h"
+[auto_update.plugins]
+"herdr-plugin-manager" = "latest"
+EOF
+  ln -s "$T/migration-config.toml" "$OLDCFG/config.toml"
+  cat > "$T/migration-registry.json" <<EOF
+{"version":1,"plugins":{"herdr-plugin-manager":{"id":"herdr-plugin-manager","name":"Manager","url":"$SRV/team/manager.git","requested_ref":"main","current":{"commit":"$OLD_SHA","version":"0.15.0","plugin_root":"$OLDROOT","install_dir":"$OLDHOME/installs/manager","requested_ref":"main","installed_unix":1},"previous":[],"first_installed_unix":1},"ttt.editor":{"id":"ttt.editor","name":"Editor","url":"$HELLO","requested_ref":"main","current":{"commit":"$OLD_SHA","version":"1.0.0","plugin_root":"$EDITOR","install_dir":"$OLDHOME/installs/editor","requested_ref":"main","installed_unix":2},"previous":[],"first_installed_unix":2}},"auto_update":["herdr-plugin-manager","ttt.editor"],"pins":{"herdr-plugin-manager":"$OLD_SHA","ttt.editor":"kept"},"last_auto_update":42}
+EOF
+  ln -s "$T/migration-registry.json" "$OLDHOME/registry.json"
+  printf '{"unix":1,"action":"install","plugin_id":"herdr-plugin-manager","ok":true}\n' > "$OLDHOME/history.jsonl"
+  cat > "$XDG_CONFIG_HOME/herdr/config.toml" <<EOF
+[[keys.command]]
+key = "prefix+p"
+type = "plugin_action"
+command = "herdr-plugin-manager.open"
+EOF
+  expect_fail "legacy state requires explicit migration" "$HPM" list
+  expect "migration dry-run" "$HPM" migrate "$PROJECT" --binary "$HPM" --dry-run
+  [ ! -e "$NEWHOME/registry.json" ] || fail "migration dry-run wrote a registry"
+  [ ! -e "$NEWCFG" ] || fail "migration dry-run moved config"
+  expect "migrate disabled legacy manager" "$HPM" migrate "$PROJECT" --binary "$HPM" --yes
+  [ -L "$NEWHOME/registry.json" ] || fail "migration replaced registry symlink"
+  [ -L "$NEWCFG/config.toml" ] || fail "migration replaced config symlink"
+  [ "$(cat "$EDITOR/keep.txt")" = untouched ] || fail "migration changed unrelated plugin files"
+  contains "$(cat "$OLDROOT/herdr-plugin.toml")" 'id = "herdr-plugin-manager"'
+  contains "$(cat "$NEWCFG/config.toml")" 'icons = false'
+  contains "$(cat "$NEWCFG/config.toml")" 'min_interval = "3h"'
+  contains "$(cat "$XDG_CONFIG_HOME/herdr/config.toml")" 'julienpoirou.herdr-plugin-manager.open'
+  contains "$(cat "$NEWHOME/registry.json")" '"last_auto_update": 42'
+  contains "$(cat "$NEWHOME/registry.json")" "\"ttt.editor\": \"kept\""
+  SNAPSHOT_SHA="$(git -C "$PROJECT" rev-parse HEAD)"
+  contains "$(cat "$NEWHOME/registry.json")" "\"julienpoirou.herdr-plugin-manager\": \"$SNAPSHOT_SHA\""
+  out="$("$HPM" info julienpoirou.herdr-plugin-manager --json)"
+  contains "$out" '"enabled": "false"'
+  contains "$("$HPM" logs)" 'herdr-plugin-manager'
+  expect "repeat migration is harmless" "$HPM" migrate "$PROJECT" --binary "$HPM" --yes
+  expect_fail "legacy rollback cannot relink an old-id manifest" "$HPM" rollback julienpoirou.herdr-plugin-manager --yes
+  expect "clean retains referenced legacy installation roots" "$HPM" clean --yes
+  [ -f "$EDITOR/keep.txt" ] && [ -f "$OLDROOT/herdr-plugin.toml" ] || fail "clean deleted retained installation roots"
+  plugin "$T/work/manager" julienpoirou.herdr-plugin-manager Manager 0.16.0
+  git -C "$T/work/manager" commit -q -am "canonical identity"
+  git -C "$T/work/manager" push -q "$SRV/team/manager.git" main
+  expect "migrated manager updates from its preserved git remote" "$HPM" update julienpoirou.herdr-plugin-manager --yes
+  contains "$("$HPM" info julienpoirou.herdr-plugin-manager)" '0.16.0'
+  [ "$(cat "$EDITOR/keep.txt")" = untouched ] || fail "updating manager touched editor"
+  printf '%s\n' "$pass" > "$T/migration-pass"
+)
+pass="$(cat "$T/migration-pass")"
+
+# --- opt-in continuous local backup observes external edits, never commits
+(
+  export XDG_CONFIG_HOME="$T/backup-cfg" XDG_STATE_HOME="$T/backup-state"
+  "$HPM" install "$HELLO" --yes >/dev/null 2>&1 || fail "backup fixture install"
+  CFG="$XDG_CONFIG_HOME/herdr/plugins/config/julienpoirou.herdr-plugin-manager/config.toml"
+  PLUGINCFG="$XDG_CONFIG_HOME/herdr/plugins/config/team.hello"
+  SNAP="$XDG_STATE_HOME/herdr/plugins/julienpoirou.herdr-plugin-manager/backup"
+  mkdir -p "$(dirname "$CFG")" "$PLUGINCFG"
+  printf 'value = "one"\n' > "$PLUGINCFG/custom.toml"
+  printf 'secret = "not-selected"\n' > "$PLUGINCFG/private.toml"
+  printf '[backup]\nenabled = true\nfiles = ["plugins/team.hello/custom.toml"]\n' > "$CFG"
+  trap 'printf "[backup]\nenabled = false\n" > "$CFG"; "$HPM" config show >/dev/null 2>&1 || true' EXIT
+  expect "start continuous local backup" "$HPM" list
+  tries=0
+  until [ -f "$SNAP/plugins/team.hello/custom.toml" ] && [ "$(cat "$SNAP/plugins/team.hello/custom.toml")" = 'value = "one"' ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 15 ] || fail "backup did not capture initial selected file"
+    sleep 1
+  done
+  printf 'value = "two"\n' > "$PLUGINCFG/custom.toml"
+  tries=0
+  until [ "$(cat "$SNAP/plugins/team.hello/custom.toml")" = 'value = "two"' ]; do
+    tries=$((tries + 1)); [ "$tries" -lt 15 ] || fail "backup did not observe external config edit"
+    sleep 1
+  done
+  [ ! -e "$SNAP/plugins/team.hello/private.toml" ] || fail "backup copied an unapproved plaintext file"
+  if git -C "$SNAP" rev-parse --verify HEAD >/dev/null 2>&1; then fail "continuous backup committed without push"; fi
+  printf '[backup]\nenabled = false\n' > "$CFG"
+  expect "stop continuous local backup" "$HPM" config show
+  trap - EXIT
+  ok "external edits are captured locally and plaintext approval is enforced"
+  printf '%s\n' "$pass" > "$T/backup-pass"
+)
+pass="$(cat "$T/backup-pass")"
+
 # --- with a live server
 herdr server >/dev/null 2>&1 &
+SERVER_PID=$!
 sleep 2
 expect "disable (server)" "$HPM" disable team.hello
 expect "enable (server)" "$HPM" enable team.hello
+
+# Pull changes Herdr config through the live reload API, not a handoff/restart.
+git init -q --bare --initial-branch=main "$T/live-backup.git"
+mkdir -p "$T/live-manager-config" "$XDG_CONFIG_HOME/herdr"
+[ -f "$XDG_CONFIG_HOME/herdr/config.toml" ] || printf 'onboarding = false\n' > "$XDG_CONFIG_HOME/herdr/config.toml"
+cat > "$T/live-manager-config/config.toml" <<EOF
+[backup]
+enabled = false
+remote = "$T/live-backup.git"
+files = ["herdr/config.toml"]
+EOF
+expect "push live configuration" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" push --yes
+git clone -q "$T/live-backup.git" "$T/live-editor"
+printf '\n# synchronized live configuration\n' >> "$T/live-editor/herdr/config.toml"
+git -C "$T/live-editor" add herdr/config.toml
+git -C "$T/live-editor" commit -q -m "change live config"
+git -C "$T/live-editor" push -q
+expect "pull and reload live configuration" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" pull --yes
+contains "$(cat "$XDG_CONFIG_HOME/herdr/config.toml")" '# synchronized live configuration'
+kill -0 "$SERVER_PID" || fail "pull replaced or stopped the running Herdr server"
+ok "GitOps applies live config without replacing the server"
+
 expect "doctor" sh -c "'$HPM' doctor || true"
 expect "uninstall" "$HPM" uninstall team.hello --yes
 out="$("$HPM" list)"

@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// The plugin id declared in `herdr-plugin.toml`.
-pub const PLUGIN_ID: &str = "gitbridge";
+pub const PLUGIN_ID: &str = "julienpoirou.herdr-plugin-manager";
+
+/// Only used by the explicit, one-time identity migration.
+pub const OLD_PLUGIN_ID: &str = "herdr-plugin-manager";
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
@@ -192,8 +195,10 @@ pub fn market_cache_dir() -> PathBuf {
     pm_home().join("cache").join("market")
 }
 
-pub fn history_file() -> PathBuf {
-    pm_home().join("history.jsonl")
+pub fn log_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::config::Config::load_read_only()?
+        .log_dir
+        .unwrap_or_else(pm_home))
 }
 
 #[cfg(test)]

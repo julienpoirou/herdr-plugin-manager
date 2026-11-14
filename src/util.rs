@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -184,6 +184,18 @@ pub fn format_unix(ts: u64) -> String {
     )
 }
 
+/// `2026-10-25T14:03:09Z`
+pub fn format_iso8601(ts: u64) -> String {
+    let (y, m, d) = civil_from_days((ts / 86_400) as i64);
+    let secs = ts % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Parses the ISO 8601 timestamps forges return (`2026-10-08T12:34:56Z`,
 /// `2026-10-08T12:34:56.123+02:00`). Returns unix seconds.
 pub fn parse_iso8601(value: &str) -> Option<u64> {
@@ -273,32 +285,79 @@ pub fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
+/// One line of input after a prompt on stderr, trimmed.
+pub fn ask_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt} ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// `90s`, `30m`, `6h`, `1d`, `1h30m` in seconds; None when malformed.
+pub fn parse_duration(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut number = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let unit = match ch {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        let n: u64 = number.parse().ok()?;
+        total = total.checked_add(n.checked_mul(unit)?)?;
+        number.clear();
+    }
+    number.is_empty().then_some(total)
+}
+
+/// `512 B`, `4.0 KB`, `12.3 MB`: one decimal from a kilobyte up.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
 /// Splits an input line like a shell would for simple cases: whitespace
-/// separates words, single or double quotes group them, backslash escapes.
+/// separates words, single or double quotes group them, and a backslash
+/// escapes a quote, a space or another backslash. Any other backslash is
+/// kept, so Windows paths (`C:\Users\…`) survive.
 pub fn split_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
-    let mut chars = input.chars();
+    let mut chars = input.chars().peekable();
+    let escapable = |c: char| c == '\\' || c == '"' || c == '\'' || c.is_whitespace();
     while let Some(ch) = chars.next() {
         match (quote, ch) {
             (Some(q), c) if c == q => quote = None,
-            (Some(_), '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
+            (_, '\\') if chars.peek().is_some_and(|&n| escapable(n)) => {
+                current.extend(chars.next());
+                in_word = true;
             }
             (Some(_), c) => current.push(c),
             (None, '\'' | '"') => {
                 quote = Some(ch);
                 in_word = true;
-            }
-            (None, '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                    in_word = true;
-                }
             }
             (None, c) if c.is_whitespace() => {
                 if in_word {
@@ -371,6 +430,45 @@ pub fn run_captured(mut command: Command, timeout: Option<Duration>) -> Result<O
         Some(timeout) => wait_with_timeout(child, timeout),
         None => Ok(child.wait_with_output()?),
     }
+}
+
+/// Runs a command with stdin closed, handing every line it prints (stdout
+/// and stderr, as they come) to `on_line`. Returns its exit status.
+pub fn stream_command(command: &mut Command, on_line: &dyn Fn(&str)) -> Result<ExitStatus> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let program = format!("{:?}", command.get_program());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start {program}"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    let stdout = child
+        .stdout
+        .take()
+        .map(|s| Box::new(s) as Box<dyn io::Read + Send>);
+    let stderr = child
+        .stderr
+        .take()
+        .map(|s| Box::new(s) as Box<dyn io::Read + Send>);
+    for pipe in [stdout, stderr].into_iter().flatten() {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx);
+    for line in rx {
+        on_line(line.trim_end_matches('\r'));
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    Ok(child.wait()?)
 }
 
 /// Opens a URL with the platform's default handler, detached and silent.
@@ -453,6 +551,8 @@ mod tests {
     fn iso_dates_roundtrip() {
         let ts = parse_iso8601("2026-10-08T12:34:56Z").unwrap();
         assert_eq!(format_unix(ts), "2026-10-08 12:34 UTC");
+        assert_eq!(format_iso8601(ts), "2026-10-08T12:34:56Z");
+        assert_eq!(parse_iso8601(&format_iso8601(ts)), Some(ts));
         let with_offset = parse_iso8601("2026-10-08T14:34:56.123+02:00").unwrap();
         assert_eq!(with_offset, ts);
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
@@ -464,7 +564,36 @@ mod tests {
             split_words(r#"ssh://h/a.git --ref "v 1" --subdir 'x y' a\ b"#),
             vec!["ssh://h/a.git", "--ref", "v 1", "--subdir", "x y", "a b"]
         );
+        assert_eq!(
+            split_words(r#"C:\srv\git\a.git "C:\Program Files\Editor\edit.exe" -w"#),
+            vec![
+                r"C:\srv\git\a.git",
+                r"C:\Program Files\Editor\edit.exe",
+                "-w"
+            ]
+        );
         assert!(split_words("   ").is_empty());
+    }
+
+    #[test]
+    fn durations_parse_with_units_only() {
+        assert_eq!(parse_duration("90s"), Some(90));
+        assert_eq!(parse_duration("6h"), Some(21_600));
+        assert_eq!(parse_duration("1h30m"), Some(5_400));
+        assert_eq!(parse_duration(" 1d "), Some(86_400));
+        assert_eq!(parse_duration("6"), None);
+        assert_eq!(parse_duration("h"), None);
+        assert_eq!(parse_duration("6x"), None);
+        assert_eq!(parse_duration(""), None);
+    }
+
+    #[test]
+    fn sizes_read_like_a_file_manager() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(12_900_000), "12.3 MB");
+        assert_eq!(human_size(1 << 30), "1.0 GB");
     }
 
     #[test]

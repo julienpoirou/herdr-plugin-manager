@@ -20,8 +20,11 @@ const REMOTE_HEAD: &str = "refs/hpm/remote-head";
 #[derive(Debug, Clone, Copy)]
 pub struct Git {
     /// Interactive calls may prompt for credentials or an SSH passphrase;
-    /// background calls must fail fast instead.
+    /// the others must fail instead of waiting for an answer.
     pub interactive: bool,
+    /// Background checks give up after a timeout; user-started operations
+    /// wait for large fetches and submodules.
+    pub bounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,9 +42,9 @@ pub struct CommitInfo {
 }
 
 /// Rejects option injection and Git's ext/remote-helper transports. All
-/// callers, including JSON imports, must pass through this boundary before
+/// callers, including GitOps snapshots, must pass through this boundary before
 /// any network process can run.
-fn validate_remote(url: &str) -> Result<()> {
+pub(crate) fn validate_remote(url: &str) -> Result<()> {
     if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
         bail!("unsafe git remote {url:?}");
     }
@@ -72,11 +75,31 @@ fn validate_remote(url: &str) -> Result<()> {
 }
 
 impl Git {
-    pub const FOREGROUND: Git = Git { interactive: true };
-    pub const BACKGROUND: Git = Git { interactive: false };
+    pub const FOREGROUND: Git = Git {
+        interactive: true,
+        bounded: false,
+    };
+    pub const BACKGROUND: Git = Git {
+        interactive: false,
+        bounded: true,
+    };
+    /// No prompts (nobody watches the terminal) and no timeouts.
+    pub const UNATTENDED: Git = Git {
+        interactive: false,
+        bounded: false,
+    };
 
     fn command(&self) -> Command {
         let mut command = Command::new("git");
+        #[cfg(windows)]
+        if std::env::var_os("HERDR_PM_BACKUP_GENERATION").is_some() {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        // Check out the committed bytes. Git for Windows defaults to
+        // core.autocrlf=true, which rewrote manifests (failing the
+        // reviewed-manifest check) and shell scripts (breaking builds).
+        command.args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"]);
         command.env("LC_ALL", "C");
         command.env("GIT_ADVICE", "0");
         if !self.interactive {
@@ -95,15 +118,25 @@ impl Git {
     }
 
     fn timeout(&self, network: bool) -> Option<Duration> {
-        match (self.interactive, network) {
-            (true, _) => None,
-            (false, true) => Some(Duration::from_secs(45)),
-            (false, false) => Some(Duration::from_secs(20)),
+        match (self.bounded, network) {
+            (false, _) => None,
+            (true, true) => Some(Duration::from_secs(45)),
+            (true, false) => Some(Duration::from_secs(20)),
         }
     }
 
     /// Runs git and returns trimmed stdout.
     pub fn run(&self, cwd: Option<&Path>, args: &[&str], network: bool) -> Result<String> {
+        Ok(
+            String::from_utf8_lossy(&self.run_bytes(cwd, args, network)?)
+                .trim()
+                .to_string(),
+        )
+    }
+
+    /// Runs git without trimming or decoding its output (blob bytes and NUL
+    /// separated tree/path listings must retain their exact contents).
+    pub fn run_bytes(&self, cwd: Option<&Path>, args: &[&str], network: bool) -> Result<Vec<u8>> {
         let mut command = self.command();
         command.args(args);
         if let Some(cwd) = cwd {
@@ -145,7 +178,7 @@ impl Git {
             }
             bail!("git {}: {message}", args.first().copied().unwrap_or(""));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(output.stdout)
     }
 
     pub fn version(&self) -> Result<String> {
@@ -418,15 +451,31 @@ impl Git {
             // Submodule URLs relative to the original remote resolve
             // correctly now that origin points back at it. A partial checkout
             // must never reach a build or be linked into Herdr.
-            Git::FOREGROUND
-                .run(
-                    Some(dest),
-                    &["submodule", "update", "--init", "--recursive", "--quiet"],
-                    true,
-                )
-                .context("could not initialize repository submodules")?;
+            self.run(
+                Some(dest),
+                &["submodule", "update", "--init", "--recursive", "--quiet"],
+                true,
+            )
+            .context("could not initialize repository submodules")?;
         }
         Ok(())
+    }
+
+    /// Every tag on the remote, newest version first (one `git ls-remote`).
+    pub fn list_tags(&self, url: &str) -> Result<Vec<RemoteTag>> {
+        validate_remote(url)?;
+        let out = self.run(None, &["ls-remote", "--tags", "--", url], true)?;
+        Ok(parse_tags(&out))
+    }
+
+    /// Name of the remote's default branch (`main`, `master`, …).
+    pub fn default_branch(&self, url: &str) -> Result<Option<String>> {
+        validate_remote(url)?;
+        let out = self.run(None, &["ls-remote", "--symref", "--", url, "HEAD"], true)?;
+        Ok(out.lines().find_map(|line| {
+            let target = line.strip_prefix("ref:")?.split_whitespace().next()?;
+            target.strip_prefix("refs/heads/").map(str::to_string)
+        }))
     }
 }
 
@@ -456,6 +505,92 @@ pub fn parse_ls_remote(out: &str, name: &str) -> Option<String> {
         }
     }
     peeled.or(tag).or(branch).or(head)
+}
+
+/// A tag and the commit it points to (peeled for annotated tags).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTag {
+    pub name: String,
+    pub commit: String,
+}
+
+/// `v1.10.0` → `[1, 10, 0]` and whether a suffix such as `-rc.1` follows.
+fn version_key(name: &str) -> Option<(Vec<u64>, bool)> {
+    let rest = name.strip_prefix(['v', 'V']).unwrap_or(name);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let numbers = rest[..end]
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    Some((numbers, end < rest.len()))
+}
+
+fn cmp_versions(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    (0..a.len().max(b.len()))
+        .map(|i| a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)))
+        .find(|o| o.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The newest release tag above `current` whose first `same` numbers match
+/// it: 0 allows any newer release, 1 keeps the major version, 2 the minor.
+/// Pre-releases are skipped. `tags` comes from `parse_tags`.
+pub fn newest_release<'a>(
+    tags: &'a [RemoteTag],
+    current: &str,
+    same: usize,
+) -> Option<&'a RemoteTag> {
+    let current = version_key(current).map(|(numbers, _)| numbers);
+    if current.is_none() && same > 0 {
+        return None;
+    }
+    tags.iter().find(|tag| {
+        let Some((numbers, false)) = version_key(&tag.name) else {
+            return false;
+        };
+        match &current {
+            None => true,
+            Some(current) => {
+                cmp_versions(&numbers, current).is_gt()
+                    && (0..same)
+                        .all(|i| numbers.get(i).unwrap_or(&0) == current.get(i).unwrap_or(&0))
+            }
+        }
+    })
+}
+
+/// Tags from `git ls-remote --tags`, versions first (highest first, a
+/// release before its pre-releases), then other names in reverse order.
+pub fn parse_tags(out: &str) -> Vec<RemoteTag> {
+    let mut commits: std::collections::BTreeMap<String, String> = Default::default();
+    let mut peeled = std::collections::HashSet::new();
+    for line in out.lines() {
+        let Some((sha, reference)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(name) = reference.trim().strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if let Some(base) = name.strip_suffix("^{}") {
+            commits.insert(base.to_string(), sha.trim().to_string());
+            peeled.insert(base.to_string());
+        } else if !peeled.contains(name) {
+            commits.insert(name.to_string(), sha.trim().to_string());
+        }
+    }
+    let mut tags: Vec<RemoteTag> = commits
+        .into_iter()
+        .map(|(name, commit)| RemoteTag { name, commit })
+        .collect();
+    tags.sort_by(|a, b| match (version_key(&a.name), version_key(&b.name)) {
+        (Some((va, pa)), Some((vb, pb))) => vb.cmp(&va).then(pa.cmp(&pb)).then(b.name.cmp(&a.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.name.cmp(&a.name),
+    });
+    tags
 }
 
 /// `<cache>/repos/<readable>-<hash>.git` so the same remote always maps to
@@ -489,6 +624,54 @@ mod tests {
         let out = "4444444444444444444444444444444444444444\tHEAD\n";
         assert_eq!(parse_ls_remote(out, "").unwrap(), "4".repeat(40));
         assert!(parse_ls_remote("", "main").is_none());
+    }
+
+    #[test]
+    fn tags_peel_and_sort_by_version() {
+        let out = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.2.0
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.2.0^{}
+cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v1.10.0
+dddddddddddddddddddddddddddddddddddddddd\trefs/tags/v1.10.0-rc.1
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/nightly
+ffffffffffffffffffffffffffffffffffffffff\trefs/tags/0.9
+";
+        let tags = parse_tags(out);
+        let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["v1.10.0", "v1.10.0-rc.1", "v1.2.0", "0.9", "nightly"]
+        );
+        assert_eq!(tags[2].commit, "b".repeat(40));
+    }
+
+    #[test]
+    fn release_strategies_pick_the_allowed_newest_tag() {
+        let tag = |name: &str| RemoteTag {
+            name: name.into(),
+            commit: String::new(),
+        };
+        // parse_tags order: highest first, a release before its pre-releases.
+        let tags = [
+            tag("v3.0.0-rc.1"),
+            tag("v2.1.0"),
+            tag("v2.0.1"),
+            tag("v1.4.2"),
+            tag("v1.4"),
+            tag("v1.3.9"),
+            tag("nightly"),
+        ];
+        let pick = |current: &str, same: usize| {
+            newest_release(&tags, current, same).map(|t| t.name.as_str())
+        };
+        assert_eq!(pick("1.3.9", 0), Some("v2.1.0"));
+        assert_eq!(pick("1.3.9", 1), Some("v1.4.2"));
+        assert_eq!(pick("1.3.9", 2), None);
+        assert_eq!(pick("1.4.0", 2), Some("v1.4.2"));
+        assert_eq!(pick("v1.4", 2), Some("v1.4.2"));
+        assert_eq!(pick("2.1.0", 0), None);
+        assert_eq!(pick("main", 0), Some("v2.1.0"));
+        assert_eq!(pick("main", 1), None);
     }
 
     #[test]

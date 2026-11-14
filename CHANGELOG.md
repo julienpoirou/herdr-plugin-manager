@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.2...v0.18.3) (2026-11-14)
+
+
+### Corrections 🐛
+
+* Remove failing marketplace and harden project tooling ([#64](https://github.com/julienpoirou/herdr-plugin-manager/issues/64)) ([4d31c24](https://github.com/julienpoirou/herdr-plugin-manager/commit/4d31c24bb9f34e97ec5006289ba9815282e7eedd))
+
 ## [0.18.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.1...v0.18.2) (2026-11-13)
 
 

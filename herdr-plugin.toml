@@ -7,8 +7,6 @@ min_herdr_version = "0.7.4"
 description = "Installs Herdr plugins from any Git transport with reviewed builds, version history and multi-forge discovery."
 platforms = ["linux", "macos", "windows"]
 
-# Builds bin/herdr-pm from source (needs a Rust toolchain), unless a
-# matching prebuilt bin/herdr-pm is already in the checkout.
 [[build]]
 platforms = ["linux", "macos"]
 command = ["sh", "scripts/build.sh"]
@@ -31,8 +29,6 @@ title = "Open plugin manager"
 contexts = ["workspace"]
 command = ["./bin/herdr-pm", "open"]
 
-# Auto-update (A in the popup). `[auto_update] trigger` in config.toml decides
-# which of these updates; the others exit right after reading it.
 [[startup]]
 command = ["./bin/herdr-pm", "auto-update", "--hook", "startup"]
 

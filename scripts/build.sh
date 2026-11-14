@@ -1,6 +1,5 @@
 #!/bin/sh
-# Produces bin/herdr-pm for the plugin. Herdr runs this on install; run it
-# yourself after `herdr plugin link` during development.
+# Produces bin/herdr-pm for the plugin.
 #
 # A prebuilt bin/herdr-pm whose version matches herdr-plugin.toml is kept as
 # is, so a branch that ships binaries installs without a Rust toolchain.
@@ -25,12 +24,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-# One shared target directory: installations stay small (no 250 MB target/
-# per kept version) and rebuilds after an update are incremental.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/herdr-plugin-manager/target"
   export CARGO_TARGET_DIR
 fi
+
 echo "herdr-plugin-manager: building $want with $(cargo --version)"
 cargo build --release --locked --quiet
 cp "$CARGO_TARGET_DIR/release/herdr-pm" bin/herdr-pm.tmp

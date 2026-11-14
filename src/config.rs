@@ -417,17 +417,11 @@ fn market(name: &str, kind: MarketKind, url: Option<&str>) -> MarketSource {
     }
 }
 
-/// herdr.dev, gitlab.com and codeberg.org, searched by the `herdr-plugin`
-/// topic.
+/// herdr.dev and gitlab.com, listing plugins tagged `herdr-plugin`.
 pub fn builtin_markets() -> Vec<MarketSource> {
     vec![
         market("herdr.dev", MarketKind::Herdr, None),
         market("gitlab.com", MarketKind::Gitlab, Some("https://gitlab.com")),
-        market(
-            "codeberg.org",
-            MarketKind::Gitea,
-            Some("https://codeberg.org"),
-        ),
     ]
 }
 
@@ -454,8 +448,8 @@ impl Default for Config {
     }
 }
 
-pub const EXAMPLE: &str = r#"# C in the popup edits this file. herdr.dev, gitlab.com and codeberg.org
-# are built-in marketplaces; the README lists every key.
+pub const EXAMPLE: &str = r#"# C in the popup edits this file. herdr.dev and gitlab.com
+# are built-in marketplaces; the guide lists every key.
 
 keep_installs = 3   # versions kept for rollback
 market_ttl = 600    # seconds
@@ -482,7 +476,7 @@ impl Config {
 
     /// A `[[marketplace]]` block named like a built-in source takes the
     /// built-in's `kind` and `url` unless it sets them, so
-    /// `name = "codeberg.org"` with `enabled = false` only hides it.
+    /// `name = "gitlab.com"` with `enabled = false` only hides it.
     fn inherit_builtin_fields(table: &mut toml::Table) {
         let Some(toml::Value::Array(sources)) = table.get_mut("marketplace") else {
             return;
@@ -796,7 +790,7 @@ mod tests {
     fn example_config_parses() {
         let config = Config::parse(EXAMPLE).unwrap();
         let names: Vec<&str> = config.marketplace.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["herdr.dev", "gitlab.com", "codeberg.org"]);
+        assert_eq!(names, ["herdr.dev", "gitlab.com"]);
         assert_eq!(config.keep_installs, 3);
         assert_eq!(config.auto_update.strategy, Strategy::Latest);
     }
@@ -805,19 +799,22 @@ mod tests {
     fn user_sources_override_builtins_by_name() {
         let config = Config::parse(
             "[[marketplace]]\nname = \"corp\"\nkind = \"gitea\"\nurl = \"https://git.corp\"\n\n\
-             [[marketplace]]\nname = \"codeberg.org\"\nenabled = false\n\n\
-             [[marketplace]]\nname = \"gitlab.com\"\nurl = \"https://gitlab.example\"\n",
+             [[marketplace]]\nname = \"gitlab.com\"\nenabled = false\n\n\
+             [[marketplace]]\nname = \"herdr.dev\"\nurl = \"https://plugins.example/herdr-index.json\"\n",
         )
         .unwrap();
         let names: Vec<&str> = config.marketplace.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["herdr.dev", "gitlab.com", "codeberg.org", "corp"]);
-        let codeberg = &config.marketplace[2];
-        assert!(!codeberg.enabled);
-        assert_eq!(codeberg.kind, MarketKind::Gitea);
-        assert_eq!(codeberg.url.as_deref(), Some("https://codeberg.org"));
+        assert_eq!(names, ["herdr.dev", "gitlab.com", "corp"]);
         let gitlab = &config.marketplace[1];
+        assert!(!gitlab.enabled);
         assert_eq!(gitlab.kind, MarketKind::Gitlab);
-        assert_eq!(gitlab.url.as_deref(), Some("https://gitlab.example"));
+        assert_eq!(gitlab.url.as_deref(), Some("https://gitlab.com"));
+        let herdr = &config.marketplace[0];
+        assert_eq!(herdr.kind, MarketKind::Herdr);
+        assert_eq!(
+            herdr.url.as_deref(),
+            Some("https://plugins.example/herdr-index.json")
+        );
     }
 
     #[test]

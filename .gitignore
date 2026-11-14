@@ -1,2 +1,6 @@
+# Rust build artifacts
 /target
 /bin
+
+# Commitlint dependencies
+/.github/commitlint/node_modules/

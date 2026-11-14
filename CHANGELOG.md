@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.2](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.1...v0.18.2) (2026-11-13)
+
+
+### Bug Fixes
+
+* **tui:** The selected marketplace entry is highlighted across both lines ([#62](https://github.com/julienpoirou/herdr-plugin-manager/issues/62)) ([f5380cf](https://github.com/julienpoirou/herdr-plugin-manager/commit/f5380cf76acf347c0d0e22180954c37d30a27dd3))
+
 ## [0.18.1](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.0...v0.18.1) (2026-11-13)
 
 

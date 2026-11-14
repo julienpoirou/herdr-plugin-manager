@@ -91,6 +91,7 @@ herdr-pm update
 - Independent installations, rollback, pin/unpin and branch/tag/commit switching.
 - Enable/disable, cleanup, logs, diagnostics and dry-run previews.
 - Opt-in GitOps snapshots at exact commits with explicitly approved config files.
+- Automatic skill provisioning and lifecycle management.
 
 ## Security and trust
 

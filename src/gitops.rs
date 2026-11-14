@@ -159,7 +159,14 @@ impl Drop for PreviewRepo {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hash = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(hash.len() * 2);
+    for &byte in hash.iter() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -2332,6 +2339,22 @@ fn discover(root: &Path, directory: &Path, prefix: &str, result: &mut Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_preserves_persisted_sha256_format() {
+        assert_eq!(
+            digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            digest(b"s"),
+            "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"
+        );
+    }
 
     fn plugin() -> PluginState {
         PluginState {

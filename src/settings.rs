@@ -1012,17 +1012,17 @@ mod tests {
 
     #[test]
     fn builtin_sources_toggle_without_leaving_a_block() {
-        let field = Field::Market("codeberg.org".into());
+        let field = Field::Market("gitlab.com".into());
         let off = apply(EXAMPLE, field.clone(), Action::Next);
         let config = Config::parse(&off).unwrap();
-        let codeberg = config
+        let gitlab = config
             .marketplace
             .iter()
-            .find(|s| s.name == "codeberg.org")
+            .find(|s| s.name == "gitlab.com")
             .unwrap();
-        assert!(!codeberg.enabled);
+        assert!(!gitlab.enabled);
         let on = apply(&off, field, Action::Next);
-        assert!(!on.contains("codeberg.org\""));
+        assert!(!on.contains("gitlab.com\""));
         assert!(Config::parse(&on)
             .unwrap()
             .marketplace

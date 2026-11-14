@@ -10,6 +10,7 @@ body:
       description: Describe the workflow or compatibility gap, not only the proposed implementation.
     validations:
       required: true
+
   - type: textarea
     id: proposal
     attributes:
@@ -17,6 +18,7 @@ body:
       description: Include CLI/popup behavior and trust/security implications.
     validations:
       required: true
+
   - type: textarea
     id: alternatives
     attributes:

@@ -12,7 +12,7 @@ cargo test --locked
 cargo build --locked && sh tests/e2e.sh
 ```
 
-The E2E command needs `herdr` on `PATH` and must use a throwaway environment;
+The E2E command needs `herdr` on `PATH` and must use a throwaway environment,
 the suite creates one itself. Windows changes must also pass the Windows CI
 job and `scripts/build.ps1`.
 

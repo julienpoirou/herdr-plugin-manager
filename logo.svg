@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Herdr Plugin Manager</title>
+  <desc id="desc">Minimal, rotationally symmetric modular mark on a square Catppuccin Mocha background.</desc>
+  <rect width="256" height="256" rx="48" fill="#181825"/>
+  <g fill="#A6E3A1">
+    <path id="module" d="M55 144V111C55 80.1 80.1 55 111 55H174V100H113C105.8 100 100 105.8 100 113V144Z"/>
+    <use href="#module" transform="rotate(180 128 128)"/>
+  </g>
+</svg>

@@ -77,6 +77,7 @@ or run the installed `bin/herdr-pm` (`bin\herdr-pm.exe` on Windows):
 
 ```sh
 herdr-pm
+herdr-pm audit git@git.example.com:team/notify.git --json
 herdr-pm install git@git.example.com:team/notify.git
 herdr-pm install https://git.example.com/team/mono.git//plugins/tool --ref v1.4.0
 herdr-pm list --check
@@ -88,6 +89,7 @@ herdr-pm update
 - GitHub, GitLab, Gitea/Forgejo, SSH/HTTPS, bare repositories and local paths.
 - Monorepo subdirectories, forge aliases and discovery via herdr.dev and gitlab.com.
 - Reviewed commands and commit changes before installation or updates.
+- Read-only audit of exact commits, referenced scripts and optional OSV advisories.
 - Independent installations, rollback, pin/unpin and branch/tag/commit switching.
 - Enable/disable, cleanup, logs, diagnostics and dry-run previews.
 - Opt-in GitOps snapshots at exact commits with explicitly approved config files.
@@ -95,24 +97,28 @@ herdr-pm update
 
 ## Security and trust
 
-Plugin code runs with your user privileges, not in a sandbox. In the reviewed
-installation flow, build and plugin commands execute only after you review and
-approve the source, resolved commit and declared commands. Review the repository
-too; pin trusted commits where appropriate.
+Plugin code runs with your user privileges, not in a sandbox. Before a
+Git-managed installation, update, switch, rollback or GitOps restore, a
+read-only audit inspects the exact commit and referenced scripts without
+executing plugin tools. Use `herdr-pm audit <source> --json` for a standalone
+report. Findings are heuristic signals, not a proof of safety or malice.
 
-Opt-in auto-update skips the per-update trust preview: enable it only for
-repositories you trust to execute new code unattended. `--yes` also supplies
-approval without an interactive prompt.
+`--yes` approves the operation, not new audit risks. Non-interactive execution
+requires a specific `--allow-risk RULE` for each new signal or incomplete scan;
+interactive reviews show the evidence instead. Auto-update suspends only a
+plugin with a new signal or incomplete analysis and keeps its installed version.
+
+Dependency advisory checks are opt-in with `--dependencies`, which sends public
+package names and versions to OSV. Review the source and pin trusted commits.
+See the [audit and trust model](docs/guide.md#trust-and-build-model).
 
 GitOps is opt-in and **plaintext, not encrypted**. Approved files can contain
 secrets that remain in Git history; select files deliberately and use a trusted
-private repository. See the [trust model](docs/guide.md#trust-and-build-model)
-and [GitOps guide](docs/guide.md#gitops-the-same-setup-on-every-machine).
+private repository. See the [GitOps guide](docs/guide.md#gitops-the-same-setup-on-every-machine).
 
 ## Roadmap
 
 - Improve GitOps security.
-- Add `herdr-pm audit`.
 - Add support for modules and layouts in Herdr App.
 
 ## License

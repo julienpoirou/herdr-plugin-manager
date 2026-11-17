@@ -22,18 +22,49 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - name: Install herdr
         run: |
-          curl -fsSL https://herdr.dev/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          # Digests: https://api.github.com/repos/herdrdev/herdr/releases/tags/v0.9.5
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64)
+              asset=herdr-linux-x86_64
+              sha256=14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d ;;
+            Linux/aarch64|Linux/arm64)
+              asset=herdr-linux-aarch64
+              sha256=17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c ;;
+            Darwin/x86_64)
+              asset=herdr-macos-x86_64
+              sha256=5fb0a908ec7f6745e3e245738b06bfad56c46391c391ab3c0955fbead01f1369 ;;
+            Darwin/arm64|Darwin/aarch64)
+              asset=herdr-macos-aarch64
+              sha256=fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2 ;;
+            *) echo "::error::Unsupported Herdr platform"; exit 1 ;;
+          esac
+          binary="$RUNNER_TEMP/herdr"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/herdrdev/herdr/releases/download/v0.9.5/$asset" -o "$binary"
+          if command -v sha256sum >/dev/null; then
+            printf '%s  %s\n' "$sha256" "$binary" | sha256sum --check --strict
+          else
+            printf '%s  %s\n' "$sha256" "$binary" | shasum -a 256 --check
+          fi
+          mkdir -p "$RUNNER_TEMP/herdr-bin"
+          install -m 755 "$binary" "$RUNNER_TEMP/herdr-bin/herdr"
+          echo "$RUNNER_TEMP/herdr-bin" >> "$GITHUB_PATH"
       - name: End-to-end with real Herdr
         run: cargo build --locked && sh tests/e2e.sh
 
@@ -41,11 +72,16 @@ jobs:
     name: windows-latest / Rust and PowerShell
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
@@ -60,7 +96,9 @@ jobs:
     name: Rust dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

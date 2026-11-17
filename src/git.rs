@@ -62,10 +62,10 @@ pub(crate) fn validate_remote(url: &str) -> Result<()> {
         return Ok(());
     }
     if let Some((before, after)) = url.split_once(':') {
-        let scp_like = !before.contains(['/', '\\'])
-            && !after.is_empty()
-            && !after.starts_with("//")
-            && !(before.len() == 1 && before.chars().all(|c| c.is_ascii_alphabetic()))
+        let scp_like = !(before.contains(['/', '\\'])
+            || after.is_empty()
+            || after.starts_with("//")
+            || before.len() == 1 && before.chars().all(|c| c.is_ascii_alphabetic()))
             && (before.contains('@') || before.contains('.') || before == "localhost");
         if scp_like {
             return Ok(());
@@ -179,6 +179,49 @@ impl Git {
             bail!("git {}: {message}", args.first().copied().unwrap_or(""));
         }
         Ok(output.stdout)
+    }
+
+    /// Read-only object commands used by auditing. Never buffer an unbounded
+    /// tree/blob, invoke a pager/filter, or honor replacement objects.
+    pub(crate) fn read_bounded(
+        &self,
+        mirror: &Mirror,
+        args: &[&str],
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut command = self.command();
+        command
+            .arg("--no-replace-objects")
+            .args(args)
+            .current_dir(&mirror.path)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().context("could not read Git objects")?;
+        let stdout = child.stdout.take().context("missing Git object output")?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.take(limit as u64 + 1).read_to_end(&mut bytes);
+            let _ = sender.send(result.map(|_| bytes));
+        });
+        let received = receiver.recv_timeout(Duration::from_secs(20));
+        let too_large = matches!(&received, Ok(Ok(bytes)) if bytes.len() > limit);
+        if received.is_err() || too_large {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        let _ = reader.join();
+        let bytes = received.context("Git object read timed out")??;
+        if too_large {
+            bail!("Git object output exceeds audit limit");
+        }
+        if !status.success() {
+            bail!("could not read requested Git object");
+        }
+        Ok(bytes)
     }
 
     pub fn version(&self) -> Result<String> {

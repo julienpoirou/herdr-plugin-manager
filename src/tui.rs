@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -196,9 +195,6 @@ struct Task {
     review: Option<Review>,
     show_log: bool,
     done: Option<Result<(), String>>,
-    /// `a` on a review approves the rest of a batch.
-    batch: bool,
-    accept_all: Arc<AtomicBool>,
     touched: Option<Vec<String>>,
 }
 
@@ -207,7 +203,6 @@ struct Task {
 /// terminal.
 struct TaskReport {
     tx: Sender<Msg>,
-    accept_all: Arc<AtomicBool>,
 }
 
 impl TaskReport {
@@ -232,9 +227,6 @@ impl Report for TaskReport {
             }
             return Ok(true);
         };
-        if self.accept_all.load(Ordering::Relaxed) {
-            return Ok(true);
-        }
         let (reply, answer) = mpsc::channel();
         self.send(TaskEvent::Review(Review {
             title: title.to_string(),
@@ -843,34 +835,29 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         return Ok(());
     }
     let one = |id: &String| Some(vec![id.clone()]);
-    let (title, touched, batch, yes): (String, Option<Vec<String>>, bool, bool) = match &job {
-        Job::Install(spec) => (format!("Installing {spec}"), None, false, false),
-        Job::InstallEntry(entry) => (format!("Installing {}", entry.title), None, false, false),
-        Job::Update(ids) if ids.len() == 1 => (
-            format!("Updating {}", ids[0]),
-            Some(ids.clone()),
-            false,
-            false,
-        ),
+    let (title, touched, yes): (String, Option<Vec<String>>, bool) = match &job {
+        Job::Install(spec) => (format!("Installing {spec}"), None, false),
+        Job::InstallEntry(entry) => (format!("Installing {}", entry.title), None, false),
+        Job::Update(ids) if ids.len() == 1 => {
+            (format!("Updating {}", ids[0]), Some(ids.clone()), false)
+        }
         Job::Update(ids) => (
             format!("Updating {} plugins", ids.len()),
             Some(ids.clone()),
-            true,
             false,
         ),
-        Job::Uninstall(id, true) => (format!("Deleting {id}"), None, false, true),
-        Job::Uninstall(id, false) => (format!("Removing {id}"), None, false, true),
-        Job::Rollback(id) => (format!("Rolling back {id}"), one(id), false, false),
+        Job::Uninstall(id, true) => (format!("Deleting {id}"), None, true),
+        Job::Uninstall(id, false) => (format!("Removing {id}"), None, true),
+        Job::Rollback(id) => (format!("Rolling back {id}"), one(id), false),
         Job::PinTo(id, commit) => (
             format!("Pinning {id} at {}", util::short_sha(commit)),
             one(id),
             false,
-            false,
         ),
-        Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false, false),
-        Job::Switch(id, r) => (format!("Switching {id} to {r}"), one(id), false, false),
-        Job::TakeOver(id) => (format!("Taking over {id}"), one(id), false, false),
-        Job::AutoUpdate => ("Auto-updating plugins".to_string(), None, true, true),
+        Job::Unpin(id) => (format!("Unpinning {id}"), one(id), false),
+        Job::Switch(id, r) => (format!("Switching {id} to {r}"), one(id), false),
+        Job::TakeOver(id) => (format!("Taking over {id}"), one(id), false),
+        Job::AutoUpdate => ("Auto-updating plugins".to_string(), None, true),
         Job::Integrate { skill, on } => (
             match (skill, on) {
                 (false, true) => "Putting herdr-pm on your PATH",
@@ -880,13 +867,11 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
             }
             .to_string(),
             None,
-            false,
             true,
         ),
         Job::Clean(ids) => (
             format!("Cleaning leftovers of {}", ids.join(", ")),
             None,
-            false,
             false,
         ),
         Job::EditConfig => unreachable!(),
@@ -930,7 +915,7 @@ fn run_job(app: &mut App, term: &mut Term, job: Job) -> Result<()> {
         Job::Clean(ids) => Box::new(move |ctx| ops::clean(ctx, &ids)),
         Job::EditConfig => unreachable!(),
     };
-    start_task(app, title, touched, batch, yes, run);
+    start_task(app, title, touched, yes, run);
     Ok(())
 }
 
@@ -942,24 +927,19 @@ fn parse_install(
     let mut source_arg = None;
     let mut reference = None;
     let mut subdir = None;
-    let mut force_git = false;
     let mut replace = false;
     let mut words = util::split_words(spec).into_iter();
     while let Some(w) = words.next() {
         match w.as_str() {
             "--ref" => reference = words.next(),
             "--subdir" => subdir = words.next(),
-            "--git" => force_git = true,
             "--replace" => replace = true,
             _ if source_arg.is_none() => source_arg = Some(w),
             other => anyhow::bail!("unexpected {other:?}"),
         }
     }
     let source_arg = source_arg.ok_or_else(|| anyhow::anyhow!("no source given"))?;
-    let mut parsed = source::parse(&source_arg, aliases)?;
-    if force_git {
-        parsed = parsed.into_git();
-    }
+    let parsed = source::parse(&source_arg, aliases)?;
     if let Some(s) = subdir.as_deref() {
         source::validate_subdir(&source::normalize_subdir(s))?;
     }
@@ -1376,20 +1356,16 @@ fn start_task(
     app: &mut App,
     title: String,
     touched: Option<Vec<String>>,
-    batch: bool,
     yes: bool,
     run: Operation,
 ) {
-    let accept_all = Arc::new(AtomicBool::new(false));
     let ctx = Ctx {
         herdr: app.ctx.herdr.clone(),
         config: app.ctx.config.clone(),
         yes,
+        audit: app.ctx.audit.clone(),
         dry_run: app.ctx.dry_run,
-        report: Arc::new(TaskReport {
-            tx: app.tx.clone(),
-            accept_all: Arc::clone(&accept_all),
-        }),
+        report: Arc::new(TaskReport { tx: app.tx.clone() }),
     };
     let tx = app.tx.clone();
     std::thread::spawn(move || {
@@ -1406,8 +1382,6 @@ fn start_task(
         review: None,
         show_log: false,
         done: None,
-        batch,
-        accept_all,
         touched,
     });
 }
@@ -1478,10 +1452,6 @@ fn task_key(app: &mut App, key: KeyEvent) -> Option<Job> {
     if let Some(review) = task.review.as_mut() {
         let answer = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
-            KeyCode::Char('a') | KeyCode::Char('A') if task.batch => {
-                task.accept_all.store(true, Ordering::Relaxed);
-                Some(true)
-            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
             KeyCode::Down | KeyCode::Char('j') => {
                 review.scroll += 1;
@@ -3994,12 +3964,12 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
     place_line(app, rect, hint_line, &hint_clicks);
     if let Some(review) = &task.review {
-        draw_review(f, app, review, task.batch, area);
+        draw_review(f, app, review, area);
     }
 }
 
 /// The trust preview of an operation, waiting for y/n.
-fn draw_review(f: &mut Frame, app: &App, review: &Review, batch: bool, area: Rect) {
+fn draw_review(f: &mut Frame, app: &App, review: &Review, area: Rect) {
     let width: u16 = 100.min(area.width.saturating_sub(2));
     let inner = width.saturating_sub(2) as usize;
     let max_height = area.height.saturating_sub(2) as usize;
@@ -4024,9 +3994,6 @@ fn draw_review(f: &mut Frame, app: &App, review: &Review, batch: bool, area: Rec
         Span::raw(" no   "),
         &[ch('n')],
     );
-    if batch {
-        hint.key("a", key, Span::raw(" yes to all   "), &[ch('a')]);
-    }
     if max_scroll > 0 {
         hint.key(
             "↑↓",

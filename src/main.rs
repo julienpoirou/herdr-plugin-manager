@@ -1,6 +1,7 @@
 //! Herdr Plugin Manager (`herdr-pm`): manage Herdr plugins from a popup or
 //! the command line, from GitHub or any git server.
 
+mod audit;
 mod backup;
 mod config;
 mod git;
@@ -48,6 +49,14 @@ struct Cli {
     #[arg(long, global = true, env = "HERDR_PM_DRY_RUN")]
     dry_run: bool,
 
+    /// Approve a specific audit rule for this invocation (repeatable).
+    #[arg(long, global = true, value_name = "RULE", value_parser = clap::builder::PossibleValuesParser::new(audit::RULE_IDS.iter().copied()))]
+    allow_risk: Vec<String>,
+
+    /// Query dependency advisories online (sends public package names/versions).
+    #[arg(long, global = true)]
+    dependencies: bool,
+
     /// Print the agent skill shipped with this version (SKILL.md).
     #[arg(long)]
     skill: bool,
@@ -86,15 +95,21 @@ enum Cmd {
         /// Register the plugin disabled.
         #[arg(long)]
         disabled: bool,
-        /// Fetch GitHub shorthands with git instead of herdr's installer
-        /// (for private repositories over SSH).
-        #[arg(long)]
-        git: bool,
         /// Take over a plugin with the same id installed another way.
         #[arg(long)]
         replace: bool,
         #[command(flatten)]
         yes: YesFlag,
+    },
+    /// Inspect an exact plugin revision without running plugin tools.
+    Audit {
+        source: String,
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
+        #[arg(long)]
+        subdir: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Update plugins (all GitHub- and git-installed ones by default).
     #[command(alias = "upgrade")]
@@ -331,7 +346,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let refresh_backup = !cli.dry_run
         && !cli.skill
-        && !matches!(&cli.command, Some(Cmd::BackupWatch | Cmd::Logs { .. }));
+        && !matches!(
+            &cli.command,
+            Some(Cmd::Audit { .. } | Cmd::BackupWatch | Cmd::Logs { .. })
+        );
     match run(cli) {
         Ok(code) => {
             if refresh_backup {
@@ -350,7 +368,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn ctx(dry_run: bool, yes: bool) -> Result<Ctx> {
+fn ctx(dry_run: bool, yes: bool, audit: audit::Policy) -> Result<Ctx> {
     Ok(Ctx {
         herdr: Herdr::detect(dry_run),
         config: if dry_run {
@@ -359,6 +377,7 @@ fn ctx(dry_run: bool, yes: bool) -> Result<Ctx> {
             Config::load()?
         },
         yes,
+        audit,
         report: std::sync::Arc::new(ops::TerminalReport),
         dry_run,
     })
@@ -374,8 +393,14 @@ fn code(failures: usize) -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let dry = cli.dry_run;
-    if !matches!(&cli.command, Some(Cmd::Migrate { .. }))
-        && !(cli.command.is_none() && cli.skill)
+    let policy = audit::Policy {
+        allow_risks: cli.allow_risk,
+        dependencies: cli.dependencies,
+    };
+    policy.validate()?;
+    let ctx = |dry, yes| ctx(dry, yes, policy.clone());
+    if !(matches!(&cli.command, Some(Cmd::Migrate { .. } | Cmd::Audit { .. }))
+        || cli.command.is_none() && cli.skill)
         && migration::required()?
     {
         bail!(
@@ -416,19 +441,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             reference,
             subdir,
             disabled,
-            git,
             replace,
             yes,
         } => {
             let ctx = ctx(dry, yes.yes)?;
-            let mut parsed = source::parse(&source, &ctx.config.aliases)?;
-            if git {
-                parsed = parsed.into_git();
-            }
-            if let Some(s) = subdir.as_deref() {
-                source::validate_subdir(&source::normalize_subdir(s))?;
-            }
-            let parsed = parsed.with_subdir(subdir);
+            let parsed = ops::parse_source(&source, subdir, &ctx.config)?;
             ops::install(
                 &ctx,
                 InstallRequest {
@@ -439,6 +456,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 },
             )?;
             Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Audit {
+            source,
+            reference,
+            subdir,
+            json,
+        } => {
+            let ctx = ctx(true, false)?;
+            let source = ops::parse_source(&source, subdir, &ctx.config)?;
+            let report = ops::audit_source(&ctx, source, reference.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                ops::Report::review(
+                    &ops::TerminalReport,
+                    "Plugin audit",
+                    &report.preview_lines(),
+                    None,
+                )?;
+            }
+            Ok(ExitCode::from(report.exit_code()))
         }
         Cmd::Update { ids, yes } => Ok(code(ops::update(&ctx(dry, yes.yes)?, &ids)?)),
         Cmd::Outdated { json } => outdated(&ctx(dry, false)?, json),

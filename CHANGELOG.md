@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Audit exact plugin commits before installation, updates, rollback and GitOps
+  restore, without running repository code. Add `herdr-pm audit`, JSON reports,
+  per-commit caching and optional Cargo/npm advisory checks through OSV.
+- Require named risk approvals in unattended execution; auto-update stops on
+  new findings or incomplete scans. GitOps preflights every candidate.
+- Use the same audited Git pipeline for GitHub shorthands; migrate the removed
+  `github_via_git` setting and remove the redundant `--git` flag.
+
+### Changes
+
+- Retire the Dockerfile and GHCR image publication. Release archives and the
+  crates.io package remain available.
+- Isolate Unix end-to-end tests from native Windows Herdr and stop a test server
+  only when the suite started it.
+- Pin CI actions and downloaded tools, verify release commits against trusted
+  main history, and keep publishing credentials out of pull-request builds.
+- Migrate HTTP requests to ureq 3 with platform certificate verification, remove
+  archived rustls-pemfile, and update the affected rustix 1.x dependency to 1.1.6.
+- Continuously fuzz manifest previews and source parsing with production code,
+  locked dependencies and a bounded, scheduled/PR libFuzzer workflow.
+
 ## [0.18.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.2...v0.18.3) (2026-11-14)
 
 

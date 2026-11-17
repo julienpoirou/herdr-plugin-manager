@@ -1,0 +1,13 @@
+id = "fuzz.example"
+name = "Escaped \u001b metadata"
+version = "1.0.0"
+min_herdr_version = "0.7.4"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["sh", "build.sh"]
+
+[[actions]]
+id = "open"
+title = "Open"
+command = ["tool", "a path with spaces", "escaped\nargument"]

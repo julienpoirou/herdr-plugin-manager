@@ -21,12 +21,6 @@ updates:
       codeql:
         patterns: ["github/codeql-action/*"]
 
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-    labels: [dependencies, docker]
-
   - package-ecosystem: npm
     directory: /.github/commitlint
     schedule:

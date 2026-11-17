@@ -28,7 +28,6 @@ pub enum Field {
     MarketTtl,
     CheckConcurrency,
     UseGhCli,
-    GithubViaGit,
     Icons,
     /// Format of the change log.
     History,
@@ -75,7 +74,6 @@ impl Field {
         match self {
             Field::KeepInstalls | Field::MarketTtl | Field::CheckConcurrency => Kind::Number,
             Field::UseGhCli
-            | Field::GithubViaGit
             | Field::Icons
             | Field::BackupEnabled
             | Field::BackupPlugins
@@ -252,16 +250,6 @@ pub fn rows(
             "use_gh_cli",
             on_off(config.use_gh_cli),
             Field::UseGhCli,
-        ),
-        row(
-            "General",
-            "github_via_git",
-            if config.github_via_git {
-                "on: owner/repo installs through git".to_string()
-            } else {
-                "off: owner/repo installs through herdr".to_string()
-            },
-            Field::GithubViaGit,
         ),
         row(
             "General",
@@ -680,7 +668,6 @@ pub fn change(text: &str, field: &Field, action: &Action) -> Result<String> {
             step(config.check_concurrency as u64, action, 1, 1)?,
         ),
         Field::UseGhCli => put(&mut doc["use_gh_cli"], !config.use_gh_cli),
-        Field::GithubViaGit => put(&mut doc["github_via_git"], !config.github_via_git),
         Field::Icons => put(&mut doc["icons"], flag(action, config.icons)),
         Field::History => put(
             &mut doc["history"],

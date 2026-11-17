@@ -24,7 +24,7 @@
   archived rustls-pemfile, and update the affected rustix 1.x dependency to 1.1.6.
 - Continuously fuzz manifest previews and source parsing with production code,
   locked dependencies and a bounded, scheduled/PR libFuzzer workflow.
-- Use portable checksum verification flags on macOS as well as GNU/Linux.
+- Verify SHA-256 with native Perl on macOS and GNU checksum tools on Linux.
 - Exercise backup lock handoff through the worker's bounded ownership wait,
   retaining the exclusivity assertion without macOS close-timing assumptions.
 - Run macOS tests on the explicit Intel runner while retaining both macOS

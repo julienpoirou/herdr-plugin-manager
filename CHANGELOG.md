@@ -1,12 +1,13 @@
 # Changelog
 
-## Unreleased
+## [0.19.0](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.3...v0.19.0) (2026-11-17)
 
 ### Features
 
 - Audit exact plugin commits before installation, updates, rollback and GitOps
   restore, without running repository code. Add `herdr-pm audit`, JSON reports,
-  per-commit caching and optional Cargo/npm advisory checks through OSV.
+  per-commit caching and optional Cargo/npm advisory checks through OSV
+  ([#71](https://github.com/julienpoirou/herdr-plugin-manager/pull/71)).
 - Require named risk approvals in unattended execution; auto-update stops on
   new findings or incomplete scans. GitOps preflights every candidate.
 - Use the same audited Git pipeline for GitHub shorthands; migrate the removed

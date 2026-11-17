@@ -29,6 +29,7 @@
   retaining the exclusivity assertion without macOS close-timing assumptions.
 - Run macOS tests on the explicit Intel runner while retaining both macOS
   release targets and the required macOS test check.
+- Build and verify each macOS release binary on its native architecture.
 
 ## [0.18.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.2...v0.18.3) (2026-11-14)
 

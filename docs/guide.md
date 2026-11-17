@@ -736,8 +736,8 @@ on pushes to `main`, pull requests targeting `main`, and Saturdays at 03:17 UTC.
 It uses the default query suite and does not require a build.
 
 macOS tests use the explicit `macos-26-intel` runner rather than the constrained
-ARM64 test queue. Release builds still cover both macOS architectures on ARM64
-hosts, including execution of the native ARM64 binary's version check.
+ARM64 test queue. Release builds use native Intel and ARM64 macOS hosts,
+executing the version check for both binaries.
 
 ### Fuzzing
 

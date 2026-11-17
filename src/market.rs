@@ -223,43 +223,66 @@ pub fn proxy_for(url: &str) -> Option<String> {
 }
 
 fn agent_for(url: &str) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(8))
-        .timeout(Duration::from_secs(20))
-        .user_agent(concat!("herdr-plugin-manager/", env!("CARGO_PKG_VERSION")));
-    if let Some(proxy) = proxy_for(url).and_then(|p| ureq::Proxy::new(p).ok()) {
-        builder = builder.proxy(proxy);
-    }
-    builder.build()
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(8)))
+        .timeout_global(Some(Duration::from_secs(20)))
+        .user_agent(concat!("herdr-plugin-manager/", env!("CARGO_PKG_VERSION")))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        // Always override ureq's environment lookup, including NO_PROXY bypasses.
+        .proxy(proxy_for(url).and_then(|p| ureq::Proxy::new(&p).ok()))
+        .max_redirects(5)
+        // Keep error bodies available for the diagnostic below.
+        .http_status_as_error(false)
+        .build()
+        .into()
 }
 
-fn describe_http_error(url: &str, err: ureq::Error) -> anyhow::Error {
-    match err {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            let message = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v["message"].as_str().map(str::to_string))
-                .map(|m| util::sanitize(&m))
-                .unwrap_or_else(|| util::truncate(&util::sanitize(&body), 120));
-            let hint = match code {
-                401 => " (token missing or rejected)",
-                403 => " (forbidden or rate-limited; set a token)",
-                404 => " (not found: check the url)",
-                _ => "",
-            };
-            anyhow!("HTTP {code}{hint}: {message}")
-        }
-        ureq::Error::Transport(t) => anyhow!("could not reach {url}: {t}"),
-    }
+fn describe_http_error(response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+    let code = response.status().as_u16();
+    let mut body = String::new();
+    let _ = response
+        .into_body()
+        .into_reader()
+        .take(64 * 1024)
+        .read_to_string(&mut body);
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_string))
+        .map(|m| util::sanitize(&m))
+        .unwrap_or_else(|| util::truncate(&util::sanitize(&body), 120));
+    let hint = match code {
+        401 => " (token missing or rejected)",
+        403 => " (forbidden or rate-limited; set a token)",
+        404 => " (not found: check the url)",
+        _ => "",
+    };
+    anyhow!("HTTP {code}{hint}: {message}")
 }
 
-fn http_get(url: &str, headers: &[(&str, String)], timeout: Duration) -> Result<ureq::Response> {
-    let mut request = agent_for(url).get(url).timeout(timeout);
+fn http_get(
+    url: &str,
+    headers: &[(&str, String)],
+    timeout: Duration,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let mut request = agent_for(url)
+        .get(url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build();
     for (name, value) in headers {
-        request = request.set(name, value);
+        request = request.header(*name, value.as_str());
     }
-    request.call().map_err(|e| describe_http_error(url, e))
+    let response = request
+        .call()
+        .map_err(|e| anyhow!("could not reach {url}: {e}"))?;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        return Err(describe_http_error(response));
+    }
+    Ok(response)
 }
 
 pub fn http_get_text(url: &str, token: Option<&str>, timeout: Duration) -> Result<String> {
@@ -269,6 +292,7 @@ pub fn http_get_text(url: &str, token: Option<&str>, timeout: Duration) -> Resul
     let response = http_get(url, &headers, timeout)?;
     let mut text = String::new();
     response
+        .into_body()
         .into_reader()
         .take(8 * 1024 * 1024)
         .read_to_string(&mut text)?;
@@ -279,7 +303,11 @@ pub fn http_get_text(url: &str, token: Option<&str>, timeout: Duration) -> Resul
 pub fn http_get_bytes(url: &str, timeout: Duration, limit: u64) -> Result<Vec<u8>> {
     let response = http_get(url, &[], timeout)?;
     let mut bytes = Vec::new();
-    response.into_reader().take(limit).read_to_end(&mut bytes)?;
+    response
+        .into_body()
+        .into_reader()
+        .take(limit)
+        .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -289,11 +317,14 @@ fn http_get_json(
 ) -> Result<(serde_json::Value, Option<String>)> {
     let response = http_get(url, headers, Duration::from_secs(20))?;
     let total = response
-        .header("x-total")
-        .or_else(|| response.header("x-total-count"))
+        .headers()
+        .get("x-total")
+        .or_else(|| response.headers().get("x-total-count"))
+        .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let mut text = String::new();
     response
+        .into_body()
         .into_reader()
         .take(16 * 1024 * 1024)
         .read_to_string(&mut text)?;
@@ -330,10 +361,19 @@ fn http_get_static(
     if response.status() == 304 {
         return Ok(Download::NotModified);
     }
-    let etag = response.header("etag").map(str::to_string);
-    let last_modified = response.header("last-modified").map(str::to_string);
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let last_modified = response
+        .headers()
+        .get("last-modified")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let mut text = String::new();
     response
+        .into_body()
         .into_reader()
         .take(32 * 1024 * 1024)
         .read_to_string(&mut text)?;
@@ -1037,6 +1077,76 @@ pub fn changes(old: &[Entry], new: &[Entry]) -> Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn serve_http_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/index.json", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 64 * 1024);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn conditional_download_preserves_304_and_authenticated_validators() {
+        let (url, server) = serve_http_once(
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        );
+        let cached = Listing {
+            etag: Some("\"cached\"".into()),
+            last_modified: Some("Tue, 17 Nov 2026 12:00:00 GMT".into()),
+            ..Listing::default()
+        };
+        let result = http_get_static(
+            &url,
+            &[("Authorization", "Bearer example-token".into())],
+            Some(&cached),
+        )
+        .unwrap();
+        assert!(matches!(result, Download::NotModified));
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer example-token\r\n"));
+        assert!(request.contains("if-none-match: \"cached\"\r\n"));
+        assert!(request.contains("if-modified-since: tue, 17 nov 2026 12:00:00 gmt\r\n"));
+    }
+
+    #[test]
+    fn http_errors_preserve_json_and_text_diagnostics() {
+        for (status, body, expected) in [
+            (
+                "401 Unauthorized",
+                r#"{"message":"Bad credentials"}"#,
+                "HTTP 401 (token missing or rejected): Bad credentials",
+            ),
+            (
+                "403 Forbidden",
+                "Rate limit exceeded",
+                "HTTP 403 (forbidden or rate-limited; set a token): Rate limit exceeded",
+            ),
+        ] {
+            let (url, server) = serve_http_once(format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ));
+            let error = http_get_text(&url, None, Duration::from_secs(5)).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn pictures_come_from_the_first_listed_field_made_absolute() {

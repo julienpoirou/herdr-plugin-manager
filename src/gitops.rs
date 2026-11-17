@@ -1985,11 +1985,12 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
     if ctx.config.backup.plugins {
         unsupported_lines(&incoming, &mut lines);
     }
-    // All manifests are reviewed up front, not only after preceding plugins
-    // have already changed. install_git retains its own authoritative review.
+    // Audit every candidate before any plugin or configuration is changed.
+    // install_git repeats the authoritative exact-commit review below.
+    let mut audits = Vec::new();
     for plugin in &plan.install {
         ctx.report
-            .step(&format!("validating exact source for {}", plugin.id));
+            .step(&format!("auditing exact source for {}", plugin.id));
         let mirror = review_mirror(git, &session, &plugin.url)?;
         let resolved = git.resolve(&mirror, Some(&plugin.commit))?;
         if resolved != plugin.commit {
@@ -2010,7 +2011,41 @@ pub fn pull(ctx: &Ctx) -> Result<()> {
                 plugin.id
             );
         }
+        let local = local_summary.plugins.get(&plugin.id);
+        let previous = local
+            .filter(|state| state.url == plugin.url && state.subdir == plugin.subdir)
+            .map(|state| state.commit.as_str());
+        let mut report = ops::audit_candidate(
+            ctx,
+            git,
+            &mirror,
+            &resolved,
+            plugin.subdir.as_deref(),
+            &manifest,
+            previous,
+        )?;
+        if local.is_some() && previous.is_none() {
+            report.findings.push(crate::audit::Finding {
+                id: format!("source-change:{}", util::fnv1a64(&plugin.url)),
+                rule: "source-change".into(),
+                severity: crate::audit::Severity::High,
+                path: None,
+                line: None,
+                message:
+                    "The snapshot source differs from the installed source or cannot be verified."
+                        .into(),
+                is_new: true,
+            });
+        }
         lines.extend(manifest.preview_lines());
+        lines.extend(report.preview_lines());
+        audits.push(report);
+    }
+    for report in &audits {
+        if let Err(error) = crate::audit::enforce(report, &ctx.audit, ctx.yes, ctx.dry_run) {
+            ctx.report.review("GitOps audit", &lines, None)?;
+            return Err(error);
+        }
     }
     if !approval(
         ctx,

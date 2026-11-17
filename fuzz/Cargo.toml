@@ -1,0 +1,31 @@
+[package]
+name = "herdr-plugin-manager-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+anyhow = "1"
+libfuzzer-sys = "=0.4.13"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source"
+path = "fuzz_targets/source.rs"
+test = false
+doc = false
+bench = false

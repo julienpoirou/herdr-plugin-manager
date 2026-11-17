@@ -368,10 +368,6 @@ pub struct Config {
     /// Editor for the `E` key (falls back to VISUAL, EDITOR, then vi/notepad).
     #[serde(default)]
     pub editor: Option<String>,
-    /// Install GitHub shorthands through this manager's git pipeline rather
-    /// than Herdr's installer, so `herdr plugin update` leaves them alone.
-    #[serde(default = "default_true")]
-    pub github_via_git: bool,
     /// Keep a `herdr-pm` link to the current installation on the user's
     /// PATH (`integrate`).
     #[serde(default)]
@@ -434,7 +430,6 @@ impl Default for Config {
             check_concurrency: default_concurrency(),
             use_gh_cli: true,
             editor: None,
-            github_via_git: true,
             cli_on_path: false,
             agent_skill: false,
             icons: true,
@@ -535,6 +530,7 @@ impl Config {
     pub fn migrate_text(text: &str) -> Result<Option<String>> {
         let mut doc: toml_edit::DocumentMut = text.parse()?;
         let mut changed = false;
+        changed |= doc.remove("github_via_git").is_some();
         if doc.contains_key("logos") {
             if doc.contains_key("icons") {
                 bail!(
@@ -784,6 +780,17 @@ mod tests {
         let text = format!("log_dir = {:?}\n", directory.to_str().unwrap());
         assert_eq!(Config::parse(&text).unwrap().log_dir, Some(directory));
         assert!(!toml::to_string(&defaults).unwrap().contains("logos"));
+    }
+
+    #[test]
+    fn legacy_github_pipeline_flag_is_removed_without_changing_other_values() {
+        let updated = Config::migrate_text("github_via_git = false\nicons = false\n")
+            .unwrap()
+            .unwrap();
+        assert!(!updated.contains("github_via_git"));
+        assert!(updated.contains("icons = false"));
+        assert!(Config::migrate_text(&updated).unwrap().is_none());
+        assert!(Config::parse("github_via_git = true\n").is_err());
     }
 
     #[test]

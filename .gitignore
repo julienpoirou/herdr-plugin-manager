@@ -4,3 +4,8 @@
 
 # Commitlint dependencies
 /.github/commitlint/node_modules/
+
+# Generated fuzzing state (seed fixtures and lockfile are tracked)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/

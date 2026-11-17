@@ -453,7 +453,16 @@ mod tests {
         assert!(try_own(&first).unwrap());
         assert!(!try_own(&next).unwrap());
         drop(first);
-        assert!(try_own(&next).unwrap());
+        // A concurrent fork can briefly retain the old file description.
+        // Exercise the worker's bounded handoff, not synchronous close timing.
+        wait_stopped(&next).unwrap();
+        let observer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(!try_own(&observer).unwrap());
+        drop(observer);
         drop(next);
         std::fs::remove_dir_all(directory).unwrap();
     }

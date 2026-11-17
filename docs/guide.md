@@ -114,16 +114,12 @@ are refused rather than merged or overwritten.
 ## Releases and packages
 
 Each [release](https://github.com/julienpoirou/herdr-plugin-manager/releases)
-publishes the same `herdr-pm` binary in three forms:
+publishes the same `herdr-pm` binary as release archives and a crates.io package:
 
 | Package | Install |
 |---|---|
 | Archives with `.sha256` checksums: Linux x86_64/arm64 (static musl), macOS x86_64/arm64, Windows x86_64 | Download `herdr-plugin-manager-<version>-<target>.tar.gz` or `.zip` and put `herdr-pm` on `PATH` |
 | [crates.io](https://crates.io/crates/herdr-plugin-manager) | `cargo install herdr-plugin-manager --locked` |
-| [GHCR](https://github.com/julienpoirou/herdr-plugin-manager/pkgs/container/herdr-plugin-manager) image (linux/amd64, linux/arm64) with Git | `docker run --rm -v "$PWD:/work" ghcr.io/julienpoirou/herdr-plugin-manager index check herdr-index.json` |
-
-The container image is meant for catalog jobs (`index build`, `index check`,
-`search`, `sources`). Plugin management needs a local Herdr.
 
 Releases are prepared by
 [release-please](https://github.com/googleapis/release-please) from
@@ -131,9 +127,9 @@ Conventional Commits (`feat:`, `fix:`, `perf:`, `deps:`). Every push to `main`
 updates a release pull request that bumps `Cargo.toml`, `Cargo.lock` and
 `herdr-plugin.toml` and extends `CHANGELOG.md`. Merging it tags `vX.Y.Z` and runs
 `.github/workflows/release.yml`, which builds the archives, creates the GitHub
-release, publishes the crate (when the `CARGO_REGISTRY_TOKEN` secret is set)
-and pushes the image. To publish an existing tag again, run the workflow manually
-with that tag.
+release and publishes the crate (when the `CARGO_REGISTRY_TOKEN` secret is set).
+To publish an existing tag again, dispatch the workflow from `main`. Its commit
+must already be reachable from `main`; unmerged or unrelated tags are refused.
 
 ## Install sources
 
@@ -164,16 +160,15 @@ herdr-pm install <git-source> --replace
 It replaces an existing local link or a GitHub-owned registration after the
 new build succeeds.
 
-GitHub shorthands go through the same Git pipeline as every other source
-(`github_via_git = true`, the default): Herdr sees a linked plugin, so a
-`herdr plugin update` run outside the manager leaves it alone, and rollback and
-history apply. With `github_via_git = false` they go to Herdr's own installer,
-which cannot replace a local link, so `--replace` then needs `--git`.
-`herdr-pm take-over <id>` (`t` in the popup) moves a plugin Herdr installed
-earlier to the Git pipeline, at the commit it runs now and following the same
-ref. That includes the manager itself (`herdr-pm take-over
-herdr-plugin-manager`): it then updates itself with `u`, `U` or auto-update,
-and `herdr plugin update` no longer touches it.
+GitHub shorthands always use the same exact-commit Git pipeline as every other
+source: Herdr sees a linked plugin, so a `herdr plugin update` run outside the
+manager leaves it alone, and rollback and history apply. The legacy
+`github_via_git` setting and `--git` flag are removed; existing configurations
+are migrated without changing their other values. `herdr-pm take-over <id>`
+(`t` in the popup) moves a plugin Herdr installed earlier to the Git pipeline,
+at the commit it runs now and following the same ref. That includes the manager
+itself (`herdr-pm take-over herdr-plugin-manager`): it then updates itself with
+`u`, `U` or auto-update, and `herdr plugin update` no longer touches it.
 
 ## Trust and build model
 
@@ -182,27 +177,70 @@ For Git-managed installations, herdr-plugin-manager:
 1. mirrors the remote and resolves the branch, annotated/lightweight tag or
    commit to a full object id;
 2. reads and validates `herdr-plugin.toml` at that object id;
-3. prints the source, ref, commit metadata and every declared command;
-4. refuses non-interactive installation without `--yes`;
-5. checks out that exact commit, initializes submodules, and verifies the
+3. audits the selected platform's commands and referenced files without executing
+   repository code, fetching submodules or checking out files;
+4. prints the source, ref, commit metadata, audit findings and declared commands;
+5. requires confirmation; non-interactive `--yes` does not approve new audit risks;
+6. checks out that exact commit, initializes approved submodules, and verifies the
    checked-out manifest against the reviewed text;
-6. runs applicable `[[build]]` entries as argv (no shell), then compares the
+7. runs applicable `[[build]]` entries as argv (no shell), then compares the
    manifest again;
-7. links the new directory into Herdr and records it in `registry.json`.
+8. links the new directory into Herdr and records it in `registry.json`.
 
 Control characters in manifest fields, refs, URLs and marketplace labels are
 neutralized in the preview and popup. Parent components in `--subdir` are
-rejected. A submodule or build failure prevents linking. Previous installations
-stay available for rollback.
+rejected. A submodule or build failure prevents linking. Previous commit records
+stay available for rollback; rollback audits and rebuilds the exact old commit
+rather than trusting a potentially modified kept checkout.
 
-Plugins remain arbitrary code running as the user. Review the commands and the
-repository, and pin the reviewed commit when appropriate. GitHub shorthand
-installs use Herdr's own preview/build implementation instead.
+Plugins remain arbitrary code running as the user. An audit with no signals is
+not a security guarantee. Review the repository and pin the reviewed commit.
 
 A hard crash between Herdr's registration and the manager's `registry.json`
 update can require manual recovery. Avoid running multiple mutating
 `herdr-pm` commands for the same plugin concurrently; `herdr-pm doctor` reports
 registry/list inconsistencies.
+
+### Plugin audit
+
+```sh
+herdr-pm audit owner/repo --ref v1.4.0
+herdr-pm audit /srv/git/plugins.git --subdir plugins/tool --json
+herdr-pm audit owner/repo --dependencies --json
+herdr-pm install owner/repo --dry-run --yes
+# After reviewing and explicitly approving the reported rule:
+herdr-pm install owner/repo --yes --allow-risk dynamic-exec
+```
+
+The default scan reads immutable Git objects locally after fetching the source.
+It follows referenced scripts, detects suspicious execution patterns and compares
+updates with the installed commit. Rules include `download-exec`, `dynamic-exec`,
+`privilege-escalation`, `sensitive-path`, `external-write`, `execution-change`,
+`script-change`, `prebuilt-binary`, `symlink`, `submodule` and `source-change`.
+Unreadable, oversized or unsupported execution surfaces make the report
+`incomplete`; binaries and submodules cannot be certified by a text scan.
+
+Standalone `audit` exits with 0 for no signals, 2 for findings, 3 for an
+incomplete report, or 1 for an operational error. JSON includes the source,
+commit, platform, completeness, findings, baseline status and limitations.
+Results are cached by source, commit, subdirectory, platform and rules version;
+the cache stores metadata and findings, not source excerpts.
+
+`--allow-risk RULE` is repeatable, has no wildcard and applies only to the
+current invocation. `incomplete` approves a scan limitation, not the unknown code.
+Interactive confirmation approves the displayed findings; `--yes` alone does
+not. Auto-update stops the affected plugin on new findings or incomplete scans.
+GitOps pull audits all installation candidates before changing plugins or files.
+`--dry-run` never builds or links candidates, but may fetch Git objects and write
+audit caches.
+
+`--dependencies` explicitly queries OSV for public Cargo/npm lockfile packages.
+Only public package names and versions are submitted, never repository contents
+or private package names. Unsupported or missing lockfiles, unverified package
+origins and unavailable advisory responses make this optional check incomplete.
+Advisories use `dependency-vulnerability`; they supplement rather than replace
+the local execution scan.
+
 
 ## Popup
 
@@ -226,13 +264,12 @@ Herdr with `ui.mouse_capture = false` (keyboard-only), the popup does not
 capture the mouse and shows no `×`, `←` or buttons.
 
 Install, update (one or all), removal, rollback, pinning another version and
-switching run inside the popup. The trust preview appears as a dialog (`y`
-yes, `n` no, `a` yes to the rest of an update-all, arrows to scroll); the work
-then runs in the background behind a progress dialog: the current step, a bar
-(`plugin k/n` for update-all), and the command output on `l`. It closes by
-itself on success; on failure it stays open with the output. GitHub
-shorthands get the same preview from a mirror of the repository before Herdr
-installs them. Only the external editor (`E`) takes over the terminal.
+switching run inside the popup. The trust preview includes the audit and appears
+as a dialog (`y` yes, `n` no, arrows to scroll); every candidate needs its own
+review. The work then runs in the background behind a progress dialog: the
+current step, a bar (`plugin k/n` for update-all), and the command output on `l`.
+It closes itself on success; on failure it stays open with the output.
+Only the external editor (`E`) takes over the terminal.
 
 `C` opens the settings: the general values, the auto-update strategy and one
 per plugin, the marketplace sources (on/off) and the aliases. `↵` types a value
@@ -319,10 +356,10 @@ for every removed plugin when no id is given. Installed plugins and the
 manager's own data are never touched.
 
 Auto-update is a per-plugin switch, independent of enable/disable. It updates
-every GitHub- or git-installed plugin with the switch on, **without the trust
-preview**, disabled plugins included. Pinned plugins stay where they are; local
-links cannot use it. Turn it on only for repositories you trust to run new
-commands unattended.
+every GitHub- or git-installed plugin with the switch on, disabled plugins
+included. New audit findings and incomplete scans stop that plugin before its
+build; review it manually to continue. Pinned plugins stay where they are; local
+links cannot use it. The heuristic audit is not a sandbox.
 
 When it runs depends on `[auto_update] trigger`:
 
@@ -357,16 +394,17 @@ strategy = "release"
 "examples.agent-telegram-notify" = "patch"
 ```
 
-With a tag strategy a git-installed plugin keeps following its branch (`u`
-still offers the newest commit); a GitHub-installed plugin is reinstalled at
-the tag, which Herdr then follows until `p` → `latest (unpin)`.
+With a tag strategy the manager keeps following the plugin's branch (`u` still
+offers the newest commit). Native GitHub installations transition to the same
+audited Git pipeline when updated.
 
 ## CLI
 
 ```text
 herdr-pm                       open the interactive manager
 herdr-pm list [--check] [--json]
-herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--git] [--replace] [-y]
+herdr-pm install <source> [--ref R] [--subdir D] [--disabled] [--replace] [-y]
+herdr-pm audit <source> [--ref R] [--subdir D] [--json] [--dependencies]
 herdr-pm update [ids…] [-y]    herdr-pm outdated [--json]
 herdr-pm uninstall <id> [--purge] herdr-pm enable|disable <id>
 herdr-pm clean [ids…] [-y]     delete leftovers of removed plugins
@@ -390,6 +428,8 @@ herdr-pm --skill               print the agent skill
 `--dry-run` (or `HERDR_PM_DRY_RUN=1`) previews plugin changes, GitOps operations,
 migration and CLI/skill integration changes. It is not a universal read-only
 mode: `index build`, for example, still writes the file passed to `-o`.
+`--allow-risk RULE` and `--dependencies` are global audit options for installation,
+update, rollback and GitOps pull as well as standalone audit.
 
 ### Logs
 
@@ -447,7 +487,6 @@ keep_installs = 3       # versions kept for rollback
 market_ttl = 600        # seconds before the marketplace is refreshed
 check_concurrency = 6   # parallel update checks in the popup
 use_gh_cli = true       # use `gh auth token` for GitHub
-github_via_git = true   # owner/repo through the Git pipeline, not Herdr's installer
 icons = true            # pictures where the terminal draws images
 history = "jsonl"       # jsonl (default), ecs or off
 # log_dir = "/absolute/writable/log/directory" # omitted: manager state directory
@@ -683,15 +722,65 @@ cargo test --locked
 cargo build --locked && sh tests/e2e.sh   # requires herdr on PATH
 ```
 
-The E2E suite uses real Herdr and temporary repositories. It covers local,
-`file://` and `git://` installs, monorepos, builds, updates/diffs, rollback,
-pin/switch, `--replace`, offline and live-server operations, identity migration,
-continuous approved-file backup, marketplace indexes, hostile Git transports,
-terminal escapes and invalid paths.
+The E2E suite uses real Herdr and temporary repositories on Linux/macOS or WSL.
+It refuses native Windows before invoking Herdr, and stops only the sandbox
+server it started. It covers local, `file://` and `git://` installs, monorepos,
+builds, updates/diffs, rollback, pin/switch, `--replace`, offline and live-server
+operations, identity migration, approved-file backup, marketplace indexes,
+hostile Git transports, terminal escapes and invalid paths. Audit regressions
+also prove that denied builds never execute and GitOps checks every candidate
+before applying a snapshot.
 
 [CodeQL](../.github/workflows/codeql.yml) scans Rust and GitHub Actions workflows
 on pushes to `main`, pull requests targeting `main`, and Saturdays at 03:17 UTC.
 It uses the default query suite and does not require a build.
+
+macOS tests use the explicit `macos-26-intel` runner rather than the constrained
+ARM64 test queue. Release builds use native Intel and ARM64 macOS hosts,
+executing the version check for both binaries.
+
+### Fuzzing
+
+The separate `fuzz/` workspace compiles the production manifest, source and
+utility modules directly. Targets check that manifest round trips preserve the
+execution surface, validated previews cannot inject terminal controls, and
+accepted sources cannot traverse outside their selected subdirectory.
+
+On Linux/macOS with a C++ compiler:
+
+```sh
+rustup toolchain install nightly-2026-11-01 --profile minimal
+cargo install cargo-fuzz --version 0.13.2 --locked
+cargo fetch --manifest-path fuzz/Cargo.toml --locked
+cp -R fuzz/seeds/manifest /tmp/herdr-pm-manifest-corpus
+CARGO_NET_OFFLINE=true cargo +nightly-2026-11-01 fuzz run manifest /tmp/herdr-pm-manifest-corpus -- -max_total_time=60 -max_len=32768
+```
+
+Use the `source` target with `fuzz/seeds/source` for source parsing. Copy seeds
+to a fresh temporary directory: fuzzing expands its corpus. CI runs both targets
+on PRs, pushes to main and Wednesdays at 04:23 UTC, bounds time/memory/input size
+and preserves crash inputs. Generated fuzz artifacts are not release contents.
+
+### Security and quality signals
+
+CodeQL and Scorecard findings are reviewed separately: CodeQL identifies code
+and workflow risks; Scorecard also measures project governance and history.
+Actions are pinned to full commits, downloaded tools have fixed versions and
+SHA-256 digests, and releases execute only commits already reachable from main.
+PR builds do not receive publishing credentials.
+
+The project retains its solo-maintainer protection policy: required CI and PRs,
+one review, and an administrator bypass through PRs. This intentionally does
+not meet Scorecard's maximal two-review/no-bypass policy. Independent review is
+still preferable; an automated agent is not a substitute for an independent
+maintainer's approval.
+
+Scorecard's CI-tests, SAST and code-review checks also examine past merged PRs;
+adding checks now cannot rewrite that history. Its age warning lasts until a
+new repository is 90 days old. An OpenSSF Best Practices badge additionally
+requires the maintainer's external assessment; this project does not claim an
+unearned badge or hide these signals to inflate its score.
+
 
 ## Français
 
@@ -721,34 +810,35 @@ sources, alias), `E` l'ouvre dans votre éditeur et `?` affiche l'aide du popup.
 **Mise à jour automatique** : `A` dans « Installed » l'active ou la désactive
 pour un plugin, qu'il soit activé ou non (`⟳` dans la liste). Au démarrage de
 Herdr (ou à l'ouverture du popup, ou au plus une fois par intervalle, selon
-`trigger`), `herdr-pm auto-update` met ces plugins à jour **sans aperçu** ; les
-plugins épinglés ne bougent pas et les liens locaux ne sont pas concernés.
+`trigger`), `herdr-pm auto-update` met ces plugins à jour sans confirmation ;
+un nouveau signal d'audit ou une analyse incomplète bloque le plugin concerné.
+Les plugins épinglés ne bougent pas et les liens locaux ne sont pas concernés.
 La stratégie choisit la cible : `latest` (défaut, dernier commit), `release`
 (dernier tag de version), `minor` (même version majeure) ou `patch` (même
 version mineure), globalement dans `[auto_update]` ou par plugin dans
 `[auto_update.plugins]`.
 
-Les raccourcis `owner/repo` passent par le pipeline Git (`github_via_git`) :
+Les raccourcis `owner/repo` passent toujours par le pipeline Git audité :
 `herdr plugin update` ne les touche pas. `t` (ou `herdr-pm take-over <id>`)
 convertit un plugin installé auparavant par Herdr.
 
-**Sécurité** : les transports `ext::`/remote-helpers sont refusés, les chemins
-`..` sont rejetés, les caractères de contrôle sont neutralisés, et aucun build
-n'est lancé avant confirmation. Le manifeste est comparé avant et après le
-build. Les plugins restent du code exécuté avec vos droits : lisez l'aperçu et
-épinglez le commit vérifié.
+**Sécurité** : `herdr-pm audit <source> --json` analyse le commit exact sans lancer
+son code. Installations et mises à jour passent par cette analyse avant le build.
+`--yes` n'approuve pas les nouveaux risques : `--allow-risk <règle>` exige une
+approbation explicite et ponctuelle. `--dependencies` interroge OSV uniquement
+avec les noms et versions de dépendances publiques Cargo/npm. Une analyse sans
+signal ne garantit pas l'innocuité du plugin.
 
-`--replace` fonctionne dans le pipeline Git. Pour remplacer un lien local par
-une source GitHub, utilisez `owner/repo --git --replace` : le programme Herdr
-natif ne propose pas cette opération de remplacement.
+Les transports `ext::`/remote-helpers et les chemins `..` sont refusés ; le
+manifeste est comparé avant et après le build. `--replace` fonctionne aussi pour
+`owner/repo` et permet de remplacer un lien local après vérification.
 
 **Releases et paquets** : chaque release GitHub publie des archives
 `herdr-pm` (Linux musl x86_64/arm64, macOS x86_64/arm64, Windows x86_64) avec
-leurs sommes SHA-256, la crate `herdr-plugin-manager`
-(`cargo install herdr-plugin-manager --locked`) et l'image
-`ghcr.io/julienpoirou/herdr-plugin-manager` pour les tâches d'index. Les
-versions sont préparées par release-please à partir des Conventional Commits ;
-fusionner la pull request de release déclenche la publication.
+leurs sommes SHA-256 et la crate `herdr-plugin-manager`
+(`cargo install herdr-plugin-manager --locked`). Les versions sont préparées
+par release-please à partir des Conventional Commits ; fusionner la pull request
+de release déclenche la publication.
 
 ## License
 

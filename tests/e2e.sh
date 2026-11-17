@@ -8,6 +8,13 @@
 # served over file paths, file:// and (when available) git daemon.
 set -eu
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "e2e: native Windows is unsupported; run on Linux/macOS or inside WSL" >&2
+    exit 2
+    ;;
+esac
+
 HPM="${1:-$(pwd)/target/debug/herdr-pm}"
 command -v herdr >/dev/null || { echo "e2e: herdr is not on PATH" >&2; exit 2; }
 [ -x "$HPM" ] || { echo "e2e: $HPM not found (cargo build first)" >&2; exit 2; }
@@ -15,7 +22,7 @@ command -v herdr >/dev/null || { echo "e2e: herdr is not on PATH" >&2; exit 2; }
 # Unix socket names are length-limited (especially on macOS); keep the
 # sandbox root short instead of inheriting a long per-user TMPDIR.
 T="$(mktemp -d /tmp/hpm-e2e.XXXXXX)"
-trap 'herdr server stop >/dev/null 2>&1 || true; [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'if [ -n "${SERVER_PID:-}" ]; then herdr server stop >/dev/null 2>&1 || true; fi; [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null; rm -rf "$T"' EXIT
 export XDG_CONFIG_HOME="$T/cfg" XDG_STATE_HOME="$T/state" XDG_CACHE_HOME="$T/cache"
 export NO_COLOR=1 HERDR_PM_NO_TOKEN=1
 export GIT_AUTHOR_NAME=e2e GIT_AUTHOR_EMAIL=e2e@example.invalid GIT_COMMITTER_NAME=e2e GIT_COMMITTER_EMAIL=e2e@example.invalid
@@ -96,7 +103,7 @@ git -C "$T/work/hello" push -q "$HELLO" main
 out="$("$HPM" outdated)"
 contains "$out" "team.hello  1.0.0"
 contains "$out" "1.1.0"
-out="$("$HPM" update team.hello --yes 2>&1)"
+out="$("$HPM" update team.hello --allow-risk execution-change --yes 2>&1)"
 contains "$out" "what it runs changed"
 contains "$out" "+ startup #1"
 contains "$out" "Updated team.hello 1.1.0"
@@ -104,7 +111,7 @@ ok "update shows a command diff and applies"
 out="$("$HPM" update --yes 2>&1)"
 contains "$out" "team.hello is up to date"
 ok "second update is a no-op"
-expect "rollback" "$HPM" rollback team.hello --yes
+expect "rollback" "$HPM" rollback team.hello --allow-risk execution-change --yes
 out="$("$HPM" list)"
 contains "$out" "team.hello  1.0.0"
 expect "pin" "$HPM" pin team.hello
@@ -112,7 +119,7 @@ out="$("$HPM" update team.hello --yes 2>&1)"
 contains "$out" "pinned"
 ok "pinned plugin is skipped"
 expect "unpin" "$HPM" unpin team.hello
-expect "update after unpin" "$HPM" update team.hello --yes
+expect "update after unpin" "$HPM" update team.hello --allow-risk execution-change --yes
 out="$("$HPM" logs team.hello)"
 contains "$out" "rollback"
 ok "history records changes"
@@ -125,7 +132,7 @@ contains "$out" "on"
 sed -i.bak 's/0.2.0/0.3.0/g' "$T/work/mono/plugins/b/herdr-plugin.toml" && rm -f "$T/work/mono/plugins/b/herdr-plugin.toml.bak"
 git -C "$T/work/mono" commit -q -am "b 0.3.0"
 git -C "$T/work/mono" push -q "$SRV/team/mono.git" main
-out="$("$HPM" auto-update < /dev/null 2>&1)"
+out="$("$HPM" auto-update --allow-risk execution-change < /dev/null 2>&1)"
 contains "$out" "Updated team.b 0.3.0"
 out="$("$HPM" list)"
 contains "$out" "○ team.b"
@@ -147,6 +154,56 @@ expect "auto-update disable" "$HPM" auto-update disable team.b
 out="$("$HPM" auto-update 2>&1)"
 contains "$out" "No plugin has auto-update turned on"
 expect_fail "auto-update refuses an unknown plugin" "$HPM" auto-update enable does.not.exist
+
+# --- audit reads immutable objects without executing plugin tools
+AUDIT_WORK="$T/work/audit"
+mkdir -p "$AUDIT_WORK"
+cat > "$AUDIT_WORK/herdr-plugin.toml" <<'EOF'
+id = "team.audit"
+name = "Audit fixture"
+version = "1.0.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["sh", "build.sh"]
+EOF
+printf 'printf "built-1.0.0\\n" > built.txt\n' > "$AUDIT_WORK/build.sh"
+publish "$AUDIT_WORK" audit
+AUDIT_REPO="$SRV/team/audit.git"
+AUDIT_MARKER="$T/audit-tool-ran"
+out="$("$HPM" audit "$AUDIT_REPO" --json)"
+contains "$out" '"findings": \[\]'
+contains "$out" '"complete": true'
+printf 'eval "touch %s"\n' "$AUDIT_MARKER" > "$AUDIT_WORK/build.sh"
+git -C "$AUDIT_WORK" commit -q -am "dangerous script, unchanged manifest"
+git -C "$AUDIT_WORK" push -q "$AUDIT_REPO" main
+set +e
+out="$("$HPM" audit "$AUDIT_REPO" --json 2>&1)"
+audit_status=$?
+set -e
+[ "$audit_status" -eq 2 ] || fail "audit returned $audit_status instead of 2: $out"
+contains "$out" '"rule": "dynamic-exec"'
+[ ! -e "$AUDIT_MARKER" ] || fail "standalone audit executed the plugin"
+expect "audit dry-run does not execute" "$HPM" install "$AUDIT_REPO" --dry-run --yes
+[ ! -e "$AUDIT_MARKER" ] || fail "dry-run executed the plugin"
+expect_fail "yes alone does not approve a new risk" "$HPM" install "$AUDIT_REPO" --yes
+[ ! -e "$AUDIT_MARKER" ] || fail "blocked installation executed the plugin"
+printf 'printf "built-1.0.0\\n" > built.txt\n' > "$AUDIT_WORK/build.sh"
+git -C "$AUDIT_WORK" commit -q -am "safe baseline"
+git -C "$AUDIT_WORK" push -q "$AUDIT_REPO" main
+expect "install safe audit baseline" "$HPM" install "$AUDIT_REPO" --yes
+expect "enable auto-update for audit fixture" "$HPM" auto-update enable team.audit
+printf 'eval "touch %s"\n' "$AUDIT_MARKER" > "$AUDIT_WORK/build.sh"
+git -C "$AUDIT_WORK" commit -q -am "new dynamic execution"
+git -C "$AUDIT_WORK" push -q "$AUDIT_REPO" main
+expect_fail "auto-update suspends a newly risky plugin" "$HPM" auto-update
+[ ! -e "$AUDIT_MARKER" ] || fail "blocked auto-update executed the plugin"
+contains "$("$HPM" info team.audit)" '1.0.0'
+expect "named risks allow an intentional update" "$HPM" auto-update --allow-risk dynamic-exec --allow-risk script-change
+[ -e "$AUDIT_MARKER" ] || fail "explicitly approved build did not run"
+expect "remove audit fixture" "$HPM" uninstall team.audit --yes
+ok "audit gates execution and auto-update preserves the installed baseline"
 
 # --- abbreviated commit ids remain checkable
 SHORT="$(git -C "$T/work/hello" rev-parse --short HEAD)"
@@ -190,7 +247,7 @@ expect_fail "refuses a plugin that needs a newer herdr" "$HPM" install "$SRV/tea
 plugin "$T/dev/hello" team.hello Hello 9.9.9
 herdr plugin link "$T/dev/hello" >/dev/null
 expect_fail "refuses to replace a hand-linked plugin" "$HPM" install "$HELLO" --yes
-expect "replaces it with --replace" "$HPM" install "$HELLO" --yes --replace
+expect "replaces it with --replace" "$HPM" install "$HELLO" --yes --replace --allow-risk source-change
 plugin "$T/work/quiet" team.quiet Quiet 0.1.0
 publish "$T/work/quiet" quiet
 out="$("$HPM" install "$SRV/team/quiet.git" < /dev/null 2>&1 || true)"
@@ -390,7 +447,9 @@ EOF
   plugin "$T/work/manager" julienpoirou.herdr-plugin-manager Manager 0.16.0
   git -C "$T/work/manager" commit -q -am "canonical identity"
   git -C "$T/work/manager" push -q "$SRV/team/manager.git" main
-  expect "migrated manager updates from its preserved git remote" "$HPM" update julienpoirou.herdr-plugin-manager --yes
+  # Migration records PROJECT's commit, absent from this synthetic remote.
+  expect_fail "missing migrated baseline requires review" "$HPM" update julienpoirou.herdr-plugin-manager --yes
+  expect "migrated manager updates from its preserved git remote" "$HPM" update julienpoirou.herdr-plugin-manager --allow-risk incomplete --yes
   contains "$("$HPM" info julienpoirou.herdr-plugin-manager)" '0.16.0'
   [ "$(cat "$EDITOR/keep.txt")" = untouched ] || fail "updating manager touched editor"
   printf '%s\n' "$pass" > "$T/migration-pass"
@@ -458,6 +517,62 @@ expect "pull and reload live configuration" env HERDR_PM_CONFIG_DIR="$T/live-man
 contains "$(cat "$XDG_CONFIG_HOME/herdr/config.toml")" '# synchronized live configuration'
 kill -0 "$SERVER_PID" || fail "pull replaced or stopped the running Herdr server"
 ok "GitOps applies live config without replacing the server"
+
+# A risky later plugin must block the whole snapshot before a safe earlier
+# plugin is installed, and --yes alone must not bypass that decision.
+SYNC_SAFE="$T/work/sync-safe"
+SYNC_RISK="$T/work/sync-risk"
+plugin "$SYNC_SAFE" team.syncaaa "Safe sync fixture" 1.0.0
+mkdir -p "$SYNC_RISK"
+cat > "$SYNC_RISK/herdr-plugin.toml" <<'EOF'
+id = "team.synczzz"
+name = "Risky sync fixture"
+version = "1.0.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["sh", "build.sh"]
+EOF
+printf 'printf "built-1.0.0\\n" > built.txt\n' > "$SYNC_RISK/build.sh"
+publish "$SYNC_SAFE" sync-safe
+publish "$SYNC_RISK" sync-risk
+expect "install safe sync candidate" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" install "$SRV/team/sync-safe.git" --yes
+expect "install safe risk baseline" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" install "$SRV/team/sync-risk.git" --yes
+expect "publish sync candidates" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" push --yes
+RISK_OLD_SHA="$(git -C "$SYNC_RISK" rev-parse HEAD)"
+expect "uninstall safe candidate before pull" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" uninstall team.syncaaa --yes
+expect "uninstall risk baseline before pull" env HERDR_PM_CONFIG_DIR="$T/live-manager-config" "$HPM" uninstall team.synczzz --yes
+SYNC_MARKER="$T/gitops-risk-ran"
+printf 'eval "touch %s"\n' "$SYNC_MARKER" > "$SYNC_RISK/build.sh"
+git -C "$SYNC_RISK" commit -q -am "risky snapshot script"
+git -C "$SYNC_RISK" push -q "$SRV/team/sync-risk.git" main
+RISK_NEW_SHA="$(git -C "$SYNC_RISK" rev-parse HEAD)"
+git -C "$T/live-editor" pull -q
+sed -i.bak "s/$RISK_OLD_SHA/$RISK_NEW_SHA/g" "$T/live-editor/plugins.toml"
+rm -f "$T/live-editor/plugins.toml.bak"
+git -C "$T/live-editor" add plugins.toml
+git -C "$T/live-editor" commit -q -m "introduce risky plugin revision"
+git -C "$T/live-editor" push -q
+# A fresh sync session models another machine with missing plugins, not a
+# conflicting local uninstall relative to an already synchronized baseline.
+RESTORE_CONFIG="$T/restore-config"
+mkdir -p "$RESTORE_CONFIG"
+cp "$T/live-manager-config/config.toml" "$RESTORE_CONFIG/config.toml"
+restore() {
+  env XDG_STATE_HOME="$T/restore-state" XDG_CONFIG_HOME="$T/restore-cfg" \
+    XDG_CACHE_HOME="$T/restore-cache" HERDR_PM_CONFIG_DIR="$RESTORE_CONFIG" "$HPM" "$@"
+}
+expect_fail "snapshot stops before any plugin mutation" restore pull --yes
+contains "$out" "audit requires explicit risk approval"
+[ ! -e "$SYNC_MARKER" ] || fail "blocked snapshot executed the risky build"
+out="$(restore list)"
+case "$out" in *team.syncaaa*|*team.synczzz*) fail "blocked snapshot installed an earlier candidate" ;; esac
+expect "named risks permit the reviewed snapshot" restore pull --allow-risk dynamic-exec --allow-risk script-change --yes
+[ -e "$SYNC_MARKER" ] || fail "explicitly approved snapshot build did not run"
+expect "cleanup safe sync candidate" restore uninstall team.syncaaa --yes
+expect "cleanup risky sync candidate" restore uninstall team.synczzz --yes
+ok "GitOps audits every candidate before applying any plugin change"
 
 expect "doctor" sh -c "'$HPM' doctor || true"
 expect "uninstall" "$HPM" uninstall team.hello --yes

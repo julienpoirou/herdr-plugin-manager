@@ -1,7 +1,7 @@
 //! What the user typed → where a plugin comes from.
 //!
 //! Accepted forms:
-//!   owner/repo[/subdir]            GitHub, installed natively by Herdr
+//!   owner/repo[/subdir]            GitHub shorthand, resolved through Git
 //!   github:owner/repo[/subdir]     same, explicit
 //!   <alias>:path[//subdir]         an alias from config.toml, e.g. corp:team/tool
 //!   https://host/team/repo.git     any git URL (http, https, ssh, git, file)
@@ -35,23 +35,6 @@ pub enum Source {
 }
 
 impl Source {
-    pub fn display(&self) -> String {
-        match self {
-            Source::Github {
-                owner,
-                repo,
-                subdir,
-            } => match subdir {
-                Some(s) => format!("{owner}/{repo}/{s}"),
-                None => format!("{owner}/{repo}"),
-            },
-            Source::Git { url, subdir } => match subdir {
-                Some(s) => format!("{url}//{s}"),
-                None => url.clone(),
-            },
-        }
-    }
-
     pub fn with_subdir(self, new: Option<String>) -> Source {
         let new = new.map(|s| normalize_subdir(&s)).filter(|s| !s.is_empty());
         match self {
@@ -71,8 +54,7 @@ impl Source {
         }
     }
 
-    /// The same plugin, fetched through git instead of Herdr's installer
-    /// (`--git`): useful for private GitHub repositories over SSH.
+    /// The same plugin, resolved and reviewed through the exact-commit Git pipeline.
     pub fn into_git(self) -> Source {
         match self {
             Source::Github {
@@ -314,7 +296,14 @@ mod tests {
                 subdir: Some("sub/dir".into())
             }
         );
-        assert_eq!(p("github:o/r").display(), "o/r");
+        assert_eq!(
+            p("github:o/r"),
+            Source::Github {
+                owner: "o".into(),
+                repo: "r".into(),
+                subdir: None
+            }
+        );
         assert!(parse("o/../x", &BTreeMap::new()).is_err());
         assert!(parse("o/r/../x", &BTreeMap::new()).is_err());
     }

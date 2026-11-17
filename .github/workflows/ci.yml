@@ -58,9 +58,9 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL \
             "https://github.com/herdrdev/herdr/releases/download/v0.9.5/$asset" -o "$binary"
           if command -v sha256sum >/dev/null; then
-            printf '%s  %s\n' "$sha256" "$binary" | sha256sum --check --strict
+            printf '%s  %s\n' "$sha256" "$binary" | sha256sum -c
           else
-            printf '%s  %s\n' "$sha256" "$binary" | shasum -a 256 --check
+            printf '%s  %s\n' "$sha256" "$binary" | shasum -a 256 -c
           fi
           mkdir -p "$RUNNER_TEMP/herdr-bin"
           install -m 755 "$binary" "$RUNNER_TEMP/herdr-bin/herdr"

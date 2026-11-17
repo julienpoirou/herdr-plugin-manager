@@ -24,6 +24,7 @@
   archived rustls-pemfile, and update the affected rustix 1.x dependency to 1.1.6.
 - Continuously fuzz manifest previews and source parsing with production code,
   locked dependencies and a bounded, scheduled/PR libFuzzer workflow.
+- Use portable checksum verification flags on macOS as well as GNU/Linux.
 
 ## [0.18.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.2...v0.18.3) (2026-11-14)
 

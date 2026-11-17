@@ -25,6 +25,8 @@
 - Continuously fuzz manifest previews and source parsing with production code,
   locked dependencies and a bounded, scheduled/PR libFuzzer workflow.
 - Use portable checksum verification flags on macOS as well as GNU/Linux.
+- Exercise backup lock handoff through the worker's bounded ownership wait,
+  retaining the exclusivity assertion without macOS close-timing assumptions.
 
 ## [0.18.3](https://github.com/julienpoirou/herdr-plugin-manager/compare/v0.18.2...v0.18.3) (2026-11-14)
 

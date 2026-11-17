@@ -1,7 +1,7 @@
 //! What the user typed → where a plugin comes from.
 //!
 //! Accepted forms:
-//!   owner/repo[/subdir]            GitHub, installed natively by Herdr
+//!   owner/repo[/subdir]            GitHub shorthand, resolved through Git
 //!   github:owner/repo[/subdir]     same, explicit
 //!   <alias>:path[//subdir]         an alias from config.toml, e.g. corp:team/tool
 //!   https://host/team/repo.git     any git URL (http, https, ssh, git, file)
